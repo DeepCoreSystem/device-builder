@@ -14,9 +14,7 @@ from aiohttp import web
 from esphome import const
 from esphome.storage_json import (
     StorageJSON,
-    archive_storage_path,
     ext_storage_path,
-    trash_storage_path,
 )
 from esphome.dashboard.util.text import friendly_name_slugify
 
@@ -180,7 +178,8 @@ async def wizard(request: web.Request) -> web.Response:
 
     if board_id:
         await loop.run_in_executor(
-            None, set_device_metadata, settings.config_dir, filename, board_id
+            None,
+            lambda: set_device_metadata(settings.config_dir, filename, board_id=board_id),
         )
 
     await DASHBOARD.entries.async_request_update_entries()
@@ -282,7 +281,7 @@ async def edit_post(request: web.Request) -> web.Response:
 
 
 # ---------------------------------------------------------------------------
-# POST /delete  POST /undo-delete
+# POST /delete
 # ---------------------------------------------------------------------------
 
 
@@ -291,51 +290,51 @@ async def delete_device(request: web.Request) -> web.Response:
     settings = get_settings(request)
     configuration = request.rel_url.query.get("configuration", "")
 
+    if not configuration:
+        return error_response("configuration is required")
+
     try:
         path = settings.rel_path(configuration)
     except ValueError:
         return error_response("Forbidden", status=403)
 
-    loop = asyncio.get_running_loop()
-
-    def _archive() -> None:
-        trash_dir = trash_storage_path(configuration).parent
-        trash_dir.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(path), str(trash_storage_path(configuration)))
-        storage = ext_storage_path(configuration)
-        if storage.exists():
-            shutil.move(str(storage), str(archive_storage_path(configuration)))
-
-    await loop.run_in_executor(None, _archive)
-    await DASHBOARD.entries.async_request_update_entries()
-    return web.Response(status=200)
-
-
-@routes.post("/undo-delete")
-async def undo_delete(request: web.Request) -> web.Response:
-    settings = get_settings(request)
-    configuration = request.rel_url.query.get("configuration", "")
-
-    try:
-        dest_path = settings.rel_path(configuration)
-    except ValueError:
-        return error_response("Forbidden", status=403)
+    if not path.exists():
+        return error_response("File not found", status=404)
 
     loop = asyncio.get_running_loop()
 
-    def _restore() -> None:
-        src = trash_storage_path(configuration)
-        if not src.exists():
-            raise FileNotFoundError(f"Trash file not found: {src}")
-        shutil.move(str(src), str(dest_path))
-        archived = archive_storage_path(configuration)
-        if archived.exists():
-            shutil.move(str(archived), str(ext_storage_path(configuration)))
+    def _delete_all() -> None:
+        # Active config file
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            raise RuntimeError(f"Could not delete config file: {exc}") from exc
+
+        # Any previously trashed copy
+        trash_copy = settings.config_dir / ".trash" / configuration
+        trash_copy.unlink(missing_ok=True)
+
+        # Archived storage copy
+        archived = settings.config_dir / ".archive" / f"{configuration}.json"
+        archived.unlink(missing_ok=True)
+
+        # ESPHome storage JSON
+        try:
+            ext_storage_path(configuration).unlink(missing_ok=True)
+        except OSError:
+            _LOGGER.warning("Could not remove storage file for %s", configuration)
+
+        # Board/metadata entry
+        try:
+            remove_device_metadata(settings.config_dir, configuration)
+        except Exception:
+            _LOGGER.warning("Could not remove metadata for %s", configuration)
 
     try:
-        await loop.run_in_executor(None, _restore)
-    except FileNotFoundError as exc:
-        return error_response(str(exc), status=404)
+        await loop.run_in_executor(None, _delete_all)
+    except Exception as exc:
+        _LOGGER.exception("Failed to delete device %s", configuration)
+        return error_response(str(exc), status=500)
 
     await DASHBOARD.entries.async_request_update_entries()
     return web.Response(status=200)

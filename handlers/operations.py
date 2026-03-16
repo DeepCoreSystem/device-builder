@@ -18,7 +18,7 @@ import aiohttp
 from aiohttp import web
 
 from ..dashboard import DASHBOARD
-from ..entries import DashboardEntries
+from ..entries import DashboardEntries, entry_state_to_bool
 from .util import get_settings
 
 _LOGGER = logging.getLogger(__name__)
@@ -198,3 +198,35 @@ def _build_rename(settings, data: dict) -> list[str]:
 @routes.get("/rename")
 async def ws_rename(request: web.Request) -> web.WebSocketResponse:
     return await _handle_ws_command(request, _build_rename)
+
+
+# ---------------------------------------------------------------------------
+# POST /update-all
+# ---------------------------------------------------------------------------
+
+
+@routes.post("/update-all")
+async def update_all(request: web.Request) -> web.Response:
+    """Trigger OTA update for all online devices (fire-and-forget)."""
+    settings = get_settings(request)
+    entries = DASHBOARD.entries.async_all()
+    online = [e for e in entries if entry_state_to_bool(e.state)]
+
+    async def _run_upload(filename: str) -> None:
+        config_file = str(settings.rel_path(filename))
+        cmd = _esphome_command("upload", config_file)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                close_fds=(os.name != "nt"),
+            )
+            await proc.wait()
+        except Exception:
+            _LOGGER.exception("update-all failed for %s", filename)
+
+    for entry in online:
+        asyncio.create_task(_run_upload(entry.filename))
+
+    return web.json_response({"queued": len(online)})
