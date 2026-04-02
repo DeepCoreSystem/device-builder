@@ -32,10 +32,6 @@ from ..models import (
     BoardHardware,
     BoardPin,
     BoardTag,
-    ComponentCatalogResponse,
-    ComponentField,
-    ComponentPlatform,
-    ComponentType,
     Connectivity,
     Esp32Variant,
     PinFeature,
@@ -46,7 +42,6 @@ _LOGGER = logging.getLogger(__name__)
 
 _DEFINITIONS_DIR = Path(__file__).parent
 _BOARDS_DIR = _DEFINITIONS_DIR / "boards"
-_COMPONENTS_DIR = _DEFINITIONS_DIR / "components"
 
 _IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".svg", ".webp")
 
@@ -185,54 +180,3 @@ def load_board_catalog() -> BoardCatalogResponse:
             _LOGGER.exception("Failed to load board definition from %s", manifest.parent.name)
 
     return BoardCatalogResponse(boards=boards)
-
-
-# ---------------------------------------------------------------------------
-# Components
-# ---------------------------------------------------------------------------
-
-
-def _load_field(data: dict) -> ComponentField:
-    """Load a ComponentField from a dict."""
-    return ComponentField(
-        key=data["key"],
-        label=data["label"],
-        type=data["type"],
-        required=data.get("required", False),
-        default=data.get("default"),
-        options=data.get("options"),
-    )
-
-
-def _load_platform(data: dict) -> ComponentPlatform:
-    """Load a ComponentPlatform from a dict."""
-    return ComponentPlatform(
-        id=data["id"],
-        name=data["name"],
-        description=data["description"],
-        yaml_template=data["yaml_template"],
-        fields=[_load_field(f) for f in data.get("fields", [])],
-    )
-
-
-def load_component_catalog() -> ComponentCatalogResponse:
-    """Load all component definitions from subdirectories."""
-    components: list[ComponentType] = []
-
-    for manifest in sorted(_COMPONENTS_DIR.glob("*/manifest.yaml")):
-        try:
-            data = yaml.safe_load(manifest.read_text())
-            components.append(
-                ComponentType(
-                    id=data["id"],
-                    name=data["name"],
-                    description=data["description"],
-                    docs_url=data.get("docs_url", ""),
-                    icon=data.get("icon", ""),
-                    platforms=[_load_platform(p) for p in data.get("platforms", [])],
-                )
-            )
-        except Exception:
-            _LOGGER.exception("Failed to load component definition from %s", manifest.parent.name)
-
-    return ComponentCatalogResponse(components=components)

@@ -1,29 +1,20 @@
-"""Catalog data: boards, components, automations, and config sections.
+"""Catalog data: automations and config sections.
 
-Board and component definitions are loaded from YAML files in their respective
-directories. Automation and config-section catalogs remain inline as they are
-simpler and less likely to receive community contributions.
+These catalogs remain inline as they are simpler and less likely to
+receive community contributions. Board and component catalogs are
+loaded separately via their own modules.
 """
 
 from __future__ import annotations
 
-from .definitions import load_component_catalog
 from .models import (
     AutomationAction,
     AutomationCatalogResponse,
     AutomationTrigger,
-    ComponentCatalogResponse,
     ComponentField,
     ConfigCatalogResponse,
     ConfigSection,
 )
-
-# ---------------------------------------------------------------------------
-# Component catalog (loaded from YAML files)
-# ---------------------------------------------------------------------------
-
-COMPONENT_CATALOG: ComponentCatalogResponse = load_component_catalog()
-
 
 # ---------------------------------------------------------------------------
 # Automation catalog

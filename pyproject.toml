@@ -62,7 +62,7 @@ esphome_device_builder = [
   "py.typed",
   "definitions/boards/*/manifest.yaml",
   "definitions/boards/*/images/*",
-  "definitions/components/*/manifest.yaml",
+  "definitions/components.json",
 ]
 
 [tool.ruff]
@@ -103,7 +103,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"script/*" = ["T20", "S310", "S110"]  # print(), URL open, bare except are fine in CLI scripts
+"script/*" = ["T20", "S108", "S310", "S110", "E501"]  # CLI scripts: print, tempdir, URL open, bare except, long lines
 
 [tool.codespell]
 skip = "*.json,*/definitions/*"

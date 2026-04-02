@@ -258,18 +258,127 @@ class BoardCatalogResponse(DataClassORJSONMixin):
 
 
 # ---------------------------------------------------------------------------
+# Component enums
+# ---------------------------------------------------------------------------
+
+
+class ConfigEntryType(StrEnum):
+    """Config entry field types."""
+
+    STRING = "string"
+    INTEGER = "integer"
+    FLOAT = "float"
+    BOOLEAN = "boolean"
+    SELECT = "select"
+    PIN = "pin"
+    TIME_PERIOD = "time_period"
+    ICON = "icon"
+    ID = "id"
+    TRIGGER = "trigger"
+    UNKNOWN = "unknown"
+
+
+class ComponentCategory(StrEnum):
+    """Component categories (ESPHome platform types + infrastructure)."""
+
+    # Entity platform types
+    SENSOR = "sensor"
+    BINARY_SENSOR = "binary_sensor"
+    SWITCH = "switch"
+    LIGHT = "light"
+    FAN = "fan"
+    COVER = "cover"
+    CLIMATE = "climate"
+    BUTTON = "button"
+    NUMBER = "number"
+    SELECT = "select"
+    TEXT = "text"
+    TEXT_SENSOR = "text_sensor"
+    LOCK = "lock"
+    VALVE = "valve"
+    MEDIA_PLAYER = "media_player"
+    SPEAKER = "speaker"
+    MICROPHONE = "microphone"
+    CAMERA = "camera"
+    DISPLAY = "display"
+    TOUCHSCREEN = "touchscreen"
+    OUTPUT = "output"
+    DATETIME = "datetime"
+    EVENT = "event"
+    UPDATE = "update"
+    ALARM = "alarm_control_panel"
+    # Infrastructure categories
+    CORE = "core"
+    BUS = "bus"
+    AUTOMATION = "automation"
+    MISC = "misc"
+
+
+# ---------------------------------------------------------------------------
 # Component models
 # ---------------------------------------------------------------------------
 
 
 @dataclass
-class ComponentField(DataClassORJSONMixin):
+class ComponentConfigEntry(DataClassORJSONMixin):
+    """A config field for a component."""
+
     key: str
+    type: ConfigEntryType
     label: str
-    type: str  # "string" | "number" | "boolean" | "select" | "pin"
-    required: bool
-    default: str | int | bool | None = None
+    required: bool = False
+    default_value: str | int | float | bool | None = None
+    description: str | None = None
     options: list[str] | None = None
+    range: tuple[int | float, int | float] | None = None
+    advanced: bool = False
+
+
+@dataclass
+class ComponentSubEntity(DataClassORJSONMixin):
+    """A sub-entity provided by a component (e.g. DHT's temperature/humidity sensors)."""
+
+    key: str
+    platform_type: str
+    config_entries: list[ComponentConfigEntry] = field(default_factory=list)
+
+
+@dataclass
+class ComponentCatalogEntry(DataClassORJSONMixin):
+    """A component in the catalog."""
+
+    id: str
+    name: str
+    description: str
+    category: ComponentCategory
+    docs_url: str = ""
+    image_url: str = ""
+    dependencies: list[str] = field(default_factory=list)
+    auto_load: list[str] = field(default_factory=list)
+    multi_conf: bool = False
+    config_entries: list[ComponentConfigEntry] = field(default_factory=list)
+    sub_entities: list[ComponentSubEntity] = field(default_factory=list)
+
+
+@dataclass
+class AddComponentRequest(DataClassORJSONMixin):
+    """Request to add a component to a device config."""
+
+    component_id: str
+    fields: dict[str, Any] = field(default_factory=dict)
+    sub_entities: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+
+@dataclass
+class AddComponentResponse(DataClassORJSONMixin):
+    """Response after adding a component."""
+
+    yaml: str
+
+
+# ---------------------------------------------------------------------------
+# Section config models (for visual YAML section editing)
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -310,40 +419,19 @@ class SectionConfigResponse(DataClassORJSONMixin):
     entries: list[ConfigEntry]
 
 
-@dataclass
-class ComponentPlatform(DataClassORJSONMixin):
-    id: str
-    name: str
-    description: str
-    yaml_template: str
-    fields: list[ComponentField]
+# ---------------------------------------------------------------------------
+# Legacy component models (used by automations and config sections — to be migrated)
+# ---------------------------------------------------------------------------
 
 
 @dataclass
-class ComponentType(DataClassORJSONMixin):
-    id: str
-    name: str
-    description: str
-    docs_url: str
-    icon: str
-    platforms: list[ComponentPlatform]
-
-
-@dataclass
-class ComponentCatalogResponse(DataClassORJSONMixin):
-    components: list[ComponentType]
-
-
-@dataclass
-class AddComponentRequest(DataClassORJSONMixin):
-    component: str
-    platform: str
-    fields: dict[str, Any]
-
-
-@dataclass
-class AddComponentResponse(DataClassORJSONMixin):
-    yaml: str
+class ComponentField(DataClassORJSONMixin):
+    key: str
+    label: str
+    type: str
+    required: bool
+    default: str | int | bool | None = None
+    options: list[str] | None = None
 
 
 # ---------------------------------------------------------------------------

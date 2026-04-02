@@ -9,6 +9,7 @@ from pathlib import Path
 from aiohttp import web
 
 from .boards import BOARD_CATALOG
+from .components import COMPONENT_CATALOG
 from .dashboard import DASHBOARD
 from .handlers import (
     automations,
@@ -63,6 +64,7 @@ def _register_frontend(app: web.Application, frontend_dir: Path) -> None:
 async def _on_startup(app: web.Application) -> None:
     settings: DashboardSettings = app["settings"]
     BOARD_CATALOG.load()
+    COMPONENT_CATALOG.load()
     DASHBOARD.settings = settings
     await DASHBOARD.async_setup()
     app["dashboard_task"] = asyncio.create_task(DASHBOARD.async_run())

@@ -1,56 +1,106 @@
-"""Component catalog and add-component handlers."""
+"""Component catalog and device component management API handlers."""
 
 from __future__ import annotations
 
 import asyncio
-import json
+import logging
 
 from aiohttp import web
 
-from ..catalogs import COMPONENT_CATALOG
+from ..components import COMPONENT_CATALOG
 from ..models import AddComponentResponse
-from ..yaml_editor import append_yaml_block, build_component_yaml
+from ..yaml_editor import generate_component_yaml
 from .util import error_response, get_settings, json_response
+
+_LOGGER = logging.getLogger(__name__)
 
 routes = web.RouteTableDef()
 
 
-@routes.get("/components/catalog")
-async def component_catalog(request: web.Request) -> web.Response:
-    return json_response(COMPONENT_CATALOG).to_dict()
+@routes.get("/components")
+async def list_components(request: web.Request) -> web.Response:
+    """List components with optional search, filtering, and pagination.
+
+    Query parameters:
+        query:    Free-text search (matches name, description, id)
+        category: Filter by category (sensor, binary_sensor, switch, ...)
+        offset:   Pagination offset (default: 0)
+        limit:    Page size (default: 50, max: 200)
+    """
+    query = request.query.get("query")
+    category = request.query.get("category")
+    offset = max(0, int(request.query.get("offset", "0")))
+    limit = min(200, max(1, int(request.query.get("limit", "50"))))
+
+    components, total = COMPONENT_CATALOG.search(
+        query=query,
+        category=category,
+        offset=offset,
+        limit=limit,
+    )
+
+    return json_response(
+        {
+            "components": [c.to_dict() for c in components],
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "categories": COMPONENT_CATALOG.categories,
+        }
+    )
+
+
+@routes.get("/components/{component_id}")
+async def get_component(request: web.Request) -> web.Response:
+    """Get a single component by ID with full config entries."""
+    component_id = request.match_info["component_id"]
+    component = COMPONENT_CATALOG.get_component(component_id)
+    if component is None:
+        return error_response(f"Component not found: {component_id}", status=404)
+    return json_response(component.to_dict())
 
 
 @routes.post("/devices/{configuration}/components")
 async def add_component(request: web.Request) -> web.Response:
+    """Add a component to a device configuration.
+
+    Body:
+        component_id: str - the component to add
+        fields: dict - config field values
+        sub_entities: dict - sub-entity field values
+    """
     settings = get_settings(request)
     configuration = request.match_info["configuration"]
 
     try:
-        path = settings.rel_path(configuration)
+        settings.rel_path(configuration)
     except ValueError:
         return error_response("Forbidden", status=403)
 
-    try:
-        body = await request.json()
-    except (json.JSONDecodeError, ValueError):
-        return error_response("Invalid JSON body")
+    body = await request.json()
+    component_id = body.get("component_id", "")
 
-    component_id = body.get("component", "")
-    platform_id = body.get("platform", "")
+    component = COMPONENT_CATALOG.get_component(component_id)
+    if component is None:
+        return error_response(f"Unknown component: {component_id}")
+
     fields = body.get("fields", {})
+    sub_entities = body.get("sub_entities", {})
 
-    # Find the template from the catalog
-    comp = next((c for c in COMPONENT_CATALOG.components if c.id == component_id), None)
-    if comp is None:
-        return error_response(f"Unknown component: {component_id}", status=404)
+    # Validate required fields
+    for entry in component.config_entries:
+        if entry.required and entry.key not in fields:
+            return error_response(f"Missing required field: {entry.key}")
 
-    plat = next((p for p in comp.platforms if p.id == platform_id), None)
-    if plat is None:
-        return error_response(f"Unknown platform: {platform_id}", status=404)
+    # Generate YAML
+    yaml_block = generate_component_yaml(component, fields, sub_entities)
 
-    block = build_component_yaml(plat.yaml_template, fields)
-
+    # Read existing config and append
+    config_path = settings.rel_path(configuration)
     loop = asyncio.get_running_loop()
-    new_yaml = await loop.run_in_executor(None, append_yaml_block, path, block)
+
+    existing = await loop.run_in_executor(None, config_path.read_text)
+    new_yaml = existing.rstrip() + "\n\n" + yaml_block + "\n"
+    await loop.run_in_executor(None, config_path.write_text, new_yaml)
 
     return json_response(AddComponentResponse(yaml=new_yaml).to_dict())
