@@ -16,6 +16,7 @@ import argparse
 import json
 import logging
 import os
+import re as re_module
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +42,165 @@ OUTPUT_FILE = (
     / "definitions"
     / "components.json"
 )
+
+# ---------------------------------------------------------------------------
+# Docs metadata fetching
+# ---------------------------------------------------------------------------
+
+_DOCS_CLONE_DIR = Path(__file__).resolve().parent.parent / ".cache" / "esphome-docs"
+
+
+def _parse_mdx_frontmatter(mdx_content: str) -> dict[str, str]:
+    """Extract title and description from MDX frontmatter."""
+    match = re_module.match(r"^---\s*\n(.*?)\n---", mdx_content, re_module.DOTALL)
+    if not match:
+        return {}
+    result = {}
+    for line in match.group(1).splitlines():
+        if ":" in line:
+            key, _, value = line.partition(":")
+            result[key.strip()] = value.strip().strip('"').strip("'")
+    return result
+
+
+def _parse_first_image(mdx_content: str) -> str | None:
+    """Extract the first image filename from MDX content."""
+    # Pattern 1: ES module import — import x from './images/foo.jpg';
+    match = re_module.search(r"from\s+['\"]\.\/images\/([^'\"]+)['\"]", mdx_content)
+    if match:
+        return match.group(1)
+    # Pattern 2: inline reference — images/foo.jpg (markdown or JSX)
+    match = re_module.search(r"images/([a-zA-Z0-9_-]+\.\w+)", mdx_content)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _ensure_docs_repo() -> Path | None:
+    """Clone the esphome-docs repo locally (shallow, once). Returns components dir."""
+    import subprocess
+
+    components_dir = _DOCS_CLONE_DIR / "src" / "content" / "docs" / "components"
+    if components_dir.exists():
+        print("Updating esphome-docs repo...")
+        subprocess.run(
+            ["git", "pull", "--ff-only"],
+            cwd=_DOCS_CLONE_DIR,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        return components_dir
+
+    print("Cloning esphome-docs repo (first time)...")
+    _DOCS_CLONE_DIR.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        subprocess.run(
+            [
+                "git",
+                "clone",
+                "--depth=1",
+                "--single-branch",
+                "--branch=current",
+                "https://github.com/esphome/esphome-docs.git",
+                str(_DOCS_CLONE_DIR),
+            ],
+            capture_output=True,
+            timeout=120,
+            check=True,
+        )
+    except Exception as exc:
+        print(f"  WARNING: Could not clone docs repo: {exc}")
+        return None
+
+    return components_dir
+
+
+def fetch_docs_metadata() -> dict[str, dict[str, str]]:
+    """Parse metadata from ESPHome docs (cloned locally).
+
+    Returns {component_id: {title, description, image_file, category}}.
+    """
+    components_dir = _ensure_docs_repo()
+    if not components_dir or not components_dir.exists():
+        print("  WARNING: Docs repo not available — skipping enrichment")
+        return {}
+
+    print("Parsing component docs metadata...")
+    metadata: dict[str, dict[str, str]] = {}
+
+    # Top-level .mdx files (core components)
+    for mdx_file in components_dir.glob("*.mdx"):
+        comp_id = mdx_file.stem
+        content = mdx_file.read_text(errors="ignore")
+        fm = _parse_mdx_frontmatter(content)
+        img = _parse_first_image(content)
+        metadata[comp_id] = {
+            "title": fm.get("title", ""),
+            "description": fm.get("description", ""),
+            "image_file": img or "",
+            "category": "",
+        }
+
+    # Category subdirectories
+    for cat_dir in sorted(components_dir.iterdir()):
+        if not cat_dir.is_dir() or cat_dir.name == "images":
+            continue
+        cat_name = cat_dir.name
+        mdx_files = list(cat_dir.glob("*.mdx"))
+        if mdx_files:
+            print(f"  {cat_name}: {len(mdx_files)} docs")
+        for mdx_file in mdx_files:
+            comp_id = mdx_file.stem
+            content = mdx_file.read_text(errors="ignore")
+            fm = _parse_mdx_frontmatter(content)
+            img = _parse_first_image(content)
+            metadata[comp_id] = {
+                "title": fm.get("title", ""),
+                "description": fm.get("description", ""),
+                "image_file": img or "",
+                "category": cat_name,
+            }
+
+    print(f"  Total: {len(metadata)} component docs found")
+
+    # Also parse the index page for image mappings (most complete source)
+    index_file = components_dir / "index.mdx"
+    if index_file.exists():
+        index_content = index_file.read_text(errors="ignore")
+        # Match: ["Name", "/components/category/comp/", "image.ext", ...]
+        img_entries = re_module.findall(
+            r'\["([^"]+)",\s*"(/components/[^"]+)",\s*"([^"]+)"',
+            index_content,
+        )
+        enriched = 0
+        for entry_name, entry_path, entry_img in img_entries:
+            # Extract component ID from path: /components/sensor/dht/ -> dht
+            parts = entry_path.strip("/").split("/")
+            if len(parts) < 2:
+                continue
+            comp_id = parts[-1] if parts[-1] else parts[-2]
+            cat = parts[1] if len(parts) >= 3 else ""
+
+            if comp_id not in metadata:
+                metadata[comp_id] = {
+                    "title": "",
+                    "description": "",
+                    "image_file": "",
+                    "category": cat,
+                }
+            m = metadata[comp_id]
+            if not m.get("image_file"):
+                m["image_file"] = entry_img
+                enriched += 1
+            if not m.get("title") and entry_name:
+                m["title"] = entry_name
+            if not m.get("category") and cat:
+                m["category"] = cat
+        print(f"  Index page: {len(img_entries)} entries, {enriched} new images added")
+
+    return metadata
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -264,13 +424,6 @@ def _identify_validator(validator: Any) -> dict[str, Any]:
         base_type = "integer" if "int" in name_lower else "float"
         return {"type": base_type, "range_min": range_min, "range_max": range_max}
 
-    # Unwrap vol.All (chain of validators)
-    if isinstance(validator, vol.All):
-        for inner in reversed(validator.validators):
-            inner_result = _identify_validator(inner)
-            if inner_result["type"] != "unknown":
-                return inner_result
-
     # Check for sub-schema (sensor_schema, etc.)
     if hasattr(validator, "schema") and isinstance(validator.schema, dict):
         return {"type": "sub_schema", "schema": validator}
@@ -281,6 +434,62 @@ def _identify_validator(validator: Any) -> dict[str, Any]:
             return {"type": "integer"}
         if validator.type is float:
             return {"type": "float"}
+
+    # Check for Range
+    if isinstance(validator, vol.Range):
+        return {
+            "type": "float",
+            "range_min": validator.min,
+            "range_max": validator.max,
+        }
+
+    # Check for vol.Any (union types — often has string options)
+    if isinstance(validator, vol.Any):
+        for inner in validator.validators:
+            inner_result = _identify_validator(inner)
+            if inner_result["type"] != "unknown":
+                return inner_result
+
+    # Unwrap vol.All (chain of validators) — check all inner validators
+    if isinstance(validator, vol.All):
+        # First pass: look for Range to extract constraints
+        range_info: dict[str, Any] = {}
+        for inner in validator.validators:
+            if isinstance(inner, vol.Range):
+                range_info = {"range_min": inner.min, "range_max": inner.max}
+            elif isinstance(inner, vol.Coerce):
+                if inner.type is int:
+                    range_info.setdefault("type", "integer")
+                elif inner.type is float:
+                    range_info.setdefault("type", "float")
+
+        # Second pass: identify the primary type
+        for inner in reversed(validator.validators):
+            inner_result = _identify_validator(inner)
+            if inner_result["type"] != "unknown":
+                # Merge range info if we found it
+                inner_result.update(
+                    {
+                        k: v
+                        for k, v in range_info.items()
+                        if k not in inner_result or k.startswith("range")
+                    }
+                )
+                return inner_result
+
+        # If we only found range info, return that
+        if range_info.get("type"):
+            return range_info
+
+    # Last resort: check if the function name hints at the type
+    if "string" in name_lower or "mac_address" in name_lower or "bind_key" in name_lower:
+        return {"type": "string"}
+    if "hex_int" in name_lower or "hex" in name_lower:
+        return {"type": "integer"}
+    if "frequency" in name_lower:
+        return {"type": "float"}
+    if "address" in name_lower:
+        return {"type": "integer"}
 
     return result
 
@@ -444,16 +653,22 @@ def _determine_category(component_id: str, platforms: list[str]) -> str:
     return "misc"
 
 
-def _generate_name(component_id: str, category: str) -> str:
+def _generate_name(component_id: str, category: str, docs_meta: dict | None = None) -> str:
     """Generate a human-readable name for a component."""
+    # Prefer docs title
+    if docs_meta and docs_meta.get("title"):
+        return docs_meta["title"]
     if component_id in COMPONENT_NAMES:
         return COMPONENT_NAMES[component_id]
-    # Titlecase the ID
     name = component_id.replace("_", " ").replace("-", " ").title()
     return name
 
 
-def _sync_component(component_id: str, platform_types: set[str]) -> dict | None:
+def _sync_component(
+    component_id: str,
+    platform_types: set[str],
+    docs_meta: dict[str, dict[str, str]] | None = None,
+) -> dict | None:
     """Sync a single component. Returns a dict or None on failure."""
     try:
         manifest = get_component(component_id)
@@ -471,13 +686,41 @@ def _sync_component(component_id: str, platform_types: set[str]) -> dict | None:
     # Find which platforms this component provides
     platforms = _get_component_platforms(component_id, platform_types)
     category = _determine_category(component_id, platforms)
-    name = _generate_name(component_id, category)
+
+    # Get docs metadata — try exact match first, then strip bus suffixes
+    all_docs = docs_meta or {}
+    comp_docs = all_docs.get(component_id, {})
+    if not comp_docs:
+        # Try stripping _i2c, _spi, _uart, _base suffixes
+        for suffix in ("_i2c", "_spi", "_uart", "_base"):
+            if component_id.endswith(suffix):
+                base_id = component_id.removesuffix(suffix)
+                comp_docs = all_docs.get(base_id, {})
+                if comp_docs:
+                    break
+    name = _generate_name(component_id, category, comp_docs)
+    description = comp_docs.get("description", "")
+
+    # Build image URL from docs image file
+    image_url = ""
+    image_file = comp_docs.get("image_file", "")
+    if image_file:
+        doc_cat = comp_docs.get("category") or category
+        if doc_cat and doc_cat not in ("core", "bus", "automation", "misc"):
+            image_url = f"https://esphome.io/components/{doc_cat}/images/{image_file}"
+        else:
+            image_url = f"https://esphome.io/components/images/{image_file}"
+
+    # Build docs URL
+    if category not in ("core", "bus", "automation", "misc"):
+        docs_url = f"https://esphome.io/components/{category}/{component_id}"
+    else:
+        docs_url = f"https://esphome.io/components/{component_id}"
 
     # Parse config schema
     config_entries: list[dict] = []
     sub_entities: list[dict] = []
 
-    # For platform components, parse the platform-specific schema
     if platforms:
         primary_platform = platforms[0]
         for pref in ("sensor", "binary_sensor", "switch", "light", "fan", "cover"):
@@ -513,12 +756,10 @@ def _sync_component(component_id: str, platform_types: set[str]) -> dict | None:
     return {
         "id": component_id,
         "name": name,
-        "description": "",
+        "description": description,
         "category": category,
-        "docs_url": f"https://esphome.io/components/{category}/{component_id}.html"
-        if category not in ("core", "bus", "automation", "misc")
-        else f"https://esphome.io/components/{component_id}.html",
-        "image_url": "",
+        "docs_url": docs_url,
+        "image_url": image_url,
         "dependencies": dependencies,
         "auto_load": auto_load,
         "multi_conf": bool(manifest.multi_conf),
@@ -531,7 +772,10 @@ def sync(dry_run: bool = False) -> None:
     """Run the component sync."""
     global PLATFORM_TYPES
 
-    print("Discovering platform types...")
+    # Fetch docs metadata first (titles, descriptions, images)
+    docs_meta = fetch_docs_metadata()
+
+    print("\nDiscovering platform types...")
     PLATFORM_TYPES = _discover_platform_types()
     print(
         f"Found {len(PLATFORM_TYPES)} platform types: {', '.join(sorted(PLATFORM_TYPES)[:10])}..."
@@ -548,7 +792,7 @@ def sync(dry_run: bool = False) -> None:
     failed = 0
 
     for comp_id in component_dirs:
-        result = _sync_component(comp_id, PLATFORM_TYPES)
+        result = _sync_component(comp_id, PLATFORM_TYPES, docs_meta)
         if result is None:
             continue
         components.append(result)

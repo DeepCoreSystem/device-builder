@@ -103,7 +103,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"script/*" = ["T20", "S108", "S310", "S110", "E501"]  # CLI scripts: print, tempdir, URL open, bare except, long lines
+"script/*" = ["T20", "S108", "S310", "S110", "S603", "S607", "E501"]  # CLI scripts
 
 [tool.codespell]
 skip = "*.json,*/definitions/*"

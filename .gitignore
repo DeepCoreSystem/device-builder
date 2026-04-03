@@ -25,5 +25,8 @@ Thumbs.db
 
 # Configs (user data, not shipped)
 configs/
+
+# Script caches (cloned repos for sync)
+.cache/
 /__pycache__
 *.lock
