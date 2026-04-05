@@ -7,10 +7,10 @@ import logging
 
 from aiohttp import web
 
-from ..components import COMPONENT_CATALOG
+from ..controllers.components import COMPONENT_CATALOG
+from ..helpers.json import error_response, get_settings, json_response
 from ..models import AddComponentResponse
 from ..yaml_editor import generate_component_yaml
-from .util import error_response, get_settings, json_response
 
 _LOGGER = logging.getLogger(__name__)
 

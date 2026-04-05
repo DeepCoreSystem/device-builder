@@ -8,9 +8,9 @@ import json
 from aiohttp import web
 
 from ..catalogs import AUTOMATION_CATALOG
+from ..helpers.json import error_response, get_settings, json_response
 from ..models import AddAutomationResponse
 from ..yaml_editor import build_automation_yaml
-from .util import error_response, get_settings, json_response
 
 routes = web.RouteTableDef()
 

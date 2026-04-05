@@ -14,9 +14,9 @@ from esphome.components.esp32 import VARIANTS as ESP32_VARIANTS
 from esphome.storage_json import StorageJSON, ext_storage_path
 from esphome.util import get_serial_ports
 
-from ..metadata import get_preferences, set_preferences
+from ..controllers.metadata import get_preferences, set_preferences
+from ..helpers.json import error_response, get_settings, json_response
 from ..models import SerialPort, VersionResponse
-from .util import error_response, get_settings, json_response
 
 _LOGGER = logging.getLogger(__name__)
 

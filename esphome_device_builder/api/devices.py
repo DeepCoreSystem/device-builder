@@ -9,20 +9,25 @@ from pathlib import Path
 
 from aiohttp import web
 from esphome import const
-from esphome.config_helpers import import_config
 from esphome.dashboard.util.text import friendly_name_slugify
 from esphome.storage_json import (
     ext_storage_path,
 )
 
-from ..dashboard import DASHBOARD
-from ..entries import entry_state_to_bool
-from ..metadata import (
+try:
+    from esphome.config_helpers import import_config
+except ImportError:
+    import_config = None  # type: ignore[assignment]
+
+from ..controllers.metadata import (
     get_board_id,
     get_device_metadata,
     remove_device_metadata,
     set_device_metadata,
 )
+from ..dashboard import DASHBOARD
+from ..entries import entry_state_to_bool
+from ..helpers.json import error_response, get_settings, json_response
 from ..models import (
     AdoptableDevice,
     ConfiguredDevice,
@@ -31,7 +36,6 @@ from ..models import (
     UpdateDeviceResponse,
     WizardResponse,
 )
-from .util import error_response, get_settings, json_response
 
 _LOGGER = logging.getLogger(__name__)
 

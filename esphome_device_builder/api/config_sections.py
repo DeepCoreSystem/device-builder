@@ -8,9 +8,9 @@ import json
 from aiohttp import web
 
 from ..catalogs import CONFIG_CATALOG
+from ..helpers.json import error_response, get_settings, json_response
 from ..models import AddConfigSectionResponse
 from ..yaml_editor import append_yaml_block, build_component_yaml
-from .util import error_response, get_settings, json_response
 
 routes = web.RouteTableDef()
 

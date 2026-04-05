@@ -1,8 +1,10 @@
-"""WebSocket handlers for streaming ESPHome CLI operations.
+"""DEPRECATED: Legacy WebSocket handlers for ESPHome CLI operations.
 
-Each endpoint accepts a JSON ``spawn`` message and then streams
-``{"event": "line", "data": "..."}`` messages until the process exits,
-followed by ``{"event": "exit", "code": N}``.
+These endpoints use the old spawn-based protocol required by the Home Assistant
+ESPHome integration (via esphome-dashboard-api). They will be removed once HA
+migrates to the new /ws multiplexed API.
+
+New clients should use the /ws endpoint instead (see api/ws.py).
 """
 
 from __future__ import annotations
@@ -19,7 +21,7 @@ from aiohttp import web
 
 from ..dashboard import DASHBOARD
 from ..entries import entry_state_to_bool
-from .util import get_settings
+from ..helpers.json import get_settings
 
 _LOGGER = logging.getLogger(__name__)
 

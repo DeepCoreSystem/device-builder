@@ -1,4 +1,7 @@
-"""WebSocket /events handler — real-time dashboard state updates."""
+"""DEPRECATED: Legacy WebSocket /events handler for real-time state updates.
+
+New clients should use the /ws endpoint with the subscribe_events command instead.
+"""
 
 from __future__ import annotations
 
@@ -10,10 +13,10 @@ from typing import Any
 import aiohttp
 from aiohttp import web
 
+from ..controllers.metadata import get_board_id
 from ..dashboard import DASHBOARD, DashboardEvent, Event
 from ..entries import entry_state_to_bool
-from ..metadata import get_board_id
-from .util import get_settings
+from ..helpers.json import get_settings
 
 _LOGGER = logging.getLogger(__name__)
 

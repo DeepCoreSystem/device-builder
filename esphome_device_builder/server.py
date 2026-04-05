@@ -8,21 +8,22 @@ from pathlib import Path
 
 from aiohttp import web
 
-from .boards import BOARD_CATALOG
-from .components import COMPONENT_CATALOG
-from .dashboard import DASHBOARD
-from .handlers import (
+from .api import (
+    _legacy_events,
+    _legacy_operations,
     automations,
     boards,
     components,
     config_sections,
     devices,
-    events,
     misc,
-    operations,
     section_config,
+    ws,
 )
-from .handlers.util import cors_middleware
+from .controllers.boards import BOARD_CATALOG
+from .controllers.components import COMPONENT_CATALOG
+from .dashboard import DASHBOARD
+from .helpers.json import cors_middleware
 from .settings import DashboardSettings
 
 _LOGGER = logging.getLogger(__name__)
@@ -88,6 +89,10 @@ def create_app(settings: DashboardSettings) -> web.Application:
     app["settings"] = settings
 
     # Register all API route tables
+    # New multiplexed WebSocket API
+    app.router.add_routes(ws.routes)
+
+    # REST API routes
     for module in (
         devices,
         boards,
@@ -95,11 +100,13 @@ def create_app(settings: DashboardSettings) -> web.Application:
         automations,
         config_sections,
         section_config,
-        operations,
-        events,
         misc,
     ):
         app.router.add_routes(module.routes)
+
+    # Legacy WebSocket endpoints (backward compat with HA dashboard-api)
+    app.router.add_routes(_legacy_operations.routes)
+    app.router.add_routes(_legacy_events.routes)
 
     # Serve the built frontend if available
     frontend_dir = _get_frontend_dir()

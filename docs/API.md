@@ -2,7 +2,68 @@
 
 Base URL: `http://localhost:6052`
 
-All responses are JSON. WebSocket endpoints are noted.
+## WebSocket API (`/ws`)
+
+The primary API for the frontend. A single multiplexed WebSocket connection handles all commands.
+
+### Protocol
+
+**Connect:** `ws://localhost:6052/ws`
+
+On connect, the server sends a `ServerInfoMessage`:
+```json
+{"server_version": "0.0.0", "esphome_version": "2026.3.1"}
+```
+
+**Send a command:**
+```json
+{"command": "compile", "message_id": "1", "args": {"configuration": "device.yaml"}}
+```
+
+**Receive a result (single response):**
+```json
+{"message_id": "1", "result": {"pong": true}}
+```
+
+**Receive streaming output (compile/upload/logs):**
+```json
+{"message_id": "1", "event": "output", "data": "Compiling...\n"}
+{"message_id": "1", "event": "output", "data": "Done.\n"}
+{"message_id": "1", "event": "result", "data": {"success": true, "code": 0}}
+```
+
+**Error:**
+```json
+{"message_id": "1", "error_code": "unknown_command", "details": "Unknown command: foo"}
+```
+
+### Commands
+
+| Command | Args | Response | Description |
+|---------|------|----------|-------------|
+| `compile` | `{configuration}` | Streaming output + result | Compile device firmware |
+| `upload` | `{configuration, port?}` | Streaming output + result | Upload firmware to device |
+| `logs` | `{configuration, port?}` | Streaming output | Stream device logs |
+| `validate` | `{configuration}` | Streaming output + result | Validate YAML config |
+| `clean` | `{configuration}` | Streaming output + result | Clean build files |
+| `ping` | — | `{pong: true}` | Health check |
+| `subscribe_events` | — | Streaming events | Subscribe to device state changes |
+
+### Error Codes
+
+| Code | Description |
+|------|-------------|
+| `invalid_message` | Malformed JSON or missing required fields |
+| `unknown_command` | Command not found |
+| `invalid_args` | Missing or invalid arguments |
+| `not_found` | Resource not found |
+| `internal_error` | Server error |
+
+---
+
+## REST API
+
+All REST responses are JSON.
 
 ## Boards
 
@@ -122,64 +183,23 @@ List all automation triggers and actions.
 
 List all config section templates (wifi, api, ota, logger, …).
 
-## Operations (WebSocket)
+## Legacy WebSocket Endpoints (Deprecated)
 
-All operation endpoints use WebSocket. The client sends a spawn message, then receives streaming output.
+These endpoints exist for backward compatibility with the Home Assistant ESPHome
+integration (via `esphome-dashboard-api`). New clients should use `/ws` instead.
 
-**Protocol:**
+### `GET /compile`, `/upload` (WebSocket)
 
-```
-→  { "type": "spawn", "configuration": "device.yaml", "port": "/dev/ttyUSB0" }
-←  { "event": "line", "data": "Compiling...\n" }
-←  { "event": "line", "data": "Done.\n" }
-←  { "event": "exit", "code": 0 }
-```
+Used by HA for firmware compilation and OTA uploads.
+Protocol: `{"type": "spawn", ...}` → `{"event": "line", ...}` → `{"event": "exit", "code": N}`
 
-### `GET /compile` (WebSocket)
+### `GET /logs`, `/validate`, `/clean`, `/rename` (WebSocket)
 
-Compile device firmware.
-
-### `GET /upload` (WebSocket)
-
-Upload firmware to device. Supports `port` in spawn message.
-
-### `GET /logs` (WebSocket)
-
-Stream device logs. Supports `port` in spawn message.
-
-### `GET /validate` (WebSocket)
-
-Validate a device YAML config.
-
-### `GET /clean` (WebSocket)
-
-Clean build artifacts.
-
-### `GET /rename` (WebSocket)
-
-Rename a device. Spawn message includes `newName`.
-
-### `POST /update-all`
-
-Trigger OTA update for all online devices (fire-and-forget).
-
-## Real-time Events (WebSocket)
+Same spawn-based protocol. Not used by HA — frontend-only.
 
 ### `GET /events` (WebSocket)
 
-Subscribe to real-time dashboard state changes.
-
-**Events sent by server:**
-
-| Event | Description |
-|-------|-------------|
-| `INITIAL_STATE` | Full device list + ping status on connect |
-| `ENTRY_ADDED` | New config file detected |
-| `ENTRY_REMOVED` | Config file deleted |
-| `ENTRY_UPDATED` | Config file modified |
-| `ENTRY_STATE_CHANGED` | Device online/offline state changed |
-| `IMPORTABLE_DEVICE_ADDED` | New adoptable device discovered |
-| `IMPORTABLE_DEVICE_REMOVED` | Adoptable device disappeared |
+Legacy event subscription. Use `subscribe_events` command on `/ws` instead.
 
 ## Utilities
 

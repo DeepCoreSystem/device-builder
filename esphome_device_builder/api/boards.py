@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from aiohttp import web
 
-from ..boards import BOARD_CATALOG
-from .util import error_response, json_response
+from ..controllers.boards import BOARD_CATALOG
+from ..helpers.json import error_response, json_response
 
 routes = web.RouteTableDef()
 

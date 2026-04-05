@@ -9,8 +9,8 @@ from typing import Any
 
 from aiohttp import web
 
+from ..helpers.json import error_response, get_settings, json_response
 from ..section_config import get_section_config
-from .util import error_response, get_settings, json_response
 
 routes = web.RouteTableDef()
 
