@@ -11,8 +11,8 @@ from ..helpers.api import api_command
 from ..models import (
     ComponentCatalogEntry,
     ComponentCategory,
-    ComponentConfigEntry,
     ComponentSubEntity,
+    ConfigEntry,
     ConfigEntryType,
     PagedComponentsResponse,
 )
@@ -22,14 +22,14 @@ _LOGGER = logging.getLogger(__name__)
 _COMPONENTS_JSON = Path(__file__).resolve().parent.parent / "definitions" / "components.json"
 
 
-def _load_config_entry(data: dict) -> ComponentConfigEntry:
-    """Load a ComponentConfigEntry from a dict."""
+def _load_config_entry(data: dict) -> ConfigEntry:
+    """Load a ConfigEntry from a dict."""
     range_val = None
     raw_range = data.get("range")
     if raw_range and isinstance(raw_range, (list, tuple)) and len(raw_range) == 2:
         range_val = (raw_range[0], raw_range[1])
 
-    return ComponentConfigEntry(
+    return ConfigEntry(
         key=data["key"],
         type=ConfigEntryType(data.get("type", "unknown")),
         label=data.get("label", data["key"]),

@@ -8,29 +8,12 @@ from typing import Any
 
 from mashumaro.mixins.orjson import DataClassORJSONMixin
 
-from .common import PagedResponse
-
-
-class ConfigEntryType(StrEnum):
-    """Config entry field types."""
-
-    STRING = "string"
-    INTEGER = "integer"
-    FLOAT = "float"
-    BOOLEAN = "boolean"
-    SELECT = "select"
-    PIN = "pin"
-    TIME_PERIOD = "time_period"
-    ICON = "icon"
-    ID = "id"
-    TRIGGER = "trigger"
-    UNKNOWN = "unknown"
+from .common import ConfigEntry, PagedResponse
 
 
 class ComponentCategory(StrEnum):
     """Component categories (ESPHome platform types + infrastructure)."""
 
-    # Entity platform types
     SENSOR = "sensor"
     BINARY_SENSOR = "binary_sensor"
     SWITCH = "switch"
@@ -56,26 +39,10 @@ class ComponentCategory(StrEnum):
     EVENT = "event"
     UPDATE = "update"
     ALARM = "alarm_control_panel"
-    # Infrastructure categories
     CORE = "core"
     BUS = "bus"
     AUTOMATION = "automation"
     MISC = "misc"
-
-
-@dataclass
-class ComponentConfigEntry(DataClassORJSONMixin):
-    """A config field for a component."""
-
-    key: str
-    type: ConfigEntryType
-    label: str
-    required: bool = False
-    default_value: str | int | float | bool | None = None
-    description: str | None = None
-    options: list[str] | None = None
-    range: tuple[int | float, int | float] | None = None
-    advanced: bool = False
 
 
 @dataclass
@@ -84,7 +51,7 @@ class ComponentSubEntity(DataClassORJSONMixin):
 
     key: str
     platform_type: str
-    config_entries: list[ComponentConfigEntry] = field(default_factory=list)
+    config_entries: list[ConfigEntry] = field(default_factory=list)
 
 
 @dataclass
@@ -100,7 +67,7 @@ class ComponentCatalogEntry(DataClassORJSONMixin):
     dependencies: list[str] = field(default_factory=list)
     auto_load: list[str] = field(default_factory=list)
     multi_conf: bool = False
-    config_entries: list[ComponentConfigEntry] = field(default_factory=list)
+    config_entries: list[ConfigEntry] = field(default_factory=list)
     sub_entities: list[ComponentSubEntity] = field(default_factory=list)
 
 
