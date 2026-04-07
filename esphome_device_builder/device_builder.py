@@ -20,9 +20,9 @@ from typing import TYPE_CHECKING, Any
 from aiohttp import web
 from esphome.storage_json import ignored_devices_storage_path
 
+from .controllers.config import DashboardSettings
 from .helpers.api import CommandHandler, collect_api_commands
 from .helpers.json import cors_middleware
-from .settings import DashboardSettings
 
 if TYPE_CHECKING:
     from .entries import DashboardEntries

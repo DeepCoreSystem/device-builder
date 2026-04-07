@@ -23,7 +23,7 @@ import aiohttp
 from aiohttp import web
 from esphome import yaml_util
 
-from ..controllers.metadata import get_board_id
+from ..controllers.config import get_board_id
 
 _LOGGER = logging.getLogger(__name__)
 

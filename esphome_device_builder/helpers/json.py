@@ -1,4 +1,4 @@
-"""Shared aiohttp utilities: JSON helpers, CORS middleware, auth."""
+"""JSON response helpers and CORS middleware."""
 
 from __future__ import annotations
 
@@ -7,8 +7,6 @@ from typing import Any
 
 import orjson
 from aiohttp import web
-
-from ..settings import DashboardSettings
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -27,11 +25,8 @@ def json_response(data: Any, status: int = 200) -> web.Response:
 
 
 def error_response(message: str, status: int = 400) -> web.Response:
+    """Return a JSON error response."""
     return json_response({"error": message}, status)
-
-
-def get_settings(request: web.Request) -> DashboardSettings:
-    return request.app["settings"]
 
 
 @web.middleware

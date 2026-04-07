@@ -20,7 +20,7 @@ from ..models import (
     UpdateDeviceResponse,
     WizardResponse,
 )
-from .metadata import (
+from .config import (
     get_board_id,
     get_device_metadata,
     remove_device_metadata,
