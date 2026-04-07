@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
+from esphome.storage_json import ignored_devices_storage_path
 
 from .helpers.api import CommandHandler, collect_api_commands
 from .helpers.json import cors_middleware
@@ -192,8 +193,6 @@ class DeviceBuilder:
 
     def _load_ignored_devices(self) -> None:
         """Load ignored devices list from disk."""
-        from esphome.storage_json import ignored_devices_storage_path
-
         storage_path = ignored_devices_storage_path()
         try:
             with storage_path.open("r", encoding="utf-8") as f:
@@ -204,8 +203,6 @@ class DeviceBuilder:
 
     def save_ignored_devices(self) -> None:
         """Persist ignored devices list to disk."""
-        from esphome.storage_json import ignored_devices_storage_path
-
         storage_path = ignored_devices_storage_path()
         with storage_path.open("w", encoding="utf-8") as f:
             json.dump({"ignored_devices": sorted(self.ignored_devices)}, f, indent=2)

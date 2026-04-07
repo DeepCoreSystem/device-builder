@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 import orjson
 from aiohttp import WSMsgType, web
+from esphome.const import __version__ as esphome_version
 
 from ..const import __version__
 from ..models import (
@@ -111,11 +112,6 @@ async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
     client = WebSocketClient(ws, device_builder)
 
     # Send server info on connect
-    try:
-        from esphome.const import __version__ as esphome_version
-    except ImportError:
-        esphome_version = "unknown"
-
     info = ServerInfoMessage(server_version=__version__, esphome_version=esphome_version)
     await client.send(info.to_dict())
 

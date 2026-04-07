@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import os
 from dataclasses import dataclass, field
@@ -14,8 +15,6 @@ _DASHBOARD_SENTINEL_FILE = "___DASHBOARD_SENTINEL___.yaml"
 
 
 def _hash_password(password: str) -> bytes:
-    import hashlib
-
     return hashlib.sha256(password.encode("utf-8")).digest()
 
 

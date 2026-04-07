@@ -21,6 +21,9 @@ from typing import Any
 
 import aiohttp
 from aiohttp import web
+from esphome import yaml_util
+
+from ..controllers.metadata import get_board_id
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -76,8 +79,6 @@ def create_legacy_routes() -> web.RouteTableDef:
             await db.entries.async_request_update_entries()
         entries = await db.entries.async_all() if db.entries else []
 
-        from ..controllers.metadata import get_board_id
-
         configured = []
         for entry in entries:
             configured.append(
@@ -118,8 +119,6 @@ def create_legacy_routes() -> web.RouteTableDef:
     @routes.get("/json-config")
     async def legacy_json_config(request: web.Request) -> web.Response:
         """Legacy GET /json-config — parsed YAML config as JSON."""
-        from esphome import yaml_util
-
         configuration = request.query.get("configuration", "")
         db = request.app["device_builder"]
         try:
