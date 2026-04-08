@@ -42,8 +42,10 @@ class Connectivity(StrEnum):
     ETHERNET = "ethernet"
     ZIGBEE = "zigbee"
     THREAD = "thread"
+    OPENTHREAD = "openthread"
     CAN = "can"
     MATTER = "matter"
+    LORA = "lora"
 
 
 class Platform(StrEnum):
