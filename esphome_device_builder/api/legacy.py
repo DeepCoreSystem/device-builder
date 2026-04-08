@@ -76,10 +76,10 @@ def create_legacy_routes() -> web.RouteTableDef:
         """Legacy GET /devices — returns configured + importable devices."""
         db = request.app["device_builder"]
         devices_ctrl = db.devices
-        await devices_ctrl._request_update_entries()
+        await devices_ctrl._request_scan_devices()
 
         configured = []
-        for entry in devices_ctrl.get_all_entries():
+        for entry in devices_ctrl.get_devices():
             configured.append(
                 entry.to_legacy_dict(board_id=get_board_id(db.settings.config_dir, entry.filename))
             )
