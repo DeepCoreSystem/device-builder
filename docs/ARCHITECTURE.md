@@ -6,53 +6,71 @@
 
 2. **ESPHome is an optional dependency.** `pip install .[esphome]` pulls it in for standalone use. Plain `pip install .` works when esphome is already present (e.g. inside the ESPHome container).
 
-3. **Frontend and backend are separate repos.** The frontend is published as a pip package (`esphome-device-builder-frontend`). The backend try-imports it and serves the static files. During development, the frontend dev server proxies API calls to the backend.
+3. **Frontend and backend are separate repos.** The frontend is published as a pip package. The backend try-imports it and serves the static files. During development, the frontend dev server proxies API calls to the backend.
 
-4. **Backward compatible.** The `esphome/dashboard-api` client (used by Home Assistant) must keep working. All endpoints it calls are preserved.
+4. **WS-first API.** Everything goes through a single `/ws` WebSocket endpoint. REST endpoints only exist for HA backward compat.
 
-## ESPHome Interaction
+## Project Structure
 
-| What | How | Why |
-|------|-----|-----|
-| Compile, upload, logs, validate, clean | Subprocess (`python -m esphome`) | Streaming output over WebSocket |
-| Device metadata (StorageJSON) | Python import | Direct file access, no CLI equivalent |
-| Board definitions per platform | Python import | ESPHome's built-in BOARDS dicts |
-| Serial port listing | Python import | `esphome.util.get_serial_ports` |
-| Device import/adoption | Python import | `esphome.config_helpers.import_config` |
-
-## Frontend Distribution
-
-- The frontend repo builds to a Python package containing static files and a `where()` function
-- Can be built via GitHub Actions and distributed as a wheel artifact — no PyPI needed during development
-- The backend detects it at startup; if absent, runs in API-only mode (for development)
-
-## Deployment Strategy
-
-### Beta Phase
-
-The existing ESPHome HA add-on and Docker image get an opt-in toggle to try the new dashboard:
-
-**HA add-on** — a config toggle `new_dashboard_beta: true`:
 ```
-# add-on run script checks the toggle:
-if bashio::config.true 'new_dashboard_beta'; then
-    pip install --pre esphome-device-builder esphome-device-builder-frontend
-    exec esphome-device-builder /config --host 0.0.0.0 --port 6052
-fi
-# otherwise: exec esphome dashboard /config
+esphome_device_builder/
+├── device_builder.py          # Core singleton — owns controllers, event bus, web app
+├── __main__.py                # CLI entry point
+├── const.py                   # Version + defaults
+│
+├── models/                    # Data shapes only — no logic, no I/O
+│   ├── common.py              # EventType, ConfigEntry, PagedResponse
+│   ├── devices.py             # Device, AdoptableDevice, DevicesResponse
+│   ├── boards.py              # Board enums + models
+│   ├── components.py          # Component enums + models
+│   └── api.py                 # WebSocket protocol (Command/Result/Error/Event)
+│
+├── controllers/               # Business logic — all state lives here
+│   ├── boards.py              # BoardCatalog: search/get boards
+│   ├── components.py          # ComponentCatalog: search/get components
+│   ├── config.py              # DashboardSettings + ConfigController + metadata persistence
+│   └── devices.py             # DevicesController: CRUD, file scanning, compile/upload/logs
+│
+├── helpers/                   # Pure utilities — no state
+│   ├── api.py                 # @api_command decorator + command registry
+│   ├── event_bus.py           # EventBus
+│   └── json.py                # JSON response helpers, CORS
+│
+├── api/                       # Transport layer
+│   ├── ws.py                  # /ws WebSocket dispatch
+│   └── legacy.py              # HA compat: GET /devices, GET /json-config, /compile, /upload
+│
+└── definitions/               # Data files
+    ├── boards/                # 501 board YAML manifests
+    ├── components.json        # Generated component catalog (655 components)
+    └── schemas/               # JSON schemas for validation
 ```
 
-**Docker** — an env var `USE_NEW_DASHBOARD=1`:
-```bash
-docker run -e USE_NEW_DASHBOARD=1 esphome/esphome
-```
+## How it works
 
-Both use `docker/install_new_dashboard.sh` which pip-installs the latest pre-release and starts the new dashboard. Users flip the toggle back to return to the legacy dashboard instantly.
+**DeviceBuilder** is the singleton. On startup it creates controllers, loads catalogs, and starts the web server. Controllers register their methods as WebSocket commands via `@api_command("devices/list")`. The WS handler dispatches incoming commands to the matching handler.
+
+**A device** is a YAML config file on disk. The `DevicesController` scans the config folder, builds `Device` models from ESPHome's `StorageJSON`, and serves them via commands. Compile/upload/logs stream output back over the WebSocket.
+
+**Boards** come from YAML manifests in `definitions/boards/`, synced from PlatformIO repos via `script/sync_boards.py`. Each board has hardware specs, pin definitions, and optional images.
+
+**Components** come from `definitions/components.json`, generated by `script/sync_components.py` which introspects ESPHome's installed Python package and parses `CONFIG_SCHEMA` objects + docs metadata.
+
+## Deployment
+
+### Beta (HA add-on)
+
+The existing ESPHome add-on gets a `new_dashboard_beta` toggle. When enabled, it pip-installs the device builder and runs it instead of the legacy dashboard.
 
 ### Production
 
-Remove the toggle. The ESPHome container ships with the new dashboard baked in. The entrypoint runs `esphome-device-builder` instead of `esphome dashboard`. The old `esphome/dashboard` module is deprecated.
+The device builder ships baked into the ESPHome container. The legacy dashboard is deprecated.
 
-## Board & Component Definitions
+## Legacy HA Compatibility
 
-Live in `esphome_device_builder/definitions/`. Each board or component is a subfolder with a `manifest.yaml` and optional assets (e.g. board images). A loader reads all `*/manifest.yaml` files at startup. Adding a board or component = adding a subfolder. These can later be extracted into a separate community-contributed repository.
+The `esphome/dashboard-api` client used by Home Assistant calls:
+- `GET /devices` — device listing
+- `GET /json-config?configuration=...` — parsed YAML as JSON
+- `/compile`, `/upload` (WebSocket, spawn protocol)
+
+These are served by `api/legacy.py` and will be removed once HA migrates to `/ws`.
