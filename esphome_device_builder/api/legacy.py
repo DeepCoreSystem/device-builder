@@ -23,8 +23,6 @@ import aiohttp
 from aiohttp import web
 from esphome import yaml_util
 
-from ..controllers.config import get_board_id
-
 _LOGGER = logging.getLogger(__name__)
 
 _ESPHOME_CMD = [sys.executable, "-m", "esphome"]
@@ -78,11 +76,7 @@ def create_legacy_routes() -> web.RouteTableDef:
         devices_ctrl = db.devices
         await devices_ctrl._request_scan_devices()
 
-        configured = []
-        for entry in devices_ctrl.get_devices():
-            configured.append(
-                entry.to_legacy_dict(board_id=get_board_id(db.settings.config_dir, entry.filename))
-            )
+        configured = [d.to_dict() for d in devices_ctrl.get_devices()]
 
         importable = []
         for name, imp in devices_ctrl.import_result.items():

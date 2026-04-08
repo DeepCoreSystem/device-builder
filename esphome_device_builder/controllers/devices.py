@@ -7,7 +7,6 @@ import json
 import logging
 import sys
 import threading
-from collections import defaultdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -19,7 +18,7 @@ from ..helpers.api import api_command
 from ..models import (
     AddComponentResponse,
     AdoptableDevice,
-    ConfiguredDevice,
+    Device,
     DevicesResponse,
     EventType,
     UpdateDeviceResponse,
@@ -44,104 +43,29 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 _ESPHOME_CMD = [sys.executable, "-m", "esphome"]
 
-# Cache key: (inode, device, mtime, size)
+# Cache key for file change detection: (inode, device, mtime, size)
 _CacheKey = tuple[int, int, float, int]
 
 
-# ---------------------------------------------------------------------------
-# Device entry — wraps an ESPHome YAML config file on disk
-# ---------------------------------------------------------------------------
-
-
-class Device:
-    """A single ESPHome device config file with cached metadata."""
-
-    __slots__ = ("_storage_path", "cache_key", "filename", "path", "storage")
-
-    def __init__(self, path: Path, cache_key: _CacheKey) -> None:
-        self.path = path
-        self.filename = path.name
-        self._storage_path = ext_storage_path(self.filename)
-        self.cache_key = cache_key
-        self.storage: StorageJSON | None = None
-
-    def load_from_disk(self, cache_key: _CacheKey | None = None) -> None:
-        """Load StorageJSON metadata from disk."""
-        self.storage = StorageJSON.load(self._storage_path)
-        if cache_key:
-            self.cache_key = cache_key
-
-    @property
-    def name(self) -> str:
-        if self.storage is None:
-            return self.filename.removesuffix(".yml").removesuffix(".yaml")
-        return self.storage.name
-
-    @property
-    def friendly_name(self) -> str:
-        return self.storage.friendly_name if self.storage else self.name
-
-    @property
-    def comment(self) -> str | None:
-        return self.storage.comment if self.storage else None
-
-    @property
-    def address(self) -> str | None:
-        return self.storage.address if self.storage else None
-
-    @property
-    def web_port(self) -> int | None:
-        return self.storage.web_port if self.storage else None
-
-    @property
-    def target_platform(self) -> str | None:
-        return self.storage.target_platform if self.storage else None
-
-    @property
-    def deployed_version(self) -> str:
-        if self.storage is None:
-            return ""
-        return self.storage.esphome_version or ""
-
-    @property
-    def loaded_integrations(self) -> list[str]:
-        if self.storage is None:
-            return []
-        return list(self.storage.loaded_integrations)
-
-    def to_configured_device(self, board_id: str = "") -> ConfiguredDevice:
-        """Convert to a ConfiguredDevice model."""
-        return ConfiguredDevice(
-            name=self.name,
-            friendly_name=self.friendly_name,
-            configuration=self.filename,
-            path=str(self.path),
-            comment=self.comment,
-            address=self.address or "",
-            web_port=self.web_port,
-            target_platform=self.target_platform or "UNKNOWN",
-            current_version=const.__version__,
-            deployed_version=self.deployed_version,
-            loaded_integrations=sorted(self.loaded_integrations),
-            board_id=board_id,
-        )
-
-    def to_legacy_dict(self, board_id: str = "") -> dict[str, Any]:
-        """Format for legacy HA /devices endpoint."""
-        return {
-            "name": self.name,
-            "friendly_name": self.friendly_name,
-            "configuration": self.filename,
-            "path": str(self.path),
-            "comment": self.comment,
-            "address": self.address or "",
-            "web_port": self.web_port,
-            "target_platform": self.target_platform or "UNKNOWN",
-            "current_version": const.__version__,
-            "deployed_version": self.deployed_version,
-            "loaded_integrations": sorted(self.loaded_integrations),
-            "board_id": board_id,
-        }
+def _load_device_from_storage(path: Path, board_id: str = "") -> Device:
+    """Build a Device model from a YAML config file and its StorageJSON."""
+    filename = path.name
+    storage = StorageJSON.load(ext_storage_path(filename))
+    name = storage.name if storage else filename.removesuffix(".yml").removesuffix(".yaml")
+    return Device(
+        name=name,
+        friendly_name=storage.friendly_name if storage else name,
+        configuration=filename,
+        path=str(path),
+        comment=storage.comment if storage else None,
+        address=storage.address or "" if storage else "",
+        web_port=storage.web_port if storage else None,
+        target_platform=storage.target_platform or "UNKNOWN" if storage else "UNKNOWN",
+        current_version=const.__version__,
+        deployed_version=storage.esphome_version or "" if storage else "",
+        loaded_integrations=sorted(storage.loaded_integrations) if storage else [],
+        board_id=board_id,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -150,13 +74,13 @@ class Device:
 
 
 class DevicesController:
-    """Manages device configurations, file watching, and CLI operations."""
+    """Manage device configurations, file watching, and CLI operations."""
 
     def __init__(self, device_builder: DeviceBuilder) -> None:
         self._db = device_builder
         self._devices: dict[Path, Device] = {}
-        self._name_to_entry: dict[str, set[Device]] = defaultdict(set)
-        self._update_lock = asyncio.Lock()
+        self._cache_keys: dict[Path, _CacheKey] = {}
+        self._scan_lock = asyncio.Lock()
 
         # Device state
         self.import_result: dict[str, Any] = {}
@@ -165,7 +89,7 @@ class DevicesController:
         self.mqtt_ping_request = threading.Event()
 
     async def start(self) -> None:
-        """Initialize the devices controller — load state, scan files."""
+        """Initialize — load state, scan files."""
         self.ping_request = asyncio.Event()
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._load_ignored_devices)
@@ -173,69 +97,80 @@ class DevicesController:
 
     async def poll(self) -> None:
         """Poll for file changes and device state."""
-        await self._request_scan_devices()
+        await self._request_scan()
         if self.ping_request:
             self.ping_request.set()
 
     # ------------------------------------------------------------------
-    # File watching
+    # File scanning
     # ------------------------------------------------------------------
 
     def get_devices(self) -> list[Device]:
-        """Get all device entries."""
+        """Get all loaded devices."""
         return list(self._devices.values())
 
-    async def _request_scan_devices(self) -> None:
-        if self._update_lock.locked():
+    async def _request_scan(self) -> None:
+        if self._scan_lock.locked():
             return
         await self.scan_devices()
 
     async def scan_devices(self) -> None:
-        """Scan disk for YAML file changes."""
-        async with self._update_lock:
-            await self._do_update()
+        """Scan the config folder for YAML file changes."""
+        async with self._scan_lock:
+            await self._do_scan()
 
-    async def _do_update(self) -> None:
+    async def _do_scan(self) -> None:
         loop = asyncio.get_running_loop()
-        path_to_cache_key = await loop.run_in_executor(None, self._get_path_to_cache_key)
-
-        entries = self._devices
-        name_to_entry = self._name_to_entry
+        config_dir = self._db.settings.config_dir
         bus = self._db.bus
 
-        removed = {e for p, e in entries.items() if p not in path_to_cache_key}
-        added: dict[Device, _CacheKey] = {}
-        updated: dict[Device, _CacheKey] = {}
+        # Get current state of files on disk
+        path_to_cache_key = await loop.run_in_executor(None, self._get_path_to_cache_key)
 
-        for path, cache_key in path_to_cache_key.items():
-            entry = entries.get(path)
-            if entry is None:
-                added[Device(path, cache_key)] = cache_key
-            elif entry.cache_key != cache_key:
-                updated[entry] = cache_key
+        old_paths = set(self._devices.keys())
+        new_paths = set(path_to_cache_key.keys())
 
-        if added or updated:
-            to_load = {**dict(added), **updated}
-            await loop.run_in_executor(None, self._load_entries, to_load)
+        removed_paths = old_paths - new_paths
+        added_paths = new_paths - old_paths
+        possibly_updated = old_paths & new_paths
 
-        for entry in added:
-            entries[entry.path] = entry
-            name_to_entry[entry.name].add(entry)
-            bus.fire(EventType.ENTRY_ADDED, {"entry": entry})
+        # Detect updated files (cache key changed)
+        updated_paths = {
+            p for p in possibly_updated if path_to_cache_key[p] != self._cache_keys.get(p)
+        }
 
-        for entry in removed:
-            del entries[entry.path]
-            name_to_entry[entry.name].discard(entry)
-            bus.fire(EventType.ENTRY_REMOVED, {"entry": entry})
+        # Load new and updated devices from disk
+        paths_to_load = added_paths | updated_paths
+        if paths_to_load:
+            devices_loaded = await loop.run_in_executor(
+                None, self._load_devices, paths_to_load, config_dir
+            )
+            for path, device in devices_loaded.items():
+                self._devices[path] = device
+                self._cache_keys[path] = path_to_cache_key[path]
+                event = EventType.ENTRY_ADDED if path in added_paths else EventType.ENTRY_UPDATED
+                bus.fire(event, {"device": device})
 
-        for entry in updated:
-            bus.fire(EventType.ENTRY_UPDATED, {"entry": entry})
+        # Remove deleted devices
+        for path in removed_paths:
+            device = self._devices.pop(path, None)
+            self._cache_keys.pop(path, None)
+            if device:
+                bus.fire(EventType.ENTRY_REMOVED, {"device": device})
 
-    def _load_entries(self, entries: dict[Device, _CacheKey]) -> None:
-        for entry, cache_key in entries.items():
-            entry.load_from_disk(cache_key)
+    def _load_devices(self, paths: set[Path], config_dir: Path) -> dict[Path, Device]:
+        """Load Device models from disk (runs in executor)."""
+        result: dict[Path, Device] = {}
+        for path in paths:
+            try:
+                board_id = get_board_id(config_dir, path.name)
+                result[path] = _load_device_from_storage(path, board_id)
+            except Exception:
+                _LOGGER.warning("Failed to load device from %s", path.name)
+        return result
 
     def _get_path_to_cache_key(self) -> dict[Path, _CacheKey]:
+        """Scan disk for YAML files and build cache keys."""
         result: dict[Path, _CacheKey] = {}
         for file in util.list_yaml_files([self._db.settings.config_dir]):
             try:
@@ -273,15 +208,9 @@ class DevicesController:
     @api_command("devices/list")
     async def list_devices(self, **kwargs: Any) -> DevicesResponse:
         """List all configured and importable devices."""
-        await self._request_scan_devices()
-        config_dir = self._db.settings.config_dir
-        configured_names: set[str] = set()
-
-        configured = []
-        for entry in self.get_devices():
-            configured_names.add(entry.name)
-            board_id_val = get_board_id(config_dir, entry.filename)
-            configured.append(entry.to_configured_device(board_id_val))
+        await self._request_scan()
+        configured = self.get_devices()
+        configured_names = {d.name for d in configured}
 
         importable = []
         for discovered in self.import_result.values():
@@ -308,7 +237,6 @@ class DevicesController:
             self.ping_request.set()
         if self._db.settings.status_use_mqtt:
             self.mqtt_ping_request.set()
-        # For now return empty — state tracking will be added later
         return {}
 
     # ------------------------------------------------------------------
@@ -349,7 +277,6 @@ class DevicesController:
             if config_type == "upload" and file_content:
                 config_path.write_text(file_content, encoding="utf-8")
                 return
-
             friendly = friendly_name_slugify(name)
             if config_type == "empty":
                 yaml = f"esphome:\n  name: {name}\n  friendly_name: {friendly}\n\n"
@@ -376,14 +303,12 @@ class DevicesController:
         await loop.run_in_executor(None, _write)
 
         if board_id:
+            config_dir = self._db.settings.config_dir
             await loop.run_in_executor(
-                None,
-                lambda: set_device_metadata(
-                    self._db.settings.config_dir, filename, board_id=board_id
-                ),
+                None, lambda: set_device_metadata(config_dir, filename, board_id=board_id)
             )
 
-        await self._request_scan_devices()
+        await self._request_scan()
         return WizardResponse(configuration=filename)
 
     @api_command("devices/update")
@@ -424,7 +349,6 @@ class DevicesController:
     async def delete_device(self, *, configuration: str, **kwargs: Any) -> None:
         """Delete a device and all associated files."""
         config_path = self._db.settings.rel_path(configuration)
-
         if not config_path.exists():
             msg = "File not found"
             raise FileNotFoundError(msg)
@@ -446,7 +370,7 @@ class DevicesController:
                 _LOGGER.warning("Could not remove metadata for %s", configuration)
 
         await loop.run_in_executor(None, _delete_all)
-        await self._request_scan_devices()
+        await self._request_scan()
 
     @api_command("devices/get_config")
     async def get_config(self, *, configuration: str, **kwargs: Any) -> str:
@@ -461,7 +385,7 @@ class DevicesController:
         path = self._db.settings.rel_path(configuration)
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, path.write_text, content, "utf-8")
-        await self._request_scan_devices()
+        await self._request_scan()
 
     @api_command("devices/add_component")
     async def add_component(
@@ -482,7 +406,6 @@ class DevicesController:
             raise ValueError(msg)
 
         fields = fields or {}
-
         for entry in component.config_entries:
             if entry.required and entry.key not in fields:
                 msg = f"Missing required field: {entry.key}"
@@ -495,7 +418,7 @@ class DevicesController:
         existing = await loop.run_in_executor(None, config_path.read_text, "utf-8")
         new_yaml = existing.rstrip() + "\n\n" + yaml_block + "\n"
         await loop.run_in_executor(None, config_path.write_text, new_yaml, "utf-8")
-        await self._request_scan_devices()
+        await self._request_scan()
 
         return AddComponentResponse(yaml=new_yaml)
 
@@ -530,7 +453,7 @@ class DevicesController:
 
         if self.ping_request:
             self.ping_request.set()
-        await self._request_scan_devices()
+        await self._request_scan()
         return {"configuration": f"{name}.yaml"}
 
     @api_command("devices/ignore")
