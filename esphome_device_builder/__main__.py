@@ -6,7 +6,7 @@ import argparse
 import logging
 from logging.handlers import RotatingFileHandler
 
-from .const import DEFAULT_HOST, DEFAULT_PORT
+from .constants import DEFAULT_HOST, DEFAULT_PORT
 from .controllers.config import DashboardSettings
 from .device_builder import DeviceBuilder
 

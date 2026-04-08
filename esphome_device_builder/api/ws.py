@@ -13,7 +13,7 @@ import orjson
 from aiohttp import WSMsgType, web
 from esphome.const import __version__ as esphome_version
 
-from ..const import __version__
+from ..constants import __version__
 from ..models import (
     CommandMessage,
     ErrorCode,

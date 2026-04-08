@@ -19,7 +19,7 @@ from esphome.helpers import get_bool_env
 from esphome.storage_json import StorageJSON, ext_storage_path
 from esphome.util import get_serial_ports
 
-from ..const import __version__ as server_version
+from ..constants import __version__ as server_version
 from ..helpers.api import api_command
 
 if TYPE_CHECKING:
