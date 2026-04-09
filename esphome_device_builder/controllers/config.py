@@ -207,8 +207,9 @@ class ConfigController:
     async def set_prefs(self, **kwargs: Any) -> dict:
         """Update user preferences."""
         loop = asyncio.get_running_loop()
+        prefs = {k: v for k, v in kwargs.items() if k not in ("client", "message_id")}
         return await loop.run_in_executor(
-            None, set_preferences, self._db.settings.config_dir, kwargs
+            None, set_preferences, self._db.settings.config_dir, prefs
         )
 
     @api_command("config/get_secrets")

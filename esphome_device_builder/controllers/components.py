@@ -14,6 +14,7 @@ from ..models import (
     ComponentSubEntity,
     ConfigEntry,
     ConfigEntryType,
+    ConfigValueOption,
     PagedComponentsResponse,
 )
 
@@ -29,6 +30,19 @@ def _load_config_entry(data: dict) -> ConfigEntry:
     if raw_range and isinstance(raw_range, (list, tuple)) and len(raw_range) == 2:
         range_val = (raw_range[0], raw_range[1])
 
+    # Normalise options: JSON may contain plain strings or {label, value} dicts
+    raw_options = data.get("options")
+    options = None
+    if raw_options and isinstance(raw_options, list):
+        options = [
+            ConfigValueOption(label=str(o), value=str(o))
+            if isinstance(o, str)
+            else ConfigValueOption(
+                label=o.get("label", o.get("value", "")), value=o.get("value", "")
+            )
+            for o in raw_options
+        ]
+
     return ConfigEntry(
         key=data["key"],
         type=ConfigEntryType(data.get("type", "unknown")),
@@ -36,7 +50,7 @@ def _load_config_entry(data: dict) -> ConfigEntry:
         required=data.get("required", False),
         default_value=data.get("default_value"),
         description=data.get("description"),
-        options=data.get("options"),
+        options=options,
         range=range_val,
         advanced=data.get("advanced", False),
     )
@@ -103,7 +117,7 @@ class ComponentCatalog:
             counts[comp.category] = counts.get(comp.category, 0) + 1
         return sorted(
             [
-                {"id": cat, "name": cat.replace("_", " ").title(), "count": count}
+                {"id": str(cat), "name": str(cat).replace("_", " ").title(), "count": count}
                 for cat, count in counts.items()
             ],
             key=lambda c: (-c["count"], c["name"]),

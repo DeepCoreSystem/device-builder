@@ -425,7 +425,7 @@ class DevicesController:
         **kwargs: Any,
     ) -> AddComponentResponse:
         """Add a component to a device configuration."""
-        component = self._db.components.get_component(component_id=component_id)
+        component = await self._db.components.get_component(component_id=component_id)
         if component is None:
             msg = f"Unknown component: {component_id}"
             raise ValueError(msg)

@@ -40,7 +40,7 @@ class WebSocketClient:
     async def send(self, data: dict[str, Any]) -> None:
         """Send a JSON message."""
         try:
-            await self._ws.send_bytes(orjson.dumps(data))
+            await self._ws.send_str(orjson.dumps(data).decode())
         except ConnectionResetError:
             pass
 
