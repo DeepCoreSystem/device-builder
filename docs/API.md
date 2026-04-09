@@ -62,6 +62,7 @@ On connect, the server sends a [`ServerInfoMessage`](../esphome_device_builder/m
 | `devices/get_states` | — | `dict` | Get device online/offline states |
 | `devices/create` | `{name, config_type?, platform?, board?, ssid?, psk?, password?, file_content?, board_id?}` | `WizardResponse` | Create new device config |
 | `devices/update` | `{name, friendly_name?, comment?, board_id?}` | `UpdateDeviceResponse` | Update device metadata |
+| `devices/rename` | `{configuration, new_name}` | — | Rename device via ESPHome CLI |
 | `devices/delete` | `{configuration}` | — | Delete device and associated files |
 | `devices/get_config` | `{configuration}` | `string` | Read device YAML config |
 | `devices/update_config` | `{configuration, content}` | — | Write device YAML config |
@@ -108,6 +109,7 @@ On connect, the server sends a [`ServerInfoMessage`](../esphome_device_builder/m
 
 | Command | Args | Response | Description |
 |---------|------|----------|-------------|
+| `components/get_categories` | — | `[{id, name, count}]` | List component categories with counts |
 | `components/get_components` | `{query?, category?, offset?, limit?}` | `PagedComponentsResponse` | Search/list components |
 | `components/get_component` | `{component_id}` | `ComponentCatalogEntry` | Get component with config entries |
 
@@ -119,6 +121,23 @@ On connect, the server sends a [`ServerInfoMessage`](../esphome_device_builder/m
 | `category` | [`ComponentCategory`](../esphome_device_builder/models/components.py) | Filter: `sensor`, `binary_sensor`, `switch`, `light`, `climate`, `core`, `bus`, ... |
 | `offset` | `int` | Pagination offset (default: 0) |
 | `limit` | `int` | Page size (default: 50, max: 200) |
+
+### Automations
+
+> Models: [`AutomationTrigger`](../esphome_device_builder/controllers/automations.py), [`AutomationAction`](../esphome_device_builder/controllers/automations.py)
+>
+> Controller: [`AutomationsController`](../esphome_device_builder/controllers/automations.py)
+
+| Command | Args | Response | Description |
+|---------|------|----------|-------------|
+| `automations/get_triggers` | `{platform_type?}` | `[AutomationTrigger]` | List triggers, optionally filtered by platform type |
+| `automations/get_actions` | — | `[AutomationAction]` | List all available actions |
+| `automations/get_available` | `{configuration}` | `{triggers, actions, present_platform_types}` | Context-aware: returns triggers + actions for a specific device based on its config |
+
+**`automations/get_available` flow:**
+1. Reads the device YAML config
+2. Detects which platform types are present (binary_sensor, sensor, switch, etc.)
+3. Returns device-level triggers (on_boot, on_shutdown) + component-level triggers matching present types + all actions
 
 ### Config
 
@@ -138,7 +157,17 @@ On connect, the server sends a [`ServerInfoMessage`](../esphome_device_builder/m
 | Command | Args | Response | Description |
 |---------|------|----------|-------------|
 | `ping` | — | `{pong: true}` | Health check |
-| `subscribe_events` | — | Streaming [`EventType`](../esphome_device_builder/models/common.py) | Subscribe to state changes |
+| `subscribe_events` | — | Streaming [`EventType`](../esphome_device_builder/models/common.py) | Subscribe to real-time device events |
+
+**`subscribe_events` flow:**
+1. Immediately sends `initial_state` event with current device list
+2. Confirms with `{subscribed: true}` result
+3. Pushes events as they happen — no polling needed:
+   - `device_added` — new config file detected
+   - `device_removed` — config file deleted
+   - `device_updated` — config file modified
+   - `device_state_changed` — device online/offline state changed
+   - `importable_device_added` / `importable_device_removed` — discovered devices
 
 ---
 
@@ -157,6 +186,8 @@ All models are dataclasses with mashumaro `DataClassORJSONMixin` for serializati
 | `ComponentCatalogEntry` | [`models/components.py`](../esphome_device_builder/models/components.py) | Component with config entries |
 | `ComponentSubEntity` | [`models/components.py`](../esphome_device_builder/models/components.py) | Sub-entity (e.g. DHT temperature) |
 | `PagedComponentsResponse` | [`models/components.py`](../esphome_device_builder/models/components.py) | Paginated component list |
+| `AutomationTrigger` | [`controllers/automations.py`](../esphome_device_builder/controllers/automations.py) | Trigger that starts an automation |
+| `AutomationAction` | [`controllers/automations.py`](../esphome_device_builder/controllers/automations.py) | Action performed in an automation |
 | `ConfigEntry` | [`models/common.py`](../esphome_device_builder/models/common.py) | Config field definition |
 | `PagedResponse` | [`models/common.py`](../esphome_device_builder/models/common.py) | Base for paginated responses |
 | `CommandMessage` | [`models/api.py`](../esphome_device_builder/models/api.py) | Client → Server command |
@@ -175,7 +206,7 @@ All models are dataclasses with mashumaro `DataClassORJSONMixin` for serializati
 | `PinFeature` | [`models/boards.py`](../esphome_device_builder/models/boards.py) | `adc`, `dac`, `touch`, `pwm`, `i2c_sda`, `i2c_scl`, `spi_mosi`, `uart_tx`, `strapping`, `input_only`, `boot_button`, ... |
 | `ComponentCategory` | [`models/components.py`](../esphome_device_builder/models/components.py) | `sensor`, `binary_sensor`, `switch`, `light`, `climate`, `core`, `bus`, `misc`, ... |
 | `ConfigEntryType` | [`models/common.py`](../esphome_device_builder/models/common.py) | `string`, `integer`, `float`, `boolean`, `select`, `pin`, `time_period`, `icon`, `id`, `unknown`, ... |
-| `EventType` | [`models/common.py`](../esphome_device_builder/models/common.py) | `entry_added`, `entry_removed`, `entry_updated`, `entry_state_changed`, ... |
+| `EventType` | [`models/common.py`](../esphome_device_builder/models/common.py) | `device_added`, `device_removed`, `device_updated`, `device_state_changed`, `importable_device_added`, `importable_device_removed` |
 | `ErrorCode` | [`models/api.py`](../esphome_device_builder/models/api.py) | `invalid_message`, `unknown_command`, `invalid_args`, `not_found`, `internal_error` |
 
 ---
