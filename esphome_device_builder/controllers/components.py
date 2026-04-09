@@ -109,6 +109,11 @@ class ComponentCatalog:
             key=lambda c: (-c["count"], c["name"]),
         )
 
+    @api_command("components/get_categories")
+    async def get_categories(self, **kwargs: Any) -> list[dict[str, str | int]]:
+        """Get all component categories with counts."""
+        return self.categories
+
     @api_command("components/get_component")
     async def get_component(
         self, *, component_id: str, **kwargs: Any

@@ -20,6 +20,7 @@ from .helpers.event_bus import EventBus
 from .helpers.json import cors_middleware
 
 if TYPE_CHECKING:
+    from .controllers.automations import AutomationsController
     from .controllers.boards import BoardCatalog
     from .controllers.components import ComponentCatalog
     from .controllers.config import ConfigController
@@ -46,6 +47,7 @@ class DeviceBuilder:
         self.components: ComponentCatalog | None = None
         self.config: ConfigController | None = None
         self.devices: DevicesController | None = None
+        self.automations: AutomationsController | None = None
 
         # Command registry — populated from controllers
         self.command_handlers: dict[str, CommandHandler] = {}
@@ -56,6 +58,7 @@ class DeviceBuilder:
 
     async def start(self) -> None:
         """Start the application — load catalogs, initialize controllers."""
+        from .controllers.automations import AutomationsController
         from .controllers.boards import BoardCatalog
         from .controllers.components import ComponentCatalog
         from .controllers.config import ConfigController
@@ -70,10 +73,17 @@ class DeviceBuilder:
         self.components.load()
         self.config = ConfigController(self)
         self.devices = DevicesController(self)
+        self.automations = AutomationsController(self)
         await self.devices.start()
 
         # Collect command handlers from all controllers
-        for controller in (self.boards, self.components, self.config, self.devices):
+        for controller in (
+            self.boards,
+            self.components,
+            self.config,
+            self.devices,
+            self.automations,
+        ):
             self.command_handlers.update(collect_api_commands(controller))
 
         # Register built-in commands
