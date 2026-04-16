@@ -353,8 +353,7 @@ class DevicesController:
         return list(self._devices.values())
 
     async def _request_scan(self) -> None:
-        if self._scan_lock.locked():
-            return
+        """Request a device scan. Waits for any running scan to finish first."""
         await self.scan_devices()
 
     async def scan_devices(self) -> None:
