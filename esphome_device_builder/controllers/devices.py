@@ -278,14 +278,15 @@ class DevicesController:
             def _on_service_state_change(
                 zeroconf: Any, service_type: str, name: str, state_change: ServiceStateChange
             ) -> None:
-                # Extract device name from mDNS name (e.g. "my-device._esphomelib._tcp.local.")
+                # mDNS name format: "my-device._esphomelib._tcp.local."
+                # ESPHome uses hyphens in mDNS, underscores in YAML config
                 device_name = name.split(".")[0].replace("-", "_")
+                _LOGGER.debug("mDNS: %s %s (raw: %s)", state_change, device_name, name)
 
                 if state_change in (ServiceStateChange.Added, ServiceStateChange.Updated):
                     self._set_device_state(device_name, DeviceState.ONLINE, "mdns")
                 elif state_change == ServiceStateChange.Removed:
                     self._set_device_state(device_name, DeviceState.OFFLINE, "mdns")
-                    # Clear the mdns source so ping can take over
                     self._state_source.pop(device_name, None)
 
             self._mdns_browser = AsyncServiceBrowser(
@@ -295,7 +296,7 @@ class DevicesController:
             )
             _LOGGER.info("mDNS browser started for %s", _ESPHOME_SERVICE_TYPE)
         except Exception:
-            _LOGGER.warning("Could not start mDNS browser — device discovery limited to ping")
+            _LOGGER.exception("Could not start mDNS browser — device discovery limited to ping")
 
     # ------------------------------------------------------------------
     # Ping sweep (fallback)
