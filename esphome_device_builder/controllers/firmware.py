@@ -124,11 +124,11 @@ class FirmwareController:
         cmd_map = {
             JobType.COMPILE: "compile",
             JobType.UPLOAD: "upload",
-            JobType.UPDATE: "run",
+            JobType.INSTALL: "run",
             JobType.CLEAN: "clean",
         }
         cmd = [*_ESPHOME_CMD, cmd_map[job_type], config_path]
-        if job_type in (JobType.UPLOAD, JobType.UPDATE) and port:
+        if job_type in (JobType.UPLOAD, JobType.INSTALL) and port:
             cmd.extend(["--device", port])
         return cmd
 
@@ -208,10 +208,10 @@ class FirmwareController:
         job = self._create_job(configuration, JobType.CLEAN)
         return await self._enqueue(job)
 
-    @api_command("firmware/update")
-    async def update(self, *, configuration: str, port: str = "OTA", **kwargs: Any) -> FirmwareJob:
+    @api_command("firmware/install")
+    async def install(self, *, configuration: str, port: str = "OTA", **kwargs: Any) -> FirmwareJob:
         """Queue a device update (compile + upload). Defaults to OTA."""
-        job = self._create_job(configuration, JobType.UPDATE, port=port)
+        job = self._create_job(configuration, JobType.INSTALL, port=port)
         return await self._enqueue(job)
 
     @api_command("firmware/compile_bulk")
@@ -224,14 +224,14 @@ class FirmwareController:
             jobs.append(job)
         return jobs
 
-    @api_command("firmware/update_bulk")
-    async def update_bulk(
+    @api_command("firmware/install_bulk")
+    async def install_bulk(
         self, *, configurations: list[str], port: str = "OTA", **kwargs: Any
     ) -> list[FirmwareJob]:
         """Queue update (compile + upload) for multiple devices. Defaults to OTA."""
         jobs = []
         for config in configurations:
-            job = self._create_job(config, JobType.UPDATE, port=port)
+            job = self._create_job(config, JobType.INSTALL, port=port)
             await self._enqueue(job)
             jobs.append(job)
         return jobs

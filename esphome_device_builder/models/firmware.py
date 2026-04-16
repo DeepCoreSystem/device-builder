@@ -23,7 +23,7 @@ class JobType(StrEnum):
 
     COMPILE = "compile"
     UPLOAD = "upload"
-    UPDATE = "update"  # compile + upload in one step (esphome run)
+    INSTALL = "install"  # compile + upload in one step
     CLEAN = "clean"
 
 
