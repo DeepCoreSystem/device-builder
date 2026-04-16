@@ -21,6 +21,7 @@ from esphome.util import get_serial_ports
 
 from ..constants import __version__ as server_version
 from ..helpers.api import api_command
+from ..models import UserPreferences
 
 if TYPE_CHECKING:
     from ..device_builder import DeviceBuilder
@@ -157,18 +158,20 @@ def remove_device_metadata(config_dir: Path, filename: str) -> None:
     _save_metadata(config_dir, data)
 
 
-def get_preferences(config_dir: Path) -> dict[str, Any]:
-    """Get user preferences."""
-    return _load_metadata(config_dir).get(_PREFS_KEY, {})
+def load_preferences(config_dir: Path) -> UserPreferences:
+    """Load user preferences, returning defaults for missing fields."""
+    raw = _load_metadata(config_dir).get(_PREFS_KEY, {})
+    try:
+        return UserPreferences.from_dict(raw)
+    except Exception:
+        return UserPreferences()
 
 
-def set_preferences(config_dir: Path, prefs: dict[str, Any]) -> dict[str, Any]:
-    """Update user preferences."""
+def save_preferences(config_dir: Path, prefs: UserPreferences) -> None:
+    """Save user preferences to disk."""
     data = _load_metadata(config_dir)
-    current = data.setdefault(_PREFS_KEY, {})
-    current.update(prefs)
+    data[_PREFS_KEY] = prefs.to_dict()
     _save_metadata(config_dir, data)
-    return current
 
 
 # ---------------------------------------------------------------------------
@@ -198,19 +201,32 @@ class ConfigController:
         ]
 
     @api_command("config/get_preferences")
-    async def get_prefs(self, **kwargs: Any) -> dict:
+    async def get_prefs(self, **kwargs: Any) -> UserPreferences:
         """Get user preferences."""
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, get_preferences, self._db.settings.config_dir)
+        return await loop.run_in_executor(None, load_preferences, self._db.settings.config_dir)
 
     @api_command("config/set_preferences")
-    async def set_prefs(self, **kwargs: Any) -> dict:
-        """Update user preferences."""
+    async def set_prefs(self, **kwargs: Any) -> UserPreferences:
+        """Update user preferences.
+
+        Accepts partial updates — only provided fields are changed,
+        others keep their current values.
+        """
         loop = asyncio.get_running_loop()
-        prefs = {k: v for k, v in kwargs.items() if k not in ("client", "message_id")}
-        return await loop.run_in_executor(
-            None, set_preferences, self._db.settings.config_dir, prefs
-        )
+        config_dir = self._db.settings.config_dir
+
+        # Load current, merge with provided fields, validate, save
+        current = await loop.run_in_executor(None, load_preferences, config_dir)
+        update_fields = {k: v for k, v in kwargs.items() if k not in ("client", "message_id")}
+
+        # Merge into current preferences
+        current_dict = current.to_dict()
+        current_dict.update(update_fields)
+        updated = UserPreferences.from_dict(current_dict)
+
+        await loop.run_in_executor(None, save_preferences, config_dir, updated)
+        return updated
 
     @api_command("config/get_secrets")
     async def get_secrets(self, **kwargs: Any) -> list[str]:
