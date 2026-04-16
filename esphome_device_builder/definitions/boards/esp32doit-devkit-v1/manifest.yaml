@@ -4,7 +4,7 @@ description: ESP32-based board with 4MB flash, 240MHz featuring Wi-Fi, Bluetooth
   Ethernet, CAN bus.
 manufacturer: DOIT
 images:
-- https://docs.espressif.com/projects/esp-dev-kits/en/latest/_images/esp32-devkitc-v4-layout-front.png
+- https://docs.espressif.com/projects/esp-dev-kits/en/latest/esp32/_images/esp32-devkitc-v4-functional-overview.png
 esphome:
   platform: esp32
   board: esp32doit-devkit-v1

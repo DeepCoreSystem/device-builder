@@ -9,7 +9,7 @@ description: 'Popular ESP32 development board with 30 exposed GPIO pins, USB-to-
   '
 manufacturer: Espressif
 images:
-- https://docs.espressif.com/projects/esp-dev-kits/en/latest/_images/esp32-devkitc-v4-layout-front.png
+- https://docs.espressif.com/projects/esp-dev-kits/en/latest/esp32/_images/esp32-devkitc-v4-functional-overview.png
 esphome:
   platform: esp32
   board: esp32dev
