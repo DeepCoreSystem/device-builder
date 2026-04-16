@@ -94,6 +94,71 @@ class FirmwareController:
         except asyncio.CancelledError:
             pass
 
+    async def _verify_chip(self, job: FirmwareJob) -> None:
+        """Verify the chip on the serial port matches the device config.
+
+        Runs esptool chip-id to detect the actual chip, then compares
+        against the target platform in the device config. Raises ValueError
+        on mismatch so the job fails early with a clear error.
+        """
+        if not job.port or job.port.upper() == "OTA" or not job.port.startswith("/dev"):
+            return  # only check serial ports
+
+        # Find the expected platform from our loaded devices
+        device = (
+            self._db.devices._find_device_by_name(
+                job.configuration.removesuffix(".yaml").removesuffix(".yml")
+            )
+            if self._db.devices
+            else None
+        )
+
+        expected_platform = ""
+        if device and device.target_platform:
+            expected_platform = device.target_platform.lower()
+        if not expected_platform:
+            return  # can't verify without knowing expected platform
+
+        # Run esptool to detect the actual chip
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m",
+            "esptool",
+            "--port",
+            job.port,
+            "chip-id",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        assert proc.stdout is not None  # type narrowing
+        output = (await proc.stdout.read()).decode("utf-8", errors="replace")
+        await proc.wait()
+
+        # Parse "Detecting chip type... ESP32-C3"
+        detected = ""
+        for line in output.splitlines():
+            if "Detecting chip type" in line:
+                detected = line.split("...")[-1].strip().lower().replace("-", "")
+                break
+
+        if not detected:
+            _LOGGER.warning("Could not detect chip type on %s", job.port)
+            return
+
+        # Normalize: "esp32c3" matches "esp32c3", "esp32" matches "esp32"
+        # The target_platform from StorageJSON might be "ESP32S3" (uppercase)
+        expected_normalized = expected_platform.lower().replace("-", "").replace("_", "")
+        detected_normalized = detected.replace(" ", "")
+
+        if expected_normalized != detected_normalized:
+            msg = (
+                f"Chip mismatch: config expects {expected_platform} "
+                f"but {job.port} has {detected}. Wrong board selected?"
+            )
+            raise ValueError(msg)
+
+        _LOGGER.debug("Chip verified: %s on %s", detected, job.port)
+
     async def _execute_job(self, job: FirmwareJob) -> None:
         """Execute a single firmware job."""
         job.status = JobStatus.RUNNING
@@ -109,6 +174,10 @@ class FirmwareController:
         await self._persist_jobs()
 
         try:
+            # Pre-flight: verify chip type for serial uploads
+            if job.job_type in (JobType.UPLOAD, JobType.INSTALL):
+                await self._verify_chip(job)
+
             config_path = str(self._db.settings.rel_path(job.configuration))
             cmd = self._build_command(job.job_type, config_path, job.port)
             _LOGGER.debug("Running: %s", " ".join(cmd))
