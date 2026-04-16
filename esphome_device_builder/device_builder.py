@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from .controllers.components import ComponentCatalog
     from .controllers.config import ConfigController
     from .controllers.devices import DevicesController
+    from .controllers.firmware import FirmwareController
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -48,6 +49,7 @@ class DeviceBuilder:
         self.config: ConfigController | None = None
         self.devices: DevicesController | None = None
         self.automations: AutomationsController | None = None
+        self.firmware: FirmwareController | None = None
 
         # Command registry — populated from controllers
         self.command_handlers: dict[str, CommandHandler] = {}
@@ -63,6 +65,7 @@ class DeviceBuilder:
         from .controllers.components import ComponentCatalog
         from .controllers.config import ConfigController
         from .controllers.devices import DevicesController
+        from .controllers.firmware import FirmwareController
 
         self.loop = asyncio.get_running_loop()
 
@@ -74,7 +77,9 @@ class DeviceBuilder:
         self.config = ConfigController(self)
         self.devices = DevicesController(self)
         self.automations = AutomationsController(self)
+        self.firmware = FirmwareController(self)
         await self.devices.start()
+        await self.firmware.start()
 
         # Collect command handlers from all controllers
         for controller in (
@@ -83,6 +88,7 @@ class DeviceBuilder:
             self.config,
             self.devices,
             self.automations,
+            self.firmware,
         ):
             self.command_handlers.update(collect_api_commands(controller))
 

@@ -5,4 +5,5 @@ from .boards import *  # noqa: F403
 from .common import *  # noqa: F403
 from .components import *  # noqa: F403
 from .devices import *  # noqa: F403
+from .firmware import *  # noqa: F403
 from .preferences import *  # noqa: F403

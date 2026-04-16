@@ -46,6 +46,13 @@ class EventType(StrEnum):
     IMPORTABLE_DEVICE_ADDED = "importable_device_added"
     IMPORTABLE_DEVICE_REMOVED = "importable_device_removed"
 
+    # Firmware job lifecycle
+    JOB_QUEUED = "job_queued"
+    JOB_STARTED = "job_started"
+    JOB_OUTPUT = "job_output"
+    JOB_COMPLETED = "job_completed"
+    JOB_FAILED = "job_failed"
+
 
 # ---------------------------------------------------------------------------
 # Config entry types

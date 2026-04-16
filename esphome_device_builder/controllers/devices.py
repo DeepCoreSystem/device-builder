@@ -40,7 +40,6 @@ except ImportError:
     import_config = None  # type: ignore[assignment]
 
 if TYPE_CHECKING:
-    from ..api.ws import WebSocketClient
     from ..device_builder import DeviceBuilder
 
 _LOGGER = logging.getLogger(__name__)
@@ -595,21 +594,24 @@ class DevicesController:
         await loop.run_in_executor(None, self._save_ignored_devices)
 
     # ------------------------------------------------------------------
-    # CLI operations (compile, upload, logs, validate, clean)
+    # Live device log streaming (not a job — per-connection)
     # ------------------------------------------------------------------
 
-    async def _stream_esphome_command(
+    @api_command("devices/logs")
+    async def stream_logs(
         self,
-        client: WebSocketClient,
-        message_id: str,
-        command: str,
-        config_path: str,
-        extra_args: list[str] | None = None,
+        *,
+        configuration: str,
+        port: str = "",
+        client: Any = None,
+        message_id: str = "",
+        **kwargs: Any,
     ) -> None:
-        """Run an esphome CLI command and stream output."""
-        cmd = [*_ESPHOME_CMD, command, config_path]
-        if extra_args:
-            cmd.extend(extra_args)
+        """Stream live device logs. Per-connection, not queued."""
+        config_path = str(self._db.settings.rel_path(configuration))
+        cmd = [*_ESPHOME_CMD, "logs", config_path]
+        if port:
+            cmd.extend(["--device", port])
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -626,57 +628,3 @@ class DevicesController:
         await client.send_event(
             message_id, "result", {"success": exit_code == 0, "code": exit_code}
         )
-
-    @api_command("devices/compile")
-    async def compile_device(
-        self, *, configuration: str, client: Any = None, message_id: str = "", **kwargs: Any
-    ) -> None:
-        """Compile a device configuration."""
-        config_path = str(self._db.settings.rel_path(configuration))
-        await self._stream_esphome_command(client, message_id, "compile", config_path)
-
-    @api_command("devices/upload")
-    async def upload_device(
-        self,
-        *,
-        configuration: str,
-        port: str = "",
-        client: Any = None,
-        message_id: str = "",
-        **kwargs: Any,
-    ) -> None:
-        """Upload firmware to a device."""
-        config_path = str(self._db.settings.rel_path(configuration))
-        extra = ["--device", port] if port else []
-        await self._stream_esphome_command(client, message_id, "upload", config_path, extra)
-
-    @api_command("devices/logs")
-    async def stream_logs(
-        self,
-        *,
-        configuration: str,
-        port: str = "",
-        client: Any = None,
-        message_id: str = "",
-        **kwargs: Any,
-    ) -> None:
-        """Stream device logs."""
-        config_path = str(self._db.settings.rel_path(configuration))
-        extra = ["--device", port] if port else []
-        await self._stream_esphome_command(client, message_id, "logs", config_path, extra)
-
-    @api_command("devices/validate")
-    async def validate_device(
-        self, *, configuration: str, client: Any = None, message_id: str = "", **kwargs: Any
-    ) -> None:
-        """Validate a device configuration."""
-        config_path = str(self._db.settings.rel_path(configuration))
-        await self._stream_esphome_command(client, message_id, "config", config_path)
-
-    @api_command("devices/clean")
-    async def clean_device(
-        self, *, configuration: str, client: Any = None, message_id: str = "", **kwargs: Any
-    ) -> None:
-        """Clean build files for a device."""
-        config_path = str(self._db.settings.rel_path(configuration))
-        await self._stream_esphome_command(client, message_id, "clean", config_path)
