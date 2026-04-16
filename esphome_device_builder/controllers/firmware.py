@@ -184,24 +184,15 @@ class FirmwareController:
         }
         cmd = [*self._esphome_cmd, cmd_map[job_type], config_path]
         if job_type in (JobType.UPLOAD, JobType.INSTALL) and port:
-            # Ensure port is a string (frontend might send a list)
-            if isinstance(port, list):
-                port = port[0] if port else ""
-            if port:
-                cmd.extend(["--device", str(port)])
+            cmd.extend(["--device", port])
         return cmd
 
     # ------------------------------------------------------------------
     # Job management
     # ------------------------------------------------------------------
 
-    def _create_job(
-        self, configuration: str, job_type: JobType, port: str | list = ""
-    ) -> FirmwareJob:
+    def _create_job(self, configuration: str, job_type: JobType, port: str = "") -> FirmwareJob:
         """Create a new job and add it to the queue."""
-        # Normalize port — frontend might send as list
-        if isinstance(port, list):
-            port = port[0] if port else ""
         job = FirmwareJob(
             job_id=uuid4().hex[:12],
             configuration=configuration,
