@@ -125,7 +125,7 @@ class ComponentCatalog:
                 {"id": str(cat), "name": str(cat).replace("_", " ").title(), "count": count}
                 for cat, count in counts.items()
             ],
-            key=lambda c: (-c["count"], c["name"]),
+            key=lambda c: (-int(c["count"]), str(c["name"])),
         )
 
     @api_command("components/get_categories")

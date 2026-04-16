@@ -395,8 +395,8 @@ class DevicesController:
 
         # Remove deleted devices
         for path in removed_paths:
-            device = self._devices.pop(path, None)
-            self._cache_keys.pop(path, None)
+            device = self._devices.pop(path, None)  # type: ignore[arg-type]
+            self._cache_keys.pop(path, None)  # type: ignore[arg-type]
             if device:
                 bus.fire(EventType.DEVICE_REMOVED, {"device": device})
 
@@ -709,6 +709,7 @@ class DevicesController:
         **kwargs: Any,
     ) -> AddComponentResponse:
         """Add a component to a device configuration."""
+        assert self._db.components is not None
         component = await self._db.components.get_component(component_id=component_id)
         if component is None:
             msg = f"Unknown component: {component_id}"

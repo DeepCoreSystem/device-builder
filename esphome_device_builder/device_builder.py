@@ -183,6 +183,7 @@ class DeviceBuilder:
 
     def create_background_task(self, coro: Any) -> asyncio.Task:
         """Create a tracked background task."""
+        assert self.loop is not None
         task = self.loop.create_task(coro)
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)

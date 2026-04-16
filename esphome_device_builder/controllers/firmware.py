@@ -441,7 +441,7 @@ class FirmwareController:
                 else:
                     platform_ = platform
                 module = importlib.import_module(f"esphome.components.{platform_}")
-                return module.get_download_types(storage)
+                return list(module.get_download_types(storage))
             except Exception:
                 _LOGGER.warning("Could not determine download types for %s", configuration)
                 return []

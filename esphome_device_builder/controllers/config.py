@@ -57,7 +57,7 @@ class DashboardSettings:
     port: int = 6052
     host: str = "0.0.0.0"
 
-    def parse_args(self, args: object) -> None:
+    def parse_args(self, args: Any) -> None:
         """Parse CLI arguments into settings."""
         self.on_ha_addon = getattr(args, "ha_addon", False)
         password = getattr(args, "password", None) or os.getenv("PASSWORD") or ""
@@ -87,12 +87,13 @@ class DashboardSettings:
     def rel_path(self, *parts: str) -> Path:
         """Return a path relative to the config dir, validated against path traversal."""
         joined = self.config_dir.joinpath(*parts)
+        assert self.absolute_config_dir is not None
         joined.resolve().relative_to(self.absolute_config_dir)
         return joined
 
     @property
     def status_use_mqtt(self) -> bool:
-        return get_bool_env("ESPHOME_DASHBOARD_USE_MQTT")
+        return bool(get_bool_env("ESPHOME_DASHBOARD_USE_MQTT"))
 
     @property
     def using_ha_addon_auth(self) -> bool:
@@ -121,7 +122,8 @@ class DashboardSettings:
 def _load_metadata(config_dir: Path) -> dict[str, Any]:
     path = config_dir / _METADATA_FILE
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
 
@@ -133,7 +135,7 @@ def _save_metadata(config_dir: Path, data: dict[str, Any]) -> None:
 
 def get_board_id(config_dir: Path, filename: str) -> str:
     """Get the board_id for a device."""
-    return _load_metadata(config_dir).get(filename, {}).get("board_id", "")
+    return str(_load_metadata(config_dir).get(filename, {}).get("board_id", ""))
 
 
 def set_device_metadata(
@@ -158,7 +160,8 @@ def set_device_metadata(
 
 def get_device_metadata(config_dir: Path, filename: str) -> dict[str, Any]:
     """Get all metadata for a device."""
-    return _load_metadata(config_dir).get(filename, {})
+    result = _load_metadata(config_dir).get(filename, {})
+    return result if isinstance(result, dict) else {}
 
 
 def remove_device_metadata(config_dir: Path, filename: str) -> None:
