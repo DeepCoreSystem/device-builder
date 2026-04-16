@@ -709,7 +709,7 @@ class DevicesController:
         **kwargs: Any,
     ) -> AddComponentResponse:
         """Add a component to a device configuration."""
-        assert self._db.components is not None
+        assert self._db.components is not None  # type narrowing
         component = await self._db.components.get_component(component_id=component_id)
         if component is None:
             msg = f"Unknown component: {component_id}"
@@ -797,7 +797,7 @@ class DevicesController:
             stderr=asyncio.subprocess.STDOUT,
         )
 
-        assert proc.stdout is not None
+        assert proc.stdout is not None  # type narrowing
         async for line_bytes in proc.stdout:
             line = line_bytes.decode("utf-8", errors="replace")
             await client.send_event(message_id, "output", line)
@@ -829,7 +829,7 @@ class DevicesController:
             stderr=asyncio.subprocess.STDOUT,
         )
 
-        assert proc.stdout is not None
+        assert proc.stdout is not None  # type narrowing
         async for line_bytes in proc.stdout:
             line = line_bytes.decode("utf-8", errors="replace")
             await client.send_event(message_id, "output", line)

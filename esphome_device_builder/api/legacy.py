@@ -55,7 +55,7 @@ async def _handle_legacy_ws_command(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
-        assert proc.stdout is not None
+        assert proc.stdout is not None  # type narrowing
         async for line in proc.stdout:
             await ws.send_json({"event": "line", "data": line.decode("utf-8", errors="replace")})
         exit_code = await proc.wait()

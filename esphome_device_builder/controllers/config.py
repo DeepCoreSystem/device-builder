@@ -87,7 +87,7 @@ class DashboardSettings:
     def rel_path(self, *parts: str) -> Path:
         """Return a path relative to the config dir, validated against path traversal."""
         joined = self.config_dir.joinpath(*parts)
-        assert self.absolute_config_dir is not None
+        assert self.absolute_config_dir is not None  # type narrowing
         joined.resolve().relative_to(self.absolute_config_dir)
         return joined
 

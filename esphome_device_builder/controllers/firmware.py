@@ -120,7 +120,7 @@ class FirmwareController:
             self._current_process = proc
 
             has_error_in_output = False
-            assert proc.stdout is not None
+            assert proc.stdout is not None  # type narrowing
             async for line_bytes in proc.stdout:
                 line = line_bytes.decode("utf-8", errors="replace")
                 job.output.append(line)
