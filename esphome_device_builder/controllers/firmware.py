@@ -1,13 +1,18 @@
-"""Firmware controller — build queue, compile, upload, validate, clean."""
+"""Firmware controller — build queue, compile, upload, validate, clean, download."""
 
 from __future__ import annotations
 
 import asyncio
+import gzip
+import importlib
 import logging
 import sys
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
+
+from esphome.components.esp32 import VARIANTS as ESP32_VARIANTS
+from esphome.storage_json import StorageJSON, ext_storage_path
 
 from ..controllers.config import _load_metadata, _save_metadata
 from ..helpers.api import api_command
@@ -270,3 +275,86 @@ class FirmwareController:
         for jid in to_remove:
             del self._jobs[jid]
         await self._persist_jobs()
+
+    # ------------------------------------------------------------------
+    # Binary download
+    # ------------------------------------------------------------------
+
+    @api_command("firmware/get_binaries")
+    async def get_binaries(self, *, configuration: str, **kwargs: Any) -> list[dict]:
+        """List available firmware binaries for a compiled device.
+
+        Returns [{title, file}] — the file names can be passed to
+        firmware/download to retrieve the binary content.
+        """
+        loop = asyncio.get_running_loop()
+
+        def _get_types() -> list[dict]:
+            storage = StorageJSON.load(ext_storage_path(configuration))
+            if storage is None:
+                return []
+            platform = (storage.target_platform or "").lower()
+            try:
+                if platform.upper() in ESP32_VARIANTS:
+                    platform_ = "esp32"
+                elif platform in ("rtl87xx", "bk72xx", "ln882x", "libretiny"):
+                    platform_ = "libretiny"
+                else:
+                    platform_ = platform
+                module = importlib.import_module(f"esphome.components.{platform_}")
+                return module.get_download_types(storage)
+            except Exception:
+                _LOGGER.warning("Could not determine download types for %s", configuration)
+                return []
+
+        return await loop.run_in_executor(None, _get_types)
+
+    @api_command("firmware/download")
+    async def download(
+        self,
+        *,
+        configuration: str,
+        file: str,
+        compressed: bool = False,
+        **kwargs: Any,
+    ) -> dict:
+        """Download a compiled firmware binary.
+
+        Returns {filename, data, content_type} where data is base64-encoded.
+        For Web Serial flashing, the frontend decodes the base64 data.
+        """
+        import base64
+
+        loop = asyncio.get_running_loop()
+
+        def _read_binary() -> dict:
+            storage = StorageJSON.load(ext_storage_path(configuration))
+            if storage is None or storage.firmware_bin_path is None:
+                msg = "No firmware binary — compile the device first"
+                raise FileNotFoundError(msg)
+
+            base_dir = storage.firmware_bin_path.parent.resolve()
+            path = (base_dir / file).resolve()
+            # Path traversal protection
+            path.relative_to(base_dir)
+
+            if not path.is_file():
+                msg = f"Binary not found: {file}"
+                raise FileNotFoundError(msg)
+
+            data = path.read_bytes()
+            if compressed:
+                data = gzip.compress(data, 9)
+
+            filename = f"{storage.name}-{file}"
+            if compressed:
+                filename += ".gz"
+
+            return {
+                "filename": filename,
+                "data": base64.b64encode(data).decode("ascii"),
+                "size": len(data),
+                "compressed": compressed,
+            }
+
+        return await loop.run_in_executor(None, _read_binary)
