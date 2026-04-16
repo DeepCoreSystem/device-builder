@@ -183,6 +183,9 @@ class FirmwareController:
             JobType.CLEAN: "clean",
         }
         cmd = [*self._esphome_cmd, cmd_map[job_type], config_path]
+        if job_type == JobType.INSTALL:
+            # Don't tail logs after upload — the job would never complete
+            cmd.append("--no-logs")
         if job_type in (JobType.UPLOAD, JobType.INSTALL) and port:
             cmd.extend(["--device", port])
         return cmd
