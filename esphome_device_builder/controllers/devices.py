@@ -131,14 +131,28 @@ def _generate_device_yaml(
     return "\n".join(lines)
 
 
+def _detect_platform_from_yaml(path: Path) -> str:
+    """Quick scan of YAML to find the platform key (esp32, esp8266, etc.)."""
+    platforms = {"esp32", "esp8266", "rp2040", "bk72xx", "rtl87xx", "ln882x", "nrf52"}
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line and not line[0].isspace() and ":" in line:
+                key = line.split(":")[0].strip()
+                if key in platforms:
+                    return key
+    except Exception:  # noqa: S110
+        pass
+    return ""
+
+
 def _load_device_from_storage(path: Path, board_id: str = "") -> Device:
     """Build a Device model from a YAML config file and its StorageJSON."""
     filename = path.name
     storage = StorageJSON.load(ext_storage_path(filename))
     name = storage.name if storage else filename.removesuffix(".yml").removesuffix(".yaml")
 
-    # Detect pending config changes: YAML modified after last compile
-    has_pending: bool | None = None  # None = never compiled
+    # Detect pending config changes
+    has_pending = True  # default: needs compile
     if storage and storage.firmware_bin_path and storage.firmware_bin_path.exists():
         yaml_mtime = path.stat().st_mtime
         bin_mtime = storage.firmware_bin_path.stat().st_mtime
@@ -148,19 +162,25 @@ def _load_device_from_storage(path: Path, board_id: str = "") -> Device:
     deployed = storage.esphome_version or "" if storage else ""
     update_available = bool(deployed and deployed != const.__version__)
 
+    # Platform: from StorageJSON if compiled, otherwise parse from YAML
+    target_platform = ""
+    if storage and storage.target_platform:
+        target_platform = storage.target_platform
+    else:
+        target_platform = _detect_platform_from_yaml(path)
+
     return Device(
         name=name,
         friendly_name=storage.friendly_name if storage else name,
         configuration=filename,
-        path=str(path),
         comment=storage.comment if storage else None,
+        board_id=board_id,
+        target_platform=target_platform,
         address=storage.address or "" if storage else "",
         web_port=storage.web_port if storage else None,
-        target_platform=storage.target_platform or "UNKNOWN" if storage else "UNKNOWN",
         current_version=const.__version__,
         deployed_version=deployed,
         loaded_integrations=sorted(storage.loaded_integrations) if storage else [],
-        board_id=board_id,
         has_pending_changes=has_pending,
         update_available=update_available,
     )
@@ -520,11 +540,34 @@ class DevicesController:
 
         await loop.run_in_executor(None, _write)
 
-        # Store board_id in metadata for future reference
-        config_dir = self._db.settings.config_dir
-        await loop.run_in_executor(
-            None, lambda: set_device_metadata(config_dir, filename, board_id=board_id)
-        )
+        # Pre-create StorageJSON so device metadata is available immediately
+        def _init_storage() -> None:
+            friendly = friendly_name_slugify(name)
+            platform = str(board.esphome.platform) if board else ""
+            storage = StorageJSON(
+                storage_version=1,
+                name=name,
+                friendly_name=friendly,
+                comment=None,
+                esphome_version=None,
+                src_version=None,
+                address=f"{name}.local",
+                web_port=None,
+                target_platform=platform,
+                build_path=None,
+                firmware_bin_path=None,
+                loaded_integrations=[],
+                loaded_platforms=[],
+                no_mdns=False,
+            )
+            storage_path = ext_storage_path(filename)
+            storage_path.parent.mkdir(parents=True, exist_ok=True)
+            storage.save(storage_path)
+
+            # Store board_id in metadata
+            set_device_metadata(self._db.settings.config_dir, filename, board_id=board_id)
+
+        await loop.run_in_executor(None, _init_storage)
 
         await self._request_scan()
         return WizardResponse(configuration=filename)

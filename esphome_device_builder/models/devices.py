@@ -23,20 +23,17 @@ class Device(DataClassORJSONMixin):
     name: str
     friendly_name: str
     configuration: str  # filename (e.g. "my_device.yaml")
-    path: str  # full disk path
     comment: str | None = None
+    board_id: str = ""
+    target_platform: str = ""
     address: str = ""
     web_port: int | None = None
-    target_platform: str = "UNKNOWN"
     current_version: str = ""
     deployed_version: str = ""
-    loaded_integrations: list[str] = field(default_factory=list)
-    board_id: str = ""
+    loaded_integrations: list[str] = field(default_factory=list)  # from StorageJSON after compile
     state: DeviceState = DeviceState.UNKNOWN
-    # True if YAML changed since last compile, None if never compiled
-    has_pending_changes: bool | None = None
-    # True if server ESPHome version != device's compiled version
-    update_available: bool = False
+    has_pending_changes: bool = True  # True until successfully compiled + deployed
+    update_available: bool = False  # True if compiled with older ESPHome version
 
 
 @dataclass
