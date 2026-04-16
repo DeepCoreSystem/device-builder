@@ -413,16 +413,13 @@ class DevicesController:
         return result
 
     def _get_path_to_cache_key(self) -> dict[Path, _CacheKey]:
-        """Scan disk for YAML files and build cache keys."""
+        """Scan disk for YAML files and build cache keys from the YAML file itself."""
         result: dict[Path, _CacheKey] = {}
         for file in util.list_yaml_files([self._db.settings.config_dir]):
             try:
-                stat = ext_storage_path(file.name).stat()
+                stat = file.stat()
             except OSError:
-                try:
-                    stat = file.stat()
-                except OSError:
-                    continue
+                continue
             result[file] = (stat.st_ino, stat.st_dev, stat.st_mtime, stat.st_size)
         return result
 
