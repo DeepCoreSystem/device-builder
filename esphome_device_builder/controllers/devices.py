@@ -137,12 +137,16 @@ def _load_device_from_storage(path: Path, board_id: str = "") -> Device:
     storage = StorageJSON.load(ext_storage_path(filename))
     name = storage.name if storage else filename.removesuffix(".yml").removesuffix(".yaml")
 
-    # Detect pending changes: YAML modified after last compile
+    # Detect pending config changes: YAML modified after last compile
     has_pending: bool | None = None  # None = never compiled
     if storage and storage.firmware_bin_path and storage.firmware_bin_path.exists():
         yaml_mtime = path.stat().st_mtime
         bin_mtime = storage.firmware_bin_path.stat().st_mtime
         has_pending = yaml_mtime > bin_mtime
+
+    # Detect ESPHome version update available
+    deployed = storage.esphome_version or "" if storage else ""
+    update_available = bool(deployed and deployed != const.__version__)
 
     return Device(
         name=name,
@@ -154,10 +158,11 @@ def _load_device_from_storage(path: Path, board_id: str = "") -> Device:
         web_port=storage.web_port if storage else None,
         target_platform=storage.target_platform or "UNKNOWN" if storage else "UNKNOWN",
         current_version=const.__version__,
-        deployed_version=storage.esphome_version or "" if storage else "",
+        deployed_version=deployed,
         loaded_integrations=sorted(storage.loaded_integrations) if storage else [],
         board_id=board_id,
         has_pending_changes=has_pending,
+        update_available=update_available,
     )
 
 

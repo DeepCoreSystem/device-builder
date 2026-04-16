@@ -33,8 +33,10 @@ class Device(DataClassORJSONMixin):
     loaded_integrations: list[str] = field(default_factory=list)
     board_id: str = ""
     state: DeviceState = DeviceState.UNKNOWN
-    # True=needs update, False=up to date, None=never compiled
+    # True if YAML changed since last compile, None if never compiled
     has_pending_changes: bool | None = None
+    # True if server ESPHome version != device's compiled version
+    update_available: bool = False
 
 
 @dataclass
