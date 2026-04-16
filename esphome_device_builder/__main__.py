@@ -15,26 +15,31 @@ _DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 _MAX_LOG_SIZE = 5_000_000  # 5 MB
 _LOGGER_NAME = "esphome_device_builder"
 
+_LOG_LEVELS = {
+    "debug": logging.DEBUG,
+    "info": logging.INFO,
+    "warning": logging.WARNING,
+    "error": logging.ERROR,
+}
 
-def _setup_logging(verbose: bool, log_file: str | None = None) -> None:
+
+def _setup_logging(log_level: str, log_file: str | None = None) -> None:
     """Set up logging with console + optional file handler."""
-    level = logging.DEBUG if verbose else logging.INFO
+    level = _LOG_LEVELS.get(log_level.lower(), logging.INFO)
 
-    # Console handler
     logging.basicConfig(level=level, format=_FORMAT, datefmt=_DATE_FORMAT)
 
-    # File handler (rotated)
     if log_file:
         file_handler = RotatingFileHandler(log_file, maxBytes=_MAX_LOG_SIZE, backupCount=1)
         file_handler.setFormatter(logging.Formatter(_FORMAT, datefmt=_DATE_FORMAT))
         logging.getLogger().addHandler(file_handler)
 
-    # Set our logger level
     logging.getLogger(_LOGGER_NAME).setLevel(level)
 
     # Silence noisy libraries
     logging.getLogger("asyncio").setLevel(logging.WARNING)
     logging.getLogger("aiohttp").setLevel(logging.WARNING)
+    logging.getLogger("zeroconf").setLevel(logging.WARNING)
 
 
 def main() -> None:
@@ -54,12 +59,17 @@ def main() -> None:
     parser.add_argument("--username", default="", help="Dashboard username")
     parser.add_argument("--password", default="", help="Dashboard password")
     parser.add_argument("--ha-addon", action="store_true", help="Running as HA add-on")
-    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
+    parser.add_argument(
+        "--log-level",
+        default="info",
+        choices=["debug", "info", "warning", "error"],
+        help="Log level",
+    )
     parser.add_argument("--log-file", default=None, help="Log to file (rotated)")
 
     args = parser.parse_args()
 
-    _setup_logging(args.verbose, args.log_file)
+    _setup_logging(args.log_level, args.log_file)
 
     settings = DashboardSettings()
     settings.parse_args(args)

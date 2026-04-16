@@ -230,7 +230,7 @@ class DeviceBuilder:
 
     def run(self) -> None:
         """Start the HTTP server (blocking)."""
-        logging.basicConfig(level=logging.DEBUG if self.settings.verbose else logging.INFO)
+        # Logging is already configured by __main__.py
         app = self.create_app()
         web.run_app(app, host=self.settings.host, port=self.settings.port)
 

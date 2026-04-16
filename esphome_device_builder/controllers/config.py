@@ -53,7 +53,7 @@ class DashboardSettings:
     using_password: bool = False
     on_ha_addon: bool = False
     cookie_secret: str | None = None
-    verbose: bool = False
+    log_level: str = "info"
     port: int = 6052
     host: str = "0.0.0.0"
 
@@ -79,7 +79,7 @@ class DashboardSettings:
                 'wifi_password: ""\n',
                 encoding="utf-8",
             )
-        self.verbose = getattr(args, "verbose", False)
+        self.log_level = getattr(args, "log_level", "info")
         self.port = getattr(args, "port", 6052)
         self.host = getattr(args, "host", "0.0.0.0")
         CORE.config_path = self.config_dir / _DASHBOARD_SENTINEL_FILE
