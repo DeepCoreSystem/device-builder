@@ -14,6 +14,8 @@
 
 6. **Persistent firmware jobs.** Compile/upload jobs are queued, run one at a time, survive page refreshes and server restarts.
 
+7. **Device discovery.** mDNS browser for instant online/offline detection, ping sweep every 60s as fallback.
+
 ## Project Structure
 
 ```
@@ -32,7 +34,7 @@ esphome_device_builder/
 │   └── api.py                 # WebSocket protocol models
 │
 ├── controllers/               # Business logic — all state lives here
-│   ├── boards.py              # BoardCatalog: 505 boards with pin maps
+│   ├── boards.py              # BoardCatalog: 559 boards across 7 platforms
 │   ├── components.py          # ComponentCatalog: 655 components
 │   ├── devices.py             # DevicesController: CRUD, file scanning, logs
 │   ├── firmware.py            # FirmwareController: job queue, compile, install
@@ -50,7 +52,7 @@ esphome_device_builder/
 │   └── legacy.py              # HA compat endpoints
 │
 └── definitions/               # Data files
-    ├── boards/                # 505 board YAML manifests
+    ├── boards/                # 559 board YAML manifests
     ├── components.json        # 655 components
     └── schemas/               # JSON schemas
 ```

@@ -12,7 +12,7 @@ The primary API. A single multiplexed WebSocket handles all 43 commands.
 
 On connect, the server sends a [`ServerInfoMessage`](../esphome_device_builder/models/api.py):
 ```json
-{"server_version": "0.0.0", "esphome_version": "2026.3.1"}
+{"server_version": "0.0.0", "esphome_version": "2026.3.1", "port": 6052, "ha_addon": false, "requires_auth": false}
 ```
 
 **Send a [`CommandMessage`](../esphome_device_builder/models/api.py):**
@@ -46,6 +46,12 @@ On connect, the server sends a [`ServerInfoMessage`](../esphome_device_builder/m
 | `not_found` | Resource not found |
 | `internal_error` | Server error |
 
+### Enums
+
+| Enum | Values | Description |
+|------|--------|-------------|
+| `DeviceState` | `unknown`, `online`, `offline` | Device connectivity state (mDNS + ping) |
+
 ---
 
 ## Commands
@@ -73,7 +79,9 @@ On connect, the server sends a [`ServerInfoMessage`](../esphome_device_builder/m
 | `devices/validate` | `{configuration}` | Streaming | Validate YAML config |
 | `devices/logs` | `{configuration, port?}` | Streaming | Stream live device logs |
 
-`Device.has_pending_changes`: `true` = YAML newer than compiled binary, `false` = up to date, `null` = never compiled.
+`Device.state`: `DeviceState` — `unknown`, `online`, or `offline` (discovered via mDNS + ping).
+`Device.has_pending_changes`: `true` = config changed since last compile, `false` = up to date, `null` = never compiled.
+`Device.update_available`: `true` = device was compiled with a different ESPHome version than the server.
 
 ### Firmware (13 commands)
 
@@ -122,7 +130,7 @@ On connect, the server sends a [`ServerInfoMessage`](../esphome_device_builder/m
 | Command | Args | Response | Description |
 |---------|------|----------|-------------|
 | `components/get_categories` | — | `[{id, name, count}]` | List categories with counts |
-| `components/get_components` | `{query?, category?, offset?, limit?}` | `PagedComponentsResponse` | Search/list components |
+| `components/get_components` | `{query?, category?, platform?, offset?, limit?}` | `PagedComponentsResponse` | Search/list components (filter by platform) |
 | `components/get_component` | `{component_id}` | `ComponentCatalogEntry` | Get component with config entries |
 
 ### Automations (3 commands)

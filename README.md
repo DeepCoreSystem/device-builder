@@ -25,7 +25,7 @@ script/setup
 
 ```bash
 source .venv/bin/activate
-esphome-device-builder ./configs --verbose
+esphome-device-builder ./configs --log-level debug
 ```
 
 The server starts on `http://localhost:6052`. Use the VS Code debugger (F5 → "Run Server") for breakpoint debugging.
@@ -41,7 +41,7 @@ esphome-device-builder [configuration] [options]
   --username USER    Dashboard username
   --password PASS    Dashboard password
   --ha-addon         Running as Home Assistant add-on
-  --verbose, -v      Verbose logging
+  --log-level LEVEL  Log level: debug, info (default), warning, error
   --log-file PATH    Log to rotating file
 ```
 
@@ -53,7 +53,7 @@ esphome-device-builder [configuration] [options]
 DeviceBuilder (singleton)
 ├── controllers/devices.py       — 14 commands: device CRUD, validation, live logs
 ├── controllers/firmware.py      — 13 commands: job queue, compile, install, download
-├── controllers/boards.py        —  3 commands: 505 boards with pin maps
+├── controllers/boards.py        —  3 commands: 559 boards with pin maps
 ├── controllers/components.py    —  3 commands: 655 components from ESPHome
 ├── controllers/automations.py   —  3 commands: context-aware triggers + actions
 ├── controllers/config.py        —  5 commands: version, preferences, secrets
@@ -63,8 +63,9 @@ DeviceBuilder (singleton)
 
 ### Key concepts
 
-- **A device** = a YAML config file on disk. Has a `has_pending_changes` flag (true if YAML newer than compiled binary)
-- **Board definitions** = YAML manifests in `definitions/boards/`, synced from PlatformIO. 505 boards with pin maps, hardware specs, images
+- **A device** = a YAML config file on disk. Has `state` (online/offline/unknown via mDNS + ping), `has_pending_changes` (config changed since compile), and `update_available` (ESPHome version mismatch)
+- **Device discovery** = mDNS browser for instant online/offline detection, ping sweep every 60s as fallback
+- **Board definitions** = YAML manifests in `definitions/boards/`, synced from PlatformIO. 559 boards across 7 platforms (esp32, esp8266, rp2040, bk72xx, rtl87xx, ln882x, nrf52) with pin maps, hardware specs, images
 - **Component catalog** = `definitions/components.json`, synced from ESPHome source + docs. 655 components with config entries
 - **Firmware jobs** = persistent queue, one at a time. Compile/install/upload. Survive page refresh and server restart
 - **Real-time events** = subscribe once, get instant updates. No polling
@@ -74,7 +75,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full architecture and [
 ### Sync scripts
 
 ```bash
-python script/sync_boards.py          # Sync 505 boards from PlatformIO
+python script/sync_boards.py          # Sync boards from PlatformIO (currently 559)
 python script/sync_components.py      # Sync 655 components from ESPHome
 python script/prefill_pins.py         # Prefill pin data from chip variants
 ```
