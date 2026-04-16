@@ -23,7 +23,8 @@ class Device(DataClassORJSONMixin):
     deployed_version: str = ""
     loaded_integrations: list[str] = field(default_factory=list)
     board_id: str = ""
-    has_pending_changes: bool = False  # True if YAML changed since last successful compile
+    # True=needs update, False=up to date, None=never compiled
+    has_pending_changes: bool | None = None
 
 
 @dataclass

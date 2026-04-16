@@ -130,14 +130,11 @@ def _load_device_from_storage(path: Path, board_id: str = "") -> Device:
     name = storage.name if storage else filename.removesuffix(".yml").removesuffix(".yaml")
 
     # Detect pending changes: YAML modified after last compile
-    has_pending = True  # default: no compile yet = pending
-    if storage and storage.firmware_bin_path:
-        try:
-            yaml_mtime = path.stat().st_mtime
-            bin_mtime = storage.firmware_bin_path.stat().st_mtime
-            has_pending = yaml_mtime > bin_mtime
-        except OSError:
-            has_pending = True
+    has_pending: bool | None = None  # None = never compiled
+    if storage and storage.firmware_bin_path and storage.firmware_bin_path.exists():
+        yaml_mtime = path.stat().st_mtime
+        bin_mtime = storage.firmware_bin_path.stat().st_mtime
+        has_pending = yaml_mtime > bin_mtime
 
     return Device(
         name=name,
