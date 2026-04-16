@@ -813,7 +813,7 @@ class DevicesController:
 
         assert proc.stdout is not None  # type narrowing
         async for line_bytes in proc.stdout:
-            line = line_bytes.decode("utf-8", errors="replace")
+            line = line_bytes.decode("utf-8", errors="replace").rstrip("\n\r")
             await client.send_event(message_id, "output", line)
 
         exit_code = await proc.wait()
@@ -847,7 +847,7 @@ class DevicesController:
 
         assert proc.stdout is not None  # type narrowing
         async for line_bytes in proc.stdout:
-            line = line_bytes.decode("utf-8", errors="replace")
+            line = line_bytes.decode("utf-8", errors="replace").rstrip("\n\r")
             await client.send_event(message_id, "output", line)
 
         exit_code = await proc.wait()
