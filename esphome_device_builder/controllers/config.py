@@ -69,6 +69,16 @@ class DashboardSettings:
         self.config_dir = Path(args.configuration)
         self.config_dir.mkdir(parents=True, exist_ok=True)
         self.absolute_config_dir = self.config_dir.resolve()
+        # Ensure secrets.yaml exists (ESPHome fails if !secret references can't find it)
+        secrets_path = self.config_dir / "secrets.yaml"
+        if not secrets_path.exists():
+            secrets_path.write_text(
+                "# Secrets — referenced from device configs via !secret\n"
+                "# Update these values for your network\n"
+                'wifi_ssid: ""\n'
+                'wifi_password: ""\n',
+                encoding="utf-8",
+            )
         self.verbose = getattr(args, "verbose", False)
         self.port = getattr(args, "port", 6052)
         self.host = getattr(args, "host", "0.0.0.0")
