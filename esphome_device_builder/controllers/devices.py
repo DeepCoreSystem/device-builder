@@ -87,17 +87,26 @@ def _generate_device_yaml(
     lines.append(f"  friendly_name: {friendly_name}")
     lines.append("")
 
-    # Platform config — only the parameters ESPHome needs, no PlatformIO board ID
-    platform = esphome_cfg.platform
+    # Platform config
+    # ESP32: variant + flash_size, board optional
+    # All others: board is REQUIRED, no variant/flash_size
+    platform = str(esphome_cfg.platform)
     hardware = board.hardware
     lines.append(f"{platform}:")
-    if esphome_cfg.variant:
-        lines.append(f"  variant: {esphome_cfg.variant}")
-    if hardware.flash_size:
-        lines.append(f"  flash_size: {hardware.flash_size}")
-    if esphome_cfg.framework:
-        lines.append("  framework:")
-        lines.append(f"    type: {esphome_cfg.framework}")
+
+    if platform == "esp32":
+        # ESP32 uses variant instead of board
+        if esphome_cfg.variant:
+            lines.append(f"  variant: {esphome_cfg.variant}")
+        if hardware.flash_size:
+            lines.append(f"  flash_size: {hardware.flash_size}")
+        if esphome_cfg.framework:
+            lines.append("  framework:")
+            lines.append(f"    type: {esphome_cfg.framework}")
+    else:
+        # esp8266, rp2040, bk72xx, rtl87xx, ln882x, nrf52 — board is required
+        lines.append(f"  board: {esphome_cfg.board}")
+
     lines.append("")
 
     # Logging
