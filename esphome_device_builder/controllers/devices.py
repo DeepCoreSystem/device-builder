@@ -48,6 +48,77 @@ _ESPHOME_CMD = [sys.executable, "-m", "esphome"]
 _CacheKey = tuple[int, int, float, int]
 
 
+def _generate_device_yaml(
+    name: str,
+    friendly_name: str,
+    board: Any,
+    ssid: str,
+    psk: str,
+) -> str:
+    """Generate a complete device YAML config from a board definition.
+
+    Produces the base config with platform settings, logging, API, OTA,
+    and WiFi — the most common/sane defaults for a new device.
+    """
+    esphome_cfg = board.esphome
+    lines: list[str] = []
+
+    # Board reference comment
+    board_label = board.name
+    if board.manufacturer:
+        board_label = f"{board.name} ({board.manufacturer})"
+    lines.append(f"# Board: {board_label}")
+    lines.append(f"# Definition: definitions/boards/{board.id}/manifest.yaml")
+    lines.append("")
+
+    # ESPHome core
+    lines.append("esphome:")
+    lines.append(f"  name: {name}")
+    lines.append(f"  friendly_name: {friendly_name}")
+    lines.append("")
+
+    # Platform config
+    platform = esphome_cfg.platform
+    lines.append(f"{platform}:")
+    if esphome_cfg.variant:
+        lines.append(f"  variant: {esphome_cfg.variant}")
+    lines.append(f"  board: {esphome_cfg.board}")
+    if esphome_cfg.framework:
+        lines.append("  framework:")
+        lines.append(f"    type: {esphome_cfg.framework}")
+    lines.append("")
+
+    # Logging
+    lines.append("logger:")
+    lines.append("")
+
+    # Home Assistant API
+    lines.append("api:")
+    lines.append("  encryption:")
+    lines.append("    key: !secret api_encryption_key")
+    lines.append("")
+
+    # OTA
+    lines.append("ota:")
+    lines.append("  - platform: esphome")
+    lines.append("")
+
+    # WiFi (only for boards that support it)
+    connectivity = [c.value for c in board.hardware.connectivity] if board.hardware else []
+    has_wifi = "wifi" in connectivity or not connectivity  # assume wifi if no connectivity data
+    if has_wifi:
+        lines.append("wifi:")
+        if ssid:
+            lines.append(f"  ssid: {ssid}")
+            lines.append(f"  password: {psk}")
+        else:
+            lines.append("  ssid: !secret wifi_ssid")
+            lines.append("  password: !secret wifi_password")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
 def _load_device_from_storage(path: Path, board_id: str = "") -> Device:
     """Build a Device model from a YAML config file and its StorageJSON."""
     filename = path.name
@@ -249,17 +320,20 @@ class DevicesController:
         self,
         *,
         name: str,
+        board_id: str,
         config_type: str = "basic",
-        platform: str = "",
-        board: str = "",
         ssid: str = "",
         psk: str = "",
-        password: str = "",
         file_content: str | None = None,
-        board_id: str | None = None,
         **kwargs: Any,
     ) -> WizardResponse:
-        """Create a new device configuration."""
+        """Create a new device configuration.
+
+        Looks up the board definition to generate proper ESPHome platform
+        config with sane defaults. The board_id is stored in metadata for
+        future reference but does NOT appear in the device YAML — ESPHome
+        only cares about platform/variant/board settings.
+        """
         name = name.strip()
         if not name:
             msg = "name is required"
@@ -272,42 +346,38 @@ class DevicesController:
             msg = "File already exists"
             raise FileExistsError(msg)
 
+        # Look up board definition
+        board = None
+        if self._db.boards:
+            board = await self._db.boards.get_board(board_id=board_id)
+        if board is None:
+            msg = f"Unknown board: {board_id}"
+            raise ValueError(msg)
+
         loop = asyncio.get_running_loop()
 
         def _write() -> None:
             if config_type == "upload" and file_content:
                 config_path.write_text(file_content, encoding="utf-8")
                 return
+
             friendly = friendly_name_slugify(name)
+
             if config_type == "empty":
                 yaml = f"esphome:\n  name: {name}\n  friendly_name: {friendly}\n\n"
-            else:
-                yaml = (
-                    f"esphome:\n"
-                    f"  name: {name}\n"
-                    f"  friendly_name: {friendly}\n\n"
-                    f"{platform}:\n"
-                    f"  board: {board}\n\n"
-                    f"logger:\n\n"
-                    f"api:\n"
-                    f"  encryption:\n"
-                    f"    key: !secret api_encryption_key\n\n"
-                    f"ota:\n"
-                    f"  - platform: esphome\n"
-                    f"    password: {password}\n\n"
-                    f"wifi:\n"
-                    f"  ssid: {ssid}\n"
-                    f"  password: {psk}\n"
-                )
+                config_path.write_text(yaml, encoding="utf-8")
+                return
+
+            yaml = _generate_device_yaml(name, friendly, board, ssid, psk)
             config_path.write_text(yaml, encoding="utf-8")
 
         await loop.run_in_executor(None, _write)
 
-        if board_id:
-            config_dir = self._db.settings.config_dir
-            await loop.run_in_executor(
-                None, lambda: set_device_metadata(config_dir, filename, board_id=board_id)
-            )
+        # Store board_id in metadata for future reference
+        config_dir = self._db.settings.config_dir
+        await loop.run_in_executor(
+            None, lambda: set_device_metadata(config_dir, filename, board_id=board_id)
+        )
 
         await self._request_scan()
         return WizardResponse(configuration=filename)
