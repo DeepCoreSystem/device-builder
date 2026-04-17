@@ -1,8 +1,10 @@
 id: tinypico
 name: Unexpected Maker TinyPICO
-description: ESP32-based board with 4MB flash, 240MHz featuring Wi-Fi, Bluetooth,
-  Ethernet, CAN bus.
+description: TinyPICO is an ultra-compact ESP32-PICO-D4 development board (18x32mm) with 4 MB flash, 4 MB PSRAM, LiPo charging,
+  RGB LED, and 14 GPIO pins. One of the smallest ESP32 boards.
 manufacturer: Unexpected Maker
+images:
+- https://unexpectedmaker.com/shop/image/cache/catalog/products/tinypico/tinypico-v2-front-1000x700.jpg
 esphome:
   platform: esp32
   board: tinypico
@@ -17,7 +19,10 @@ hardware:
   - bluetooth
   - ethernet
   - can
-tags: []
+tags:
+- compact
+- lipo
+- rgb-led
 docs_url: https://esphome.io/components/esp32.html
 product_url: https://www.tinypico.com
 pins:
@@ -107,8 +112,7 @@ pins:
   - pwm
   - strapping
   available: null
-  notes: ADC2_CH5, Touch5 — strapping pin (must be LOW during boot for correct flash
-    voltage)
+  notes: ADC2_CH5, Touch5 — strapping pin (must be LOW during boot for correct flash voltage)
 - gpio: 13
   label: GPIO13
   features:
@@ -248,16 +252,14 @@ pins:
   - adc
   - input_only
   available: null
-  notes: ADC1_CH1 — input only, no internal pull-up/pull-down (not exposed on most
-    boards)
+  notes: ADC1_CH1 — input only, no internal pull-up/pull-down (not exposed on most boards)
 - gpio: 38
   label: GPIO38
   features:
   - adc
   - input_only
   available: null
-  notes: ADC1_CH2 — input only, no internal pull-up/pull-down (not exposed on most
-    boards)
+  notes: ADC1_CH2 — input only, no internal pull-up/pull-down (not exposed on most boards)
 - gpio: 39
   label: GPIO39
   features:

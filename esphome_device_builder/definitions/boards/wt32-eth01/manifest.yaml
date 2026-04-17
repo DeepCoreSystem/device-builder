@@ -1,7 +1,7 @@
 id: wt32-eth01
 name: WT32-ETH01
-description: ESP32 module with built-in Ethernet (LAN8720A) and Wi-Fi, designed for
-  wired network applications.
+description: WT32-ETH01 with ESP32 and built-in Ethernet (LAN8720A). Compact module for wired network connectivity. Popular
+  for reliable, low-latency home automation nodes.
 manufacturer: Wireless-Tag
 esphome:
   platform: esp32
@@ -16,6 +16,7 @@ hardware:
   - bluetooth
   - ethernet
 tags:
+- compact
 - module
 docs_url: https://esphome.io/components/esp32.html
 pins:
@@ -105,8 +106,7 @@ pins:
   - pwm
   - strapping
   available: null
-  notes: ADC2_CH5, Touch5 — strapping pin (must be LOW during boot for correct flash
-    voltage)
+  notes: ADC2_CH5, Touch5 — strapping pin (must be LOW during boot for correct flash voltage)
 - gpio: 13
   label: GPIO13
   features:
@@ -246,16 +246,14 @@ pins:
   - adc
   - input_only
   available: null
-  notes: ADC1_CH1 — input only, no internal pull-up/pull-down (not exposed on most
-    boards)
+  notes: ADC1_CH1 — input only, no internal pull-up/pull-down (not exposed on most boards)
 - gpio: 38
   label: GPIO38
   features:
   - adc
   - input_only
   available: null
-  notes: ADC1_CH2 — input only, no internal pull-up/pull-down (not exposed on most
-    boards)
+  notes: ADC1_CH2 — input only, no internal pull-up/pull-down (not exposed on most boards)
 - gpio: 39
   label: GPIO39
   features:

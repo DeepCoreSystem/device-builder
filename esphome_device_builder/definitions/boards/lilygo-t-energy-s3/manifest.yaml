@@ -1,7 +1,7 @@
 id: lilygo-t-energy-s3
 name: LilyGo T-Energy-S3
-description: The T-Energy module was developed using the ESP32S3, equipped with an
-  18650 lithium battery.
+description: LilyGo T-Energy-S3 with ESP32-S3, 18650 battery holder, solar charging circuit, and deep sleep optimizations.
+  Designed for solar-powered outdoor IoT deployments.
 manufacturer: LilyGo
 esphome:
   platform: esp32
@@ -15,7 +15,10 @@ hardware:
   connectivity:
   - bluetooth
   - wifi
-tags: []
+tags:
+- dev-kit
+- battery
+- solar
 docs_url: https://esphome.io/components/esp32.html
 product_url: https://www.lilygo.cc/products/t-energy-s3
 pins:

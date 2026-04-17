@@ -1,6 +1,7 @@
 id: nodemcuv2
 name: NodeMCU v2 (ESP8266)
-description: Popular ESP8266-based development board with USB-to-serial via CH340.
+description: NodeMCU V2 with ESP8266 (ESP-12E module), 4 MB flash, micro-USB, and onboard USB-UART bridge. The most popular
+  ESP8266 development board for home automation.
 manufacturer: NodeMCU
 esphome:
   platform: esp8266
@@ -126,5 +127,4 @@ pins:
   features:
   - adc
   available: null
-  notes: Analog input (TOUT pin) — 0-1V range, single ADC channel; not a standard
-    GPIO
+  notes: Analog input (TOUT pin) — 0-1V range, single ADC channel; not a standard GPIO

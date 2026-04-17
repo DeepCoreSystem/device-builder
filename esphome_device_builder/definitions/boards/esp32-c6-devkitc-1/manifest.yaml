@@ -1,7 +1,7 @@
 id: esp32-c6-devkitc-1
 name: ESP32-C6 DevKitC-1
-description: Espressif's ESP32-C6 development board with Wi-Fi 6, Bluetooth 5.0, Zigbee
-  3.0, and Thread support.
+description: Espressif ESP32-C6 development board with Wi-Fi 6, Bluetooth 5 (LE), Thread, and Zigbee support. RISC-V CPU with
+  USB-C interface.
 manufacturer: Espressif
 images:
 - https://docs.espressif.com/projects/esp-dev-kits/en/latest/esp32c6/_images/esp32-c6-devkitc-1-isometric_v1.2.png
@@ -20,6 +20,7 @@ hardware:
   - thread
 tags:
 - dev-kit
+- usb-c
 docs_url: https://esphome.io/components/esp32.html
 pins:
 - gpio: 0

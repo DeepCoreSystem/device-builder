@@ -1,6 +1,7 @@
 id: seeed_xiao_esp32c6
 name: Seeed Studio XIAO ESP32C6
-description: Getting Started with Seeed Studio XIAO ESP32C6.
+description: Seeed XIAO ESP32C6 is a compact board (21x17mm) with Wi-Fi 6, Bluetooth 5, Thread, and Zigbee support. USB-C,
+  4 MB flash, battery charging circuit.
 manufacturer: Seeed Studio
 esphome:
   platform: esp32
@@ -16,7 +17,10 @@ hardware:
   - bluetooth
   - zigbee
   - thread
-tags: []
+tags:
+- compact
+- usb-c
+- battery
 docs_url: https://esphome.io/components/esp32.html
 product_url: https://wiki.seeedstudio.com/xiao_esp32c6_getting_started/
 pins:

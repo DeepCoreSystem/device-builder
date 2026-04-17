@@ -1,7 +1,10 @@
 id: lolin_c3_mini
 name: WEMOS LOLIN C3 Mini
-description: ESP32-C3-based board with 4MB flash, 160MHz featuring Wi-Fi.
+description: LOLIN C3 Mini with ESP32-C3 in D1 Mini form factor. RISC-V core with Wi-Fi and Bluetooth 5. Compatible with D1
+  Mini shields.
 manufacturer: WEMOS
+images:
+- https://www.wemos.cc/en/latest/_images/c3_mini_v1.0.0_1_16x16.jpg
 esphome:
   platform: esp32
   board: lolin_c3_mini
@@ -13,7 +16,9 @@ hardware:
   cpu_frequency: 160MHz
   connectivity:
   - wifi
-tags: []
+tags:
+- compact
+- usb-c
 docs_url: https://esphome.io/components/esp32.html
 product_url: https://www.wemos.cc/en/latest/c3/c3_mini.html
 pins:

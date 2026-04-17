@@ -1,7 +1,7 @@
 id: esp32-s2-mini
 name: LOLIN S2 Mini
-description: Compact ESP32-S2 board from LOLIN/Wemos with USB-C and a D1 Mini-compatible
-  form factor.
+description: Compact ESP32-S2 development board in D1 Mini form factor. Features USB-C, Wi-Fi, 4 MB flash, and 2 MB PSRAM.
+  Drop-in upgrade for D1 Mini projects.
 manufacturer: LOLIN/Wemos
 esphome:
   platform: esp32
@@ -14,6 +14,7 @@ hardware:
   connectivity:
   - wifi
 tags:
+- dev-kit
 - compact
 - usb-c
 docs_url: https://esphome.io/components/esp32.html

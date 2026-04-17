@@ -1,6 +1,7 @@
 id: arduino_nano_esp32
 name: Arduino Nano ESP32
-description: ESP32-S3-based board with 16MB flash, 240MHz featuring Bluetooth, Wi-Fi.
+description: Arduino Nano ESP32 with ESP32-S3, USB-C, 16 MB flash, 8 MB PSRAM, and Arduino Nano form factor. Official Arduino
+  board compatible with the Arduino ecosystem and ESP-IDF.
 manufacturer: Arduino
 esphome:
   platform: esp32
@@ -14,7 +15,10 @@ hardware:
   connectivity:
   - bluetooth
   - wifi
-tags: []
+tags:
+- dev-kit
+- compact
+- usb-c
 docs_url: https://esphome.io/components/esp32.html
 product_url: https://docs.arduino.cc/hardware/nano-esp32
 pins:

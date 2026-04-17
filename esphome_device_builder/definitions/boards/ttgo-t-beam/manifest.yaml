@@ -1,7 +1,7 @@
 id: ttgo-t-beam
 name: TTGO T-Beam
-description: Contribute to LilyGO/TTGO-T-Beam development by creating an account on
-  GitHub.
+description: TTGO T-Beam with ESP32, LoRa SX1276/SX1278 radio, GPS module (NEO-6M), OLED display, and 18650 battery holder.
+  Popular board for LoRa mesh networking and GPS tracking.
 manufacturer: TTGO
 esphome:
   platform: esp32
@@ -17,7 +17,9 @@ hardware:
   - bluetooth
   - can
   - ethernet
-tags: []
+tags:
+- lipo
+- external-antenna
 docs_url: https://esphome.io/components/esp32.html
 product_url: https://github.com/LilyGO/TTGO-T-Beam
 pins:
@@ -107,8 +109,7 @@ pins:
   - pwm
   - strapping
   available: null
-  notes: ADC2_CH5, Touch5 — strapping pin (must be LOW during boot for correct flash
-    voltage)
+  notes: ADC2_CH5, Touch5 — strapping pin (must be LOW during boot for correct flash voltage)
 - gpio: 13
   label: GPIO13
   features:
@@ -249,16 +250,14 @@ pins:
   - adc
   - input_only
   available: null
-  notes: ADC1_CH1 — input only, no internal pull-up/pull-down (not exposed on most
-    boards)
+  notes: ADC1_CH1 — input only, no internal pull-up/pull-down (not exposed on most boards)
 - gpio: 38
   label: GPIO38
   features:
   - adc
   - input_only
   available: null
-  notes: ADC1_CH2 — input only, no internal pull-up/pull-down (not exposed on most
-    boards)
+  notes: ADC1_CH2 — input only, no internal pull-up/pull-down (not exposed on most boards)
 - gpio: 39
   label: GPIO39
   features:

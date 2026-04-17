@@ -1,8 +1,10 @@
 id: seeed-xiao-esp32s3
 name: Seeed XIAO ESP32S3
-description: Compact ESP32-S3 board from Seeed Studio with Wi-Fi, Bluetooth 5.0, USB-C,
-  and optional camera support.
+description: Seeed XIAO ESP32S3 is a compact ESP32-S3 board (21x17mm) with Wi-Fi, Bluetooth, camera interface, 8 MB flash,
+  and 8 MB PSRAM. USB-C with OTG support.
 manufacturer: Seeed Studio
+images:
+- https://files.seeedstudio.com/wiki/SeeedStudio-XIAO-ESP32S3/img/xiaoesp32s3.jpg
 esphome:
   platform: esp32
   board: seeed_xiao_esp32s3
@@ -17,6 +19,7 @@ hardware:
 tags:
 - compact
 - usb-c
+- camera
 docs_url: https://esphome.io/components/esp32.html
 pins:
 - gpio: 0

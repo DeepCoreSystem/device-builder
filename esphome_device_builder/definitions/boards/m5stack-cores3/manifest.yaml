@@ -1,8 +1,7 @@
 id: m5stack-cores3
 name: M5Stack CoreS3
-description: The reference docs for M5Stack products. Quick start, get the detailed
-  information or instructions such as IDE,UIFLOW,Arduino. The tutorials for M5Burner,
-  Firmware, Burning, programming. ESP32,M5StickC,StickV, StickT,M5ATOM.
+description: M5Stack CoreS3 with ESP32-S3, 2-inch capacitive touch display, dual cameras, microphone, speaker, IMU, proximity
+  sensor, and 500 mAh battery. USB-C with full IoT sensor suite.
 manufacturer: M5Stack
 esphome:
   platform: esp32
@@ -16,7 +15,15 @@ hardware:
   connectivity:
   - bluetooth
   - wifi
-tags: []
+tags:
+- dev-kit
+- display
+- camera
+- speaker
+- microphone
+- imu
+- usb-c
+- battery
 docs_url: https://esphome.io/components/esp32.html
 product_url: https://docs.m5stack.com/en/core/CoreS3
 pins:

@@ -1,6 +1,7 @@
 id: esp32-c3-devkitc-02
 name: Espressif ESP32-C3-DevKitC-02
-description: ESP32-C3-based board with 4MB flash, 160MHz featuring Wi-Fi, Bluetooth.
+description: Espressif ESP32-C3 development board with RISC-V single-core CPU, Wi-Fi, and Bluetooth 5 (LE). Cost-effective
+  board for IoT applications with full ESP-IDF and Arduino support.
 manufacturer: Espressif
 images:
 - https://docs.espressif.com/projects/esp-dev-kits/en/latest/esp32c3/_images/esp32-c3-devkitc-02-v1-isometric.png
@@ -16,7 +17,9 @@ hardware:
   connectivity:
   - wifi
   - bluetooth
-tags: []
+tags:
+- dev-kit
+- usb-c
 docs_url: https://esphome.io/components/esp32.html
 product_url: https://docs.espressif.com/projects/esp-idf/en/latest/esp32c3/hw-reference/esp32c3/user-guide-devkitc-02.html
 pins:

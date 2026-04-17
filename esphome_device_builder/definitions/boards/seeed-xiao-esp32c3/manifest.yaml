@@ -1,8 +1,10 @@
 id: seeed-xiao-esp32c3
 name: Seeed XIAO ESP32C3
-description: Thumb-sized ESP32-C3 board from Seeed Studio with Wi-Fi, Bluetooth 5.0,
-  and a rich set of interfaces in a tiny package.
+description: Seeed XIAO ESP32C3 is a thumb-sized ESP32-C3 board (21x17mm) with Wi-Fi and Bluetooth 5 (LE). Features USB-C,
+  4 MB flash, battery charging, and external antenna connector.
 manufacturer: Seeed Studio
+images:
+- https://files.seeedstudio.com/wiki/XIAO_WiFi/board-pic.png
 esphome:
   platform: esp32
   board: seeed_xiao_esp32c3
@@ -16,6 +18,9 @@ hardware:
   - bluetooth
 tags:
 - compact
+- usb-c
+- external-antenna
+- battery
 docs_url: https://esphome.io/components/esp32.html
 pins:
 - gpio: 0

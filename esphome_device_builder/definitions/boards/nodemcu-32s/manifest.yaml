@@ -1,7 +1,7 @@
 id: nodemcu-32s
 name: NodeMCU-32S
-description: ESP32-based board with 4MB flash, 240MHz featuring Wi-Fi, Bluetooth,
-  Ethernet, CAN bus.
+description: NodeMCU-32S with ESP32-WROOM-32, 4 MB flash, micro-USB, 38 pins exposed. ESP32 version of the classic NodeMCU
+  form factor.
 manufacturer: NodeMCU
 images:
 - https://docs.espressif.com/projects/esp-dev-kits/en/latest/esp32/_images/esp32-devkitc-v4-functional-overview.png
@@ -19,7 +19,8 @@ hardware:
   - bluetooth
   - ethernet
   - can
-tags: []
+tags:
+- dev-kit
 docs_url: https://esphome.io/components/esp32.html
 product_url: http://www.nodemcu.com/
 pins:
@@ -111,8 +112,7 @@ pins:
   - pwm
   - strapping
   available: null
-  notes: ADC2_CH5, Touch5 — strapping pin (must be LOW during boot for correct flash
-    voltage)
+  notes: ADC2_CH5, Touch5 — strapping pin (must be LOW during boot for correct flash voltage)
 - gpio: 13
   label: GPIO13
   features:
@@ -252,16 +252,14 @@ pins:
   - adc
   - input_only
   available: null
-  notes: ADC1_CH1 — input only, no internal pull-up/pull-down (not exposed on most
-    boards)
+  notes: ADC1_CH1 — input only, no internal pull-up/pull-down (not exposed on most boards)
 - gpio: 38
   label: GPIO38
   features:
   - adc
   - input_only
   available: null
-  notes: ADC1_CH2 — input only, no internal pull-up/pull-down (not exposed on most
-    boards)
+  notes: ADC1_CH2 — input only, no internal pull-up/pull-down (not exposed on most boards)
 - gpio: 39
   label: GPIO39
   features:

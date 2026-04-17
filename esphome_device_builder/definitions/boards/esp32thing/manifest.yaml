@@ -1,7 +1,7 @@
 id: esp32thing
 name: SparkFun ESP32 Thing
-description: The SparkFun ESP32 Thing is a comprehensive development platform for
-  Espressif’s ESP32, their super-charged version of the popular ESP8266.
+description: SparkFun ESP32 Thing with ESP32-WROOM, LiPo battery charging, onboard LED, and Qwiic connector. Beginner-friendly
+  ESP32 board with SparkFun's ecosystem support.
 manufacturer: SparkFun Electronics
 esphome:
   platform: esp32
@@ -17,7 +17,9 @@ hardware:
   - bluetooth
   - ethernet
   - can
-tags: []
+tags:
+- dev-kit
+- lipo
 docs_url: https://esphome.io/components/esp32.html
 product_url: https://www.sparkfun.com/products/13907
 pins:
@@ -109,8 +111,7 @@ pins:
   - pwm
   - strapping
   available: null
-  notes: ADC2_CH5, Touch5 — strapping pin (must be LOW during boot for correct flash
-    voltage)
+  notes: ADC2_CH5, Touch5 — strapping pin (must be LOW during boot for correct flash voltage)
 - gpio: 13
   label: GPIO13
   features:
@@ -250,16 +251,14 @@ pins:
   - adc
   - input_only
   available: null
-  notes: ADC1_CH1 — input only, no internal pull-up/pull-down (not exposed on most
-    boards)
+  notes: ADC1_CH1 — input only, no internal pull-up/pull-down (not exposed on most boards)
 - gpio: 38
   label: GPIO38
   features:
   - adc
   - input_only
   available: null
-  notes: ADC1_CH2 — input only, no internal pull-up/pull-down (not exposed on most
-    boards)
+  notes: ADC1_CH2 — input only, no internal pull-up/pull-down (not exposed on most boards)
 - gpio: 39
   label: GPIO39
   features:

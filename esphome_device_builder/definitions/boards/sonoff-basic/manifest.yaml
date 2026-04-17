@@ -1,7 +1,7 @@
 id: sonoff-basic
 name: Sonoff Basic
-description: Budget-friendly ESP8266-based Wi-Fi relay switch from ITEAD. Popular
-  for DIY home automation with custom firmware.
+description: Sonoff Basic R1 smart relay switch with ESP8285, 10A relay, and mains power input. Flashable with ESPHome for
+  local control. Popular entry point for smart home retrofitting.
 manufacturer: Sonoff/ITEAD
 esphome:
   platform: esp8266
@@ -127,5 +127,4 @@ pins:
   features:
   - adc
   available: null
-  notes: Analog input (TOUT pin) — 0-1V range, single ADC channel; not a standard
-    GPIO
+  notes: Analog input (TOUT pin) — 0-1V range, single ADC channel; not a standard GPIO

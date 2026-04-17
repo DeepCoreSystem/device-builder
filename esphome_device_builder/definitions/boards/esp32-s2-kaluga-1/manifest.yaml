@@ -1,6 +1,7 @@
 id: esp32-s2-kaluga-1
 name: Espressif ESP32-S2-Kaluga-1 Kit
-description: ESP32-S2-based board with 4MB flash, 240MHz featuring Wi-Fi.
+description: Espressif ESP32-S2 multimedia development board with LCD display, camera interface, audio codec, and touch panel
+  support. Designed for HMI and multimedia IoT applications.
 manufacturer: Espressif
 esphome:
   platform: esp32
@@ -13,7 +14,12 @@ hardware:
   cpu_frequency: 240MHz
   connectivity:
   - wifi
-tags: []
+tags:
+- dev-kit
+- display
+- camera
+- speaker
+- microphone
 docs_url: https://esphome.io/components/esp32.html
 product_url: https://docs.espressif.com/projects/esp-idf/en/latest/esp32s2/hw-reference/esp32s2/user-guide-esp32-s2-kaluga-1-kit.html
 pins:

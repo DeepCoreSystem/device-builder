@@ -1,8 +1,10 @@
 id: esp32-gateway
 name: OLIMEX ESP32-GATEWAY
-description: ESP32-GATEWAY development board with WiFi BLE, Ethernet, micro SD card,
-  and GPIO.
+description: Olimex ESP32-GATEWAY with ESP32-WROOM, Ethernet (LAN8710A), and micro-USB. Compact Ethernet gateway board ideal
+  for bridging Wi-Fi and wired networks in home automation.
 manufacturer: OLIMEX
+images:
+- https://www.olimex.com/Products/IoT/ESP32/ESP32-GATEWAY/images/thumbs/350x/ESP32-GATEWAY-03.jpg
 esphome:
   platform: esp32
   board: esp32-gateway
@@ -17,7 +19,8 @@ hardware:
   - bluetooth
   - ethernet
   - can
-tags: []
+tags:
+- compact
 docs_url: https://esphome.io/components/esp32.html
 product_url: https://www.olimex.com/Products/IoT/ESP32-GATEWAY/open-source-hardware
 pins:
@@ -107,8 +110,7 @@ pins:
   - pwm
   - strapping
   available: null
-  notes: ADC2_CH5, Touch5 — strapping pin (must be LOW during boot for correct flash
-    voltage)
+  notes: ADC2_CH5, Touch5 — strapping pin (must be LOW during boot for correct flash voltage)
 - gpio: 13
   label: GPIO13
   features:
@@ -250,16 +252,14 @@ pins:
   - adc
   - input_only
   available: null
-  notes: ADC1_CH1 — input only, no internal pull-up/pull-down (not exposed on most
-    boards)
+  notes: ADC1_CH1 — input only, no internal pull-up/pull-down (not exposed on most boards)
 - gpio: 38
   label: GPIO38
   features:
   - adc
   - input_only
   available: null
-  notes: ADC1_CH2 — input only, no internal pull-up/pull-down (not exposed on most
-    boards)
+  notes: ADC1_CH2 — input only, no internal pull-up/pull-down (not exposed on most boards)
 - gpio: 39
   label: GPIO39
   features:

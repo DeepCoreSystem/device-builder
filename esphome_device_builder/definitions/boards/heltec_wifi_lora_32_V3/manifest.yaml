@@ -1,7 +1,7 @@
 id: heltec_wifi_lora_32_V3
 name: Heltec WiFi LoRa 32 (V3)
-description: WiFi LoRa 32 is a classic IoT development board widely used in many open-source
-  projects and IoT products.
+description: Heltec WiFi LoRa 32 V3 with ESP32-S3, SX1262 LoRa radio, 0.96-inch OLED display, and USB-C. Third-generation
+  LoRa development board with improved range and power efficiency.
 manufacturer: Heltec
 esphome:
   platform: esp32
@@ -16,7 +16,11 @@ hardware:
   - wifi
   - bluetooth
   - lora
-tags: []
+tags:
+- dev-kit
+- display
+- usb-c
+- external-antenna
 docs_url: https://esphome.io/components/esp32.html
 product_url: https://heltec.org/project/wifi-lora-32-v3/
 pins:

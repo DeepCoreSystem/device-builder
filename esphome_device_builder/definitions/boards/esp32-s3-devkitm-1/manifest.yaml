@@ -1,6 +1,7 @@
 id: esp32-s3-devkitm-1
 name: Espressif ESP32-S3-DevKitM-1
-description: ESP32-S3-based board with 8MB flash, 240MHz featuring Bluetooth, Wi-Fi.
+description: Compact Espressif ESP32-S3 development board using the ESP32-S3-MINI-1 module. Smaller form factor than the DevKitC-1,
+  ideal for space-constrained projects.
 manufacturer: Espressif
 images:
 - https://docs.espressif.com/projects/esp-dev-kits/en/latest/esp32s3/_images/esp32-s3-devkitm-1-v1-isometric.png
@@ -16,7 +17,10 @@ hardware:
   connectivity:
   - bluetooth
   - wifi
-tags: []
+tags:
+- dev-kit
+- compact
+- usb-c
 docs_url: https://esphome.io/components/esp32.html
 product_url: https://docs.espressif.com/projects/esp-idf/en/latest/esp32s3/hw-reference/esp32s3/user-guide-devkitm-1.html
 pins:

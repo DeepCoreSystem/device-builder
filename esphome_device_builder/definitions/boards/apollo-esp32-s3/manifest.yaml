@@ -1,7 +1,7 @@
 id: apollo-esp32-s3
 name: Apollo Automation ESP32-S3 Starter Kit
-description: Apollo Automation's ESP32-S3 based starter kit with USB and Bluetooth
-  LE.
+description: Apollo Automation DEV-1 development board with ESP32-S3 module. Features USB-C, Wi-Fi, Bluetooth, onboard RGB
+  LED, GPIO, and I2C interfaces. Pre-soldered headers for easy prototyping.
 manufacturer: Apollo Automation
 esphome:
   platform: esp32
@@ -15,8 +15,9 @@ hardware:
   - wifi
   - bluetooth
 tags:
-- starter-kit
+- dev-kit
 - usb-c
+- rgb-led
 docs_url: https://esphome.io/components/esp32.html
 featured: true
 pins:

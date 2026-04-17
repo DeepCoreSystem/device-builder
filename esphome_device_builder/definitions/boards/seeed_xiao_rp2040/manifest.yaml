@@ -1,6 +1,7 @@
 id: seeed_xiao_rp2040
 name: XIAO RP2040
-description: Board by Seeed with 2MB flash, 133MHz.
+description: Seeed XIAO RP2040 is a tiny RP2040 board (21x17mm) with dual-core Cortex-M0+ at 133 MHz, 2 MB flash, USB-C, and
+  programmable RGB LED. Compatible with Arduino and MicroPython.
 manufacturer: Seeed
 esphome:
   platform: rp2040
@@ -10,7 +11,10 @@ hardware:
   flash_size: 2MB
   ram_size: 262144
   cpu_frequency: 133MHz
-tags: []
+tags:
+- compact
+- usb-c
+- rgb-led
 docs_url: https://esphome.io/components/rp2040.html
 product_url: https://www.raspberrypi.org/products/raspberry-pi-pico/
 pins:

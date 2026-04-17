@@ -1,6 +1,7 @@
 id: esp32-c6-devkitm-1
 name: Espressif ESP32-C6-DevKitM-1
-description: ESP32-C6-based board with 4MB flash, 160MHz featuring Wi-Fi.
+description: Compact Espressif ESP32-C6 development board using the ESP32-C6-MINI-1 module. Wi-Fi 6, Bluetooth 5, Thread,
+  and Zigbee in a small form factor.
 manufacturer: Espressif
 images:
 - https://docs.espressif.com/projects/esp-dev-kits/en/latest/esp32c6/_images/esp32-c6-devkitm-1-isometric.png
@@ -15,7 +16,9 @@ hardware:
   cpu_frequency: 160MHz
   connectivity:
   - wifi
-tags: []
+tags:
+- dev-kit
+- compact
 docs_url: https://esphome.io/components/esp32.html
 product_url: https://docs.espressif.com/projects/espressif-esp-dev-kits/en/latest/esp32c6/esp32-c6-devkitm-1/index.html
 pins:

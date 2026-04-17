@@ -1,6 +1,7 @@
 id: rpipico2
 name: Pico 2
-description: Board by Raspberry Pi with 4MB flash, 150MHz.
+description: Raspberry Pi Pico 2 with RP2350, dual-core Cortex-M33 at 150 MHz, 4 MB flash, 520 KB RAM, and USB-C. Significant
+  performance upgrade over the original Pico.
 manufacturer: Raspberry Pi
 esphome:
   platform: rp2040
@@ -10,7 +11,9 @@ hardware:
   flash_size: 4MB
   ram_size: 524288
   cpu_frequency: 150MHz
-tags: []
+tags:
+- dev-kit
+- usb-c
 docs_url: https://esphome.io/components/rp2040.html
 product_url: https://www.raspberrypi.org/products/raspberry-pi-pico/
 pins:

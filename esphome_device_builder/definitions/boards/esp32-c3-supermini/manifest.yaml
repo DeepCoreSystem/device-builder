@@ -1,7 +1,7 @@
 id: esp32-c3-supermini
 name: ESP32-C3 Super Mini
-description: Ultra-compact ESP32-C3 board with USB-C and a minimal footprint, ideal
-  for space-constrained projects.
+description: Ultra-compact ESP32-C3 development board in a thumb-sized form factor. Features USB-C, Wi-Fi, and Bluetooth 5
+  (LE). Popular budget-friendly board for small IoT projects.
 manufacturer: Generic
 esphome:
   platform: esp32
@@ -15,6 +15,7 @@ hardware:
   - wifi
   - bluetooth
 tags:
+- dev-kit
 - compact
 - usb-c
 docs_url: https://esphome.io/components/esp32.html

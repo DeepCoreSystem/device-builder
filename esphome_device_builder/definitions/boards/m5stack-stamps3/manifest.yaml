@@ -1,8 +1,7 @@
 id: m5stack-stamps3
 name: M5Stack StampS3
-description: The reference docs for M5Stack products. Quick start, get the detailed
-  information or instructions such as IDE,UIFLOW,Arduino. The tutorials for M5Burner,
-  Firmware, Burning, programming. ESP32,M5StickC,StickV, StickT,M5ATOM.
+description: M5Stack StampS3 is a postage-stamp sized ESP32-S3 module (24x24mm) with 8 MB flash, 2 MB PSRAM, Wi-Fi, and Bluetooth.
+  Castellated pads for direct soldering onto carrier boards.
 manufacturer: M5Stack
 esphome:
   platform: esp32
@@ -16,7 +15,9 @@ hardware:
   connectivity:
   - bluetooth
   - wifi
-tags: []
+tags:
+- compact
+- module
 docs_url: https://esphome.io/components/esp32.html
 product_url: https://docs.m5stack.com/en/core/StampS3
 pins:

@@ -1,7 +1,7 @@
 id: freenove-esp32-s3-n8r8
 name: Freenove ESP32-S3 WROOM N8R8 (8MB Flash / 8MB PSRAM)
-description: Apply to FNK0085. Contribute to Freenove/Freenove_ESP32_S3_WROOM_Board
-  development by creating an account on GitHub.
+description: Freenove ESP32-S3 development board with 8 MB flash, 8 MB PSRAM, USB-C, camera connector, and 44 GPIO pins. Affordable
+  ESP32-S3 board with comprehensive GPIO access.
 manufacturer: Freenove
 esphome:
   platform: esp32
@@ -15,7 +15,10 @@ hardware:
   connectivity:
   - wifi
   - bluetooth
-tags: []
+tags:
+- dev-kit
+- usb-c
+- camera
 docs_url: https://esphome.io/components/esp32.html
 product_url: https://github.com/Freenove/Freenove_ESP32_S3_WROOM_Board
 pins:

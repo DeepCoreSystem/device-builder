@@ -1,9 +1,10 @@
 id: m5stack-fire
 name: M5Stack FIRE
-description: Open-source modular toolkits for IoT devices based on ESP32-updated version
-  of ESP8266. With stackable modules, user-friendly IDE, enabling rapid and high-quality
-  prototyping, STEM education, engineering and mechanical use.
+description: M5Stack FIRE is the deluxe ESP32 kit with 2-inch LCD display, 9-axis IMU, microphone, speaker, 16 MB flash, 8
+  MB PSRAM, 600 mAh battery, and expanded GPIO via M-Bus.
 manufacturer: M5Stack
+images:
+- https://static-cdn.m5stack.com/resource/docs/products/core/fire/fire_01.webp
 esphome:
   platform: esp32
   board: m5stack-fire
@@ -18,7 +19,13 @@ hardware:
   - bluetooth
   - ethernet
   - can
-tags: []
+tags:
+- dev-kit
+- display
+- speaker
+- microphone
+- imu
+- battery
 docs_url: https://esphome.io/components/esp32.html
 product_url: http://www.m5stack.com
 pins:
@@ -108,8 +115,7 @@ pins:
   - pwm
   - strapping
   available: null
-  notes: ADC2_CH5, Touch5 — strapping pin (must be LOW during boot for correct flash
-    voltage)
+  notes: ADC2_CH5, Touch5 — strapping pin (must be LOW during boot for correct flash voltage)
 - gpio: 13
   label: GPIO13
   features:
@@ -249,16 +255,14 @@ pins:
   - adc
   - input_only
   available: null
-  notes: ADC1_CH1 — input only, no internal pull-up/pull-down (not exposed on most
-    boards)
+  notes: ADC1_CH1 — input only, no internal pull-up/pull-down (not exposed on most boards)
 - gpio: 38
   label: GPIO38
   features:
   - adc
   - input_only
   available: null
-  notes: ADC1_CH2 — input only, no internal pull-up/pull-down (not exposed on most
-    boards)
+  notes: ADC1_CH2 — input only, no internal pull-up/pull-down (not exposed on most boards)
 - gpio: 39
   label: GPIO39
   features:

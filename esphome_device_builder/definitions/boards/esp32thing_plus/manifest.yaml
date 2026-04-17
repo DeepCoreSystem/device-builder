@@ -1,7 +1,7 @@
 id: esp32thing_plus
 name: SparkFun ESP32 Thing Plus
-description: This Feather-compatible ESP32 board features dual-core processing, WiFi,
-  Bluetooth, a micro-B USB port, and a plug-and-play Qwiic connector.
+description: SparkFun ESP32 Thing Plus with ESP32-WROOM, Feather-compatible pinout, LiPo charging, Qwiic connector, and microSD
+  slot. Works with Adafruit Feather accessories.
 manufacturer: SparkFun Electronics
 esphome:
   platform: esp32
@@ -17,7 +17,10 @@ hardware:
   - bluetooth
   - ethernet
   - can
-tags: []
+tags:
+- dev-kit
+- lipo
+- sd-card
 docs_url: https://esphome.io/components/esp32.html
 product_url: https://www.sparkfun.com/products/15663
 pins:
@@ -107,8 +110,7 @@ pins:
   - pwm
   - strapping
   available: null
-  notes: ADC2_CH5, Touch5 — strapping pin (must be LOW during boot for correct flash
-    voltage)
+  notes: ADC2_CH5, Touch5 — strapping pin (must be LOW during boot for correct flash voltage)
 - gpio: 13
   label: GPIO13
   features:
@@ -248,16 +250,14 @@ pins:
   - adc
   - input_only
   available: null
-  notes: ADC1_CH1 — input only, no internal pull-up/pull-down (not exposed on most
-    boards)
+  notes: ADC1_CH1 — input only, no internal pull-up/pull-down (not exposed on most boards)
 - gpio: 38
   label: GPIO38
   features:
   - adc
   - input_only
   available: null
-  notes: ADC1_CH2 — input only, no internal pull-up/pull-down (not exposed on most
-    boards)
+  notes: ADC1_CH2 — input only, no internal pull-up/pull-down (not exposed on most boards)
 - gpio: 39
   label: GPIO39
   features:

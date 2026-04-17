@@ -1,7 +1,7 @@
 id: ttgo-lora32-v21
 name: TTGO LoRa32-OLED v2.1.6
-description: T3. Contribute to LilyGO/TTGO-LoRa32-V2.1 development by creating an
-  account on GitHub.
+description: TTGO LoRa32 V2.1 with ESP32, SX1276 LoRa radio, 0.96-inch OLED display, and SMA antenna connector. Compact LoRa
+  node for long-range IoT communication.
 manufacturer: TTGO
 esphome:
   platform: esp32
@@ -17,7 +17,10 @@ hardware:
   - bluetooth
   - ethernet
   - can
-tags: []
+tags:
+- compact
+- display
+- external-antenna
 docs_url: https://esphome.io/components/esp32.html
 product_url: https://github.com/LilyGO/TTGO-LoRa32-V2.1
 pins:
@@ -107,8 +110,7 @@ pins:
   - pwm
   - strapping
   available: null
-  notes: ADC2_CH5, Touch5 — strapping pin (must be LOW during boot for correct flash
-    voltage)
+  notes: ADC2_CH5, Touch5 — strapping pin (must be LOW during boot for correct flash voltage)
 - gpio: 13
   label: GPIO13
   features:
@@ -249,16 +251,14 @@ pins:
   - adc
   - input_only
   available: null
-  notes: ADC1_CH1 — input only, no internal pull-up/pull-down (not exposed on most
-    boards)
+  notes: ADC1_CH1 — input only, no internal pull-up/pull-down (not exposed on most boards)
 - gpio: 38
   label: GPIO38
   features:
   - adc
   - input_only
   available: null
-  notes: ADC1_CH2 — input only, no internal pull-up/pull-down (not exposed on most
-    boards)
+  notes: ADC1_CH2 — input only, no internal pull-up/pull-down (not exposed on most boards)
 - gpio: 39
   label: GPIO39
   features:

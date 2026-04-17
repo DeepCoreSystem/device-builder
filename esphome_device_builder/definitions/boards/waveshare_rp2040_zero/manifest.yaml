@@ -1,6 +1,7 @@
 id: waveshare_rp2040_zero
 name: RP2040 Zero
-description: Board by Waveshare with 2MB flash, 133MHz.
+description: Waveshare RP2040-Zero is a tiny RP2040 board (23x18mm) with USB-C, 2 MB flash, 29 GPIO pins, and castellated
+  pads. Affordable and compact Pico alternative.
 manufacturer: Waveshare
 esphome:
   platform: rp2040
@@ -10,7 +11,9 @@ hardware:
   flash_size: 2MB
   ram_size: 262144
   cpu_frequency: 133MHz
-tags: []
+tags:
+- compact
+- usb-c
 docs_url: https://esphome.io/components/rp2040.html
 product_url: https://www.raspberrypi.org/products/raspberry-pi-pico/
 pins:

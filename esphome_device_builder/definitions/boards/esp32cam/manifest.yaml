@@ -1,7 +1,7 @@
 id: esp32cam
 name: AI Thinker ESP32-CAM
-description: ESP32-based board with 4MB flash, 240MHz featuring Wi-Fi, Bluetooth,
-  Ethernet, CAN bus.
+description: ESP32-CAM with ESP32-S, OV2640 2MP camera, microSD slot, onboard LED flash, and external antenna connector. Popular
+  low-cost board for camera and image processing projects.
 manufacturer: AI Thinker
 esphome:
   platform: esp32
@@ -17,7 +17,10 @@ hardware:
   - bluetooth
   - ethernet
   - can
-tags: []
+tags:
+- camera
+- sd-card
+- external-antenna
 docs_url: https://esphome.io/components/esp32.html
 product_url: https://wiki.ai-thinker.com/esp32-cam
 pins:
@@ -107,8 +110,7 @@ pins:
   - pwm
   - strapping
   available: null
-  notes: ADC2_CH5, Touch5 — strapping pin (must be LOW during boot for correct flash
-    voltage)
+  notes: ADC2_CH5, Touch5 — strapping pin (must be LOW during boot for correct flash voltage)
 - gpio: 13
   label: GPIO13
   features:
@@ -248,16 +250,14 @@ pins:
   - adc
   - input_only
   available: null
-  notes: ADC1_CH1 — input only, no internal pull-up/pull-down (not exposed on most
-    boards)
+  notes: ADC1_CH1 — input only, no internal pull-up/pull-down (not exposed on most boards)
 - gpio: 38
   label: GPIO38
   features:
   - adc
   - input_only
   available: null
-  notes: ADC1_CH2 — input only, no internal pull-up/pull-down (not exposed on most
-    boards)
+  notes: ADC1_CH2 — input only, no internal pull-up/pull-down (not exposed on most boards)
 - gpio: 39
   label: GPIO39
   features:

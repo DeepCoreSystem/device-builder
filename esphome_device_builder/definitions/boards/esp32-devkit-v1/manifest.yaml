@@ -1,12 +1,7 @@
 id: esp32-devkit-v1
 name: ESP32 DevKit V1
-description: 'Popular ESP32 development board with 30 exposed GPIO pins, USB-to-serial
-
-  via CP2102, and a micro-USB connector. Features the ESP32-WROOM-32 module
-
-  with 4 MB flash, Wi-Fi and Bluetooth Classic + BLE.
-
-  '
+description: Popular ESP32 development board with 30 exposed GPIO pins, USB-to-serial via CP2102, and micro-USB connector.
+  Features the ESP32-WROOM-32 module with 4 MB flash, Wi-Fi, and Bluetooth Classic + BLE.
 manufacturer: Espressif
 images:
 - https://docs.espressif.com/projects/esp-dev-kits/en/latest/esp32/_images/esp32-devkitc-v4-functional-overview.png

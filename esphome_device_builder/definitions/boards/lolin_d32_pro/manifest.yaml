@@ -1,7 +1,7 @@
 id: lolin_d32_pro
 name: WEMOS LOLIN D32 PRO
-description: ESP32-based board with 4MB flash, 240MHz featuring Wi-Fi, Bluetooth,
-  Ethernet, CAN bus.
+description: LOLIN D32 Pro with ESP32-WROVER, 16 MB flash, 8 MB PSRAM, TF card slot, LiPo battery charging, and OLED display
+  connector. Premium ESP32 board for data-intensive projects.
 manufacturer: WEMOS
 images:
 - https://www.wemos.cc/en/latest/_images/d32_pro_v2.0.0_1_16x16.jpg
@@ -19,7 +19,10 @@ hardware:
   - bluetooth
   - ethernet
   - can
-tags: []
+tags:
+- dev-kit
+- lipo
+- sd-card
 docs_url: https://esphome.io/components/esp32.html
 product_url: https://www.wemos.cc/en/latest/d32/d32_pro.html
 pins:
@@ -110,8 +113,7 @@ pins:
   - pwm
   - strapping
   available: null
-  notes: ADC2_CH5, Touch5 — strapping pin (must be LOW during boot for correct flash
-    voltage)
+  notes: ADC2_CH5, Touch5 — strapping pin (must be LOW during boot for correct flash voltage)
 - gpio: 13
   label: GPIO13
   features:
@@ -251,16 +253,14 @@ pins:
   - adc
   - input_only
   available: null
-  notes: ADC1_CH1 — input only, no internal pull-up/pull-down (not exposed on most
-    boards)
+  notes: ADC1_CH1 — input only, no internal pull-up/pull-down (not exposed on most boards)
 - gpio: 38
   label: GPIO38
   features:
   - adc
   - input_only
   available: null
-  notes: ADC1_CH2 — input only, no internal pull-up/pull-down (not exposed on most
-    boards)
+  notes: ADC1_CH2 — input only, no internal pull-up/pull-down (not exposed on most boards)
 - gpio: 39
   label: GPIO39
   features:

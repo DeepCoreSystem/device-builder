@@ -1,6 +1,7 @@
 id: esp8285
 name: Generic ESP8285 Module
-description: Board by Espressif with 1MB flash, 80MHz featuring Wi-Fi.
+description: ESP8285 module with built-in 1 MB flash (no external flash chip needed). Pin-compatible with ESP8266 but in a
+  smaller package. Used in many commercial IoT products.
 manufacturer: Espressif
 esphome:
   platform: esp8266
@@ -12,7 +13,9 @@ hardware:
   cpu_frequency: 80MHz
   connectivity:
   - wifi
-tags: []
+tags:
+- compact
+- module
 docs_url: https://esphome.io/components/esp8266.html
 product_url: http://www.esp8266.com/wiki/doku.php?id=esp8266-module-family
 pins:
@@ -126,5 +129,4 @@ pins:
   features:
   - adc
   available: null
-  notes: Analog input (TOUT pin) — 0-1V range, single ADC channel; not a standard
-    GPIO
+  notes: Analog input (TOUT pin) — 0-1V range, single ADC channel; not a standard GPIO

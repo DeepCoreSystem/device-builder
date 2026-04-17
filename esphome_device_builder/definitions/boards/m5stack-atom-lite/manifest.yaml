@@ -1,8 +1,10 @@
 id: m5stack-atom-lite
 name: M5Stack ATOM Lite
-description: Tiny 24x24mm ESP32 board with a built-in RGB LED, button, and Grove connector.
-  Great for compact IoT projects.
+description: M5Stack ATOM Lite is a tiny ESP32-based development board (24x24mm) with one programmable button, RGB LED, infrared
+  emitter, and Grove connector. Minimal and affordable IoT node.
 manufacturer: M5Stack
+images:
+- https://static-cdn.m5stack.com/resource/docs/products/core/atom_lite/atom_lite_01.webp
 esphome:
   platform: esp32
   board: m5stack-atom
@@ -105,8 +107,7 @@ pins:
   - pwm
   - strapping
   available: null
-  notes: ADC2_CH5, Touch5 — strapping pin (must be LOW during boot for correct flash
-    voltage)
+  notes: ADC2_CH5, Touch5 — strapping pin (must be LOW during boot for correct flash voltage)
 - gpio: 13
   label: GPIO13
   features:
@@ -246,16 +247,14 @@ pins:
   - adc
   - input_only
   available: null
-  notes: ADC1_CH1 — input only, no internal pull-up/pull-down (not exposed on most
-    boards)
+  notes: ADC1_CH1 — input only, no internal pull-up/pull-down (not exposed on most boards)
 - gpio: 38
   label: GPIO38
   features:
   - adc
   - input_only
   available: null
-  notes: ADC1_CH2 — input only, no internal pull-up/pull-down (not exposed on most
-    boards)
+  notes: ADC1_CH2 — input only, no internal pull-up/pull-down (not exposed on most boards)
 - gpio: 39
   label: GPIO39
   features:

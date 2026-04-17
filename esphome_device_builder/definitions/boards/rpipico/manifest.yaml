@@ -1,6 +1,7 @@
 id: rpipico
 name: Pico
-description: Board by Raspberry Pi with 2MB flash, 133MHz.
+description: Raspberry Pi Pico with RP2040, dual-core Cortex-M0+ at 133 MHz, 2 MB flash, 26 GPIO pins, and micro-USB. The
+  original Pico board, no wireless connectivity.
 manufacturer: Raspberry Pi
 esphome:
   platform: rp2040
@@ -10,7 +11,8 @@ hardware:
   flash_size: 2MB
   ram_size: 262144
   cpu_frequency: 133MHz
-tags: []
+tags:
+- dev-kit
 docs_url: https://esphome.io/components/rp2040.html
 product_url: https://www.raspberrypi.org/products/raspberry-pi-pico/
 pins:

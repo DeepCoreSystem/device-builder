@@ -1,8 +1,7 @@
 id: m5stack-atoms3u
 name: M5Stack AtomS3U
-description: The reference docs for M5Stack products. Quick start, get the detailed
-  information or instructions such as IDE,UIFLOW,Arduino. The tutorials for M5Burner,
-  Firmware, Burning, programming. ESP32,M5StickC,StickV, StickT,M5ATOM.
+description: M5Stack AtomS3U with ESP32-S3, USB-A connector for direct plug-in, 0.85-inch LCD, programmable button, and Grove
+  port. Designed for USB dongle-style deployments.
 manufacturer: M5Stack
 esphome:
   platform: esp32
@@ -16,7 +15,9 @@ hardware:
   connectivity:
   - bluetooth
   - wifi
-tags: []
+tags:
+- compact
+- display
 docs_url: https://esphome.io/components/esp32.html
 product_url: https://docs.m5stack.com/en/core/AtomS3U
 pins:

@@ -1,6 +1,7 @@
 id: esp01
 name: Espressif Generic ESP8266 ESP-01 512k
-description: Board with 0.5MB flash, 80MHz featuring Wi-Fi.
+description: ESP-01 is the original ESP8266 module with 1 MB flash, 2 GPIO pins, and 3.3V UART interface. The smallest and
+  most basic ESP8266 board, widely used for adding Wi-Fi to existing projects.
 manufacturer: Espressif
 esphome:
   platform: esp8266
@@ -12,7 +13,9 @@ hardware:
   cpu_frequency: 80MHz
   connectivity:
   - wifi
-tags: []
+tags:
+- compact
+- module
 docs_url: https://esphome.io/components/esp8266.html
 product_url: http://www.esp8266.com/wiki/doku.php?id=esp8266-module-family
 pins:
@@ -126,5 +129,4 @@ pins:
   features:
   - adc
   available: null
-  notes: Analog input (TOUT pin) — 0-1V range, single ADC channel; not a standard
-    GPIO
+  notes: Analog input (TOUT pin) — 0-1V range, single ADC channel; not a standard GPIO
