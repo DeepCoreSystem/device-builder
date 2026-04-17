@@ -1,5 +1,5 @@
 id: apollo-esp32-c6
-name: Apollo Automation ESP32-C6 Starter Kit
+name: Apollo DEV-2 ESP32-C6 Development Board
 description: Apollo Automation DEV-2 development board with ESP32-C6-MINI-1 module. Features USB-C, Wi-Fi, Bluetooth, Thread,
   Zigbee, onboard RGB LED, GPIO, and I2C interfaces. Pre-soldered headers for easy prototyping.
 manufacturer: Apollo Automation
@@ -23,7 +23,6 @@ tags:
 - usb-c
 - rgb-led
 docs_url: https://esphome.io/components/esp32.html
-featured: true
 pins:
 - gpio: 0
   label: GPIO0
