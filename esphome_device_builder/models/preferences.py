@@ -44,6 +44,7 @@ class UserPreferences(DataClassORJSONMixin):
 
     # Device editor
     navigator_visible: bool = True
+    yaml_diff_button: bool = False
 
     # Table view settings
     table_page_size: int = 25
