@@ -33,6 +33,21 @@ class BoardCatalog:
                 return board
         return None
 
+    def find_by_pio_board(self, pio_board: str, pio_variant: str = "") -> BoardCatalogEntry | None:
+        """Find a board by its PlatformIO board ID, preferring matching variant.
+
+        Used to derive a board_id from a user-provided YAML config. Returns
+        None if no entry has a matching `esphome.board` value.
+        """
+        matches = [b for b in self._boards if b.esphome.board == pio_board]
+        if not matches:
+            return None
+        if pio_variant:
+            for b in matches:
+                if b.esphome.variant and b.esphome.variant.value == pio_variant:
+                    return b
+        return matches[0]
+
     @api_command("boards/get_boards")
     async def get_boards(
         self,

@@ -141,18 +141,48 @@ def _generate_device_yaml(
     return "\n".join(lines)
 
 
+_PLATFORM_KEYS = frozenset({"esp32", "esp8266", "rp2040", "bk72xx", "rtl87xx", "ln882x", "nrf52"})
+
+
+def _parse_platform_from_yaml(yaml_content: str) -> tuple[str, str, str]:
+    """Parse YAML content and return ``(platform, pio_board, variant)``.
+
+    Looks at top-level platform keys (esp32:, esp8266:, etc.) and reads
+    the ``board:`` and ``variant:`` fields nested under them. Returns
+    empty strings for fields that aren't present.
+    """
+    platform = ""
+    pio_board = ""
+    variant = ""
+    in_platform = False
+
+    for line in yaml_content.splitlines():
+        if line and not line[0].isspace() and ":" in line:
+            key = line.split(":")[0].strip()
+            if key in _PLATFORM_KEYS:
+                platform = key
+                in_platform = True
+            else:
+                in_platform = False
+            continue
+        if not in_platform:
+            continue
+        stripped = line.strip()
+        if stripped.startswith("board:"):
+            pio_board = stripped.split(":", 1)[1].strip().strip('"').strip("'")
+        elif stripped.startswith("variant:"):
+            variant = stripped.split(":", 1)[1].strip().strip('"').strip("'")
+
+    return platform, pio_board, variant
+
+
 def _detect_platform_from_yaml(path: Path) -> str:
     """Quick scan of YAML to find the platform key (esp32, esp8266, etc.)."""
-    platforms = {"esp32", "esp8266", "rp2040", "bk72xx", "rtl87xx", "ln882x", "nrf52"}
     try:
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if line and not line[0].isspace() and ":" in line:
-                key = line.split(":")[0].strip()
-                if key in platforms:
-                    return key
-    except Exception:  # noqa: S110
-        pass
-    return ""
+        platform, _, _ = _parse_platform_from_yaml(path.read_text(encoding="utf-8"))
+        return platform
+    except Exception:
+        return ""
 
 
 def _load_device_from_storage(path: Path, board_id: str = "") -> Device:
@@ -504,8 +534,7 @@ class DevicesController:
         self,
         *,
         name: str,
-        board_id: str = "",
-        config_type: str = "basic",
+        board_id: str | None = None,
         ssid: str = "",
         psk: str = "",
         file_content: str | None = None,
@@ -513,11 +542,16 @@ class DevicesController:
     ) -> WizardResponse:
         """Create a new device configuration.
 
-        For config_type="basic", a board_id is required — the board definition
-        is used to generate proper ESPHome platform config with sane defaults.
-        For config_type="empty" (user writes YAML manually) or "upload" (user
-        provides file_content), board_id is optional. The board_id, when given,
-        is stored in metadata but does NOT appear in the device YAML.
+        Three flows, decided by which arguments are provided:
+
+        1. ``file_content`` given → write it as-is (user supplied full YAML).
+        2. ``board_id`` given → generate a basic config from the board template.
+        3. Neither → write a minimal stub the user fills in manually.
+
+        After writing, we always try to derive a board_id by parsing the
+        resulting YAML's platform/board/variant fields and matching against
+        the catalog. The derived (or supplied) board_id is stored in metadata
+        for later reference.
         """
         name = name.strip()
         if not name:
@@ -531,7 +565,7 @@ class DevicesController:
             msg = "File already exists"
             raise FileExistsError(msg)
 
-        # board_id is only required for "basic" config generation
+        # Resolve the board if explicitly given
         board = None
         if board_id:
             if self._db.boards:
@@ -539,34 +573,34 @@ class DevicesController:
             if board is None:
                 msg = f"Unknown board: {board_id}"
                 raise ValueError(msg)
-        elif config_type == "basic":
-            msg = "board_id is required for basic config generation"
-            raise ValueError(msg)
+
+        # Compose the YAML content
+        friendly = friendly_name_slugify(name)
+        if file_content:
+            yaml_content = file_content
+        elif board:
+            yaml_content = _generate_device_yaml(name, friendly, board, ssid, psk)
+        else:
+            yaml_content = f"esphome:\n  name: {name}\n  friendly_name: {friendly}\n\n"
+
+        # Derive board_id from YAML when not explicitly provided
+        if not board_id and self._db.boards:
+            _, pio_board, variant = _parse_platform_from_yaml(yaml_content)
+            if pio_board:
+                matched = self._db.boards.find_by_pio_board(pio_board, variant)
+                if matched:
+                    board = matched
+                    board_id = matched.id
 
         loop = asyncio.get_running_loop()
 
         def _write() -> None:
-            if config_type == "upload" and file_content:
-                config_path.write_text(file_content, encoding="utf-8")
-                return
-
-            friendly = friendly_name_slugify(name)
-
-            if config_type == "empty":
-                yaml = f"esphome:\n  name: {name}\n  friendly_name: {friendly}\n\n"
-                config_path.write_text(yaml, encoding="utf-8")
-                return
-
-            # config_type == "basic" — board is guaranteed non-None here
-            assert board is not None  # type narrowing for mypy
-            yaml = _generate_device_yaml(name, friendly, board, ssid, psk)
-            config_path.write_text(yaml, encoding="utf-8")
+            config_path.write_text(yaml_content, encoding="utf-8")
 
         await loop.run_in_executor(None, _write)
 
         # Pre-create StorageJSON so device metadata is available immediately
         def _init_storage() -> None:
-            friendly = friendly_name_slugify(name)
             platform = str(board.esphome.platform) if board else ""
             storage = StorageJSON(
                 storage_version=1,
@@ -588,8 +622,8 @@ class DevicesController:
             storage_path.parent.mkdir(parents=True, exist_ok=True)
             storage.save(storage_path)
 
-            # Store board_id in metadata (empty string when not provided)
-            set_device_metadata(self._db.settings.config_dir, filename, board_id=board_id)
+            if board_id:
+                set_device_metadata(self._db.settings.config_dir, filename, board_id=board_id)
 
         await loop.run_in_executor(None, _init_storage)
 
