@@ -515,22 +515,29 @@ ADVANCED_BASE_KEYS: set[str] = {
 }
 
 # Fields important enough to always show without an "Advanced" toggle
-# even when they happen to be optional in the schema.
-IMPORTANT_KEYS: set[str] = {
-    "pin",
+# even when they happen to be optional in the schema. Order matters
+# here — it drives the sort order in the rendered form.
+IMPORTANT_KEY_ORDER: tuple[str, ...] = (
+    # Discriminators come first — they decide which other fields render.
+    "platform",
+    "type",
+    # Identification
     "id",
     "name",
-    "platform",
-    "restore_mode",
-    "device_class",
-    "unit_of_measurement",
     "icon",
+    # Hardware / connection
+    "pin",
     "address",
     "i2c_id",
     "spi_id",
     "uart_id",
+    # Behaviour
+    "device_class",
+    "unit_of_measurement",
+    "restore_mode",
     "update_interval",
-}
+)
+IMPORTANT_KEYS: set[str] = set(IMPORTANT_KEY_ORDER)
 
 # Friendly names for well-known components
 COMPONENT_NAMES: dict[str, str] = {
@@ -1050,6 +1057,42 @@ def _build_entry(key: Any, validator: Any) -> dict | None:
     return entry
 
 
+def _sort_entries(entries: list[dict]) -> list[dict]:
+    """
+    Sort config entries into a consistent display order.
+
+    The form should read:
+
+        1. Required fields (in priority order, then schema order)
+        2. Important optional fields (id, name, icon, device_class, ...)
+           in IMPORTANT_KEY_ORDER
+        3. Other non-advanced optional fields, in schema order
+        4. Advanced fields, in schema order
+
+    Schema order is preserved within each bucket via the original
+    index — meaning equally-ranked fields keep the order ESPHome's
+    voluptuous schema gave us.
+    """
+    important_rank = {key: i for i, key in enumerate(IMPORTANT_KEY_ORDER)}
+    not_important = len(IMPORTANT_KEY_ORDER)
+
+    def sort_key(item: tuple[int, dict]) -> tuple[int, int, int]:
+        idx, entry = item
+        key = entry["key"]
+        rank = important_rank.get(key, not_important)
+        if entry.get("advanced"):
+            bucket = 3
+        elif entry.get("required"):
+            bucket = 0
+        elif key in important_rank:
+            bucket = 1
+        else:
+            bucket = 2
+        return (bucket, rank, idx)
+
+    return [entry for _idx, entry in sorted(enumerate(entries), key=sort_key)]
+
+
 def _classify_advanced(key_name: str, required: bool) -> bool:
     """
     Decide whether a config entry should be hidden under "Advanced".
@@ -1175,7 +1218,7 @@ def _parse_schema(
             _attach_description(entry, field_descriptions)
             entries.append(entry)
 
-    return entries, sub_entries
+    return _sort_entries(entries), sub_entries
 
 
 def _parse_typed_schema(
@@ -1243,7 +1286,7 @@ def _parse_typed_schema(
             _attach_description(e, field_descriptions)
             entries.append(e)
 
-    return entries
+    return _sort_entries(entries)
 
 
 def _parse_subdict_to_map(schema_dict: dict) -> dict[str, dict]:
@@ -1308,7 +1351,7 @@ def _build_sub_entry(
     return {
         "key": key_name,
         "platform_type": platform_type,
-        "config_entries": inner_entries,
+        "config_entries": _sort_entries(inner_entries),
     }
 
 
@@ -1489,7 +1532,7 @@ def _build_unified_platform_component(
         "dependencies": [],
         "multi_conf": True,
         "supported_platforms": [],
-        "config_entries": config_entries,
+        "config_entries": _sort_entries(config_entries),
         "sub_entries": [],
     }
 
