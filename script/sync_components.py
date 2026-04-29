@@ -1318,8 +1318,30 @@ def _load_entity_categories() -> list[str]:
     return list(raw.keys() if hasattr(raw, "keys") else raw)
 
 
+def _load_units_of_measurement() -> list[str]:
+    """
+    Load every ``UNIT_*`` constant from esphome.const.
+
+    These are suggestions rather than a strict closed set — ESPHome's
+    ``validate_unit_of_measurement`` accepts any string. Frontend can
+    render the list as autocomplete suggestions while still allowing
+    free-form input for custom units.
+    """
+    units: list[str] = []
+    for attr in dir(const):
+        if not attr.startswith("UNIT_"):
+            continue
+        value = getattr(const, attr, None)
+        if isinstance(value, str):
+            units.append(value)
+    # Stable order: empty first (the "no unit" option), then alphabetical
+    units = sorted(set(units), key=lambda v: (v != "", v))
+    return units
+
+
 _PLATFORM_ENUMS: dict[str, dict[str, list[str]]] = _load_platform_enums()
 _ENTITY_CATEGORIES: list[str] = _load_entity_categories()
+_UNITS_OF_MEASUREMENT: list[str] = _load_units_of_measurement()
 
 
 def _inject_enum_options(entries: list[dict], platform: str | None) -> None:
@@ -1327,9 +1349,11 @@ def _inject_enum_options(entries: list[dict], platform: str | None) -> None:
     Populate ``options`` for entity-base fields that lack them.
 
     ``device_class`` / ``state_class`` come from the platform's own
-    constants; ``entity_category`` is universal. Only fills in
-    options when the entry doesn't already have any — domain-specific
-    enums that the schema introspection picked up keep priority.
+    constants; ``entity_category`` is universal; ``unit_of_measurement``
+    is sourced from the ``UNIT_*`` constants in esphome.const (acting
+    as autocomplete suggestions — ESPHome itself accepts any string).
+    Only fills in options when the entry doesn't already have any —
+    domain-specific enums picked up by the schema introspection win.
     """
     platform_enums = _PLATFORM_ENUMS.get(platform, {}) if platform else {}
     for entry in entries:
@@ -1341,6 +1365,8 @@ def _inject_enum_options(entries: list[dict], platform: str | None) -> None:
             values = platform_enums.get(key)
         elif key == "entity_category":
             values = _ENTITY_CATEGORIES
+        elif key == "unit_of_measurement":
+            values = _UNITS_OF_MEASUREMENT
         if values:
             entry["options"] = [_make_option(v) for v in values]
 
