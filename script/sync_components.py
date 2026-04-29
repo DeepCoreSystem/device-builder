@@ -857,6 +857,12 @@ def _identify_validator(validator: Any) -> dict[str, Any]:
             result["references_component"] = ref
         return result
 
+    # cv.declare_id(SomeClass) produces a wrapper whose qualname is
+    # `declare_id.<locals>.validator`. Used for the component's own
+    # id (auto-generated when omitted). Just mark as ID type.
+    if qualname.startswith("declare_id."):
+        return {"type": "id"}
+
     if any(validator is v for v in _LAMBDA_VALIDATORS):
         return {"type": "lambda"}
 
@@ -1206,10 +1212,12 @@ def _build_entry(key: Any, validator: Any) -> dict | None:
         range_val = [info.get("range_min"), info.get("range_max")]
 
     references = info.get("references_component")
-    # use_id-style references wire components together; they're
-    # structural even when the schema marks them optional, so always
-    # show them on the main form rather than under "Advanced".
-    advanced = False if references else _classify_advanced(key_name, required)
+    # Structural fields — wiring (use_id references) and hardware
+    # connections (PIN-typed entries) — are kept on the main form
+    # even when the schema marks them optional. Users almost always
+    # want to see what's wired where.
+    is_structural = bool(references) or info["type"] == "pin"
+    advanced = False if is_structural else _classify_advanced(key_name, required)
 
     entry: dict[str, Any] = {
         "key": key_name,
@@ -1561,13 +1569,17 @@ def _parse_schema(
             sub_entries.append(_build_sub_entry(key_name, validator, field_descriptions))
             continue
 
-        if _is_generate_id(key):
-            entry = _build_id_entry(key_name, key)
-            _attach_description(entry, field_descriptions)
-            entries.append(entry)
-            continue
-
         entry = _build_entry(key, validator)
+        if _is_generate_id(key):
+            # GenerateID always means an ID field. If the validator
+            # wasn't recognised, build a minimal ID entry; if it was
+            # but produced a non-id type (e.g. component-private
+            # wrappers like uart's _uart_declare_type), force it.
+            if entry is None:
+                entry = _build_id_entry(key_name, key)
+            elif entry.get("type") != "id":
+                entry["type"] = "id"
+                entry["advanced"] = _classify_advanced(key_name, entry["required"])
         if entry is not None:
             _attach_description(entry, field_descriptions)
             entries.append(entry)
@@ -1668,10 +1680,13 @@ def _parse_subdict_to_map(schema_dict: dict) -> dict[str, dict]:
             continue
         if any(key_name.startswith(p) for p in AUTOMATION_KEY_PREFIXES):
             continue
-        if _is_generate_id(key):
-            result[key_name] = _build_id_entry(key_name, key)
-            continue
         entry = _build_entry(key, validator)
+        if _is_generate_id(key):
+            if entry is None:
+                entry = _build_id_entry(key_name, key)
+            elif entry.get("type") != "id":
+                entry["type"] = "id"
+                entry["advanced"] = _classify_advanced(key_name, entry["required"])
         if entry is not None:
             result[key_name] = entry
     return result
@@ -1702,12 +1717,13 @@ def _build_sub_entry(
             continue
         if any(sk_name.startswith(p) for p in AUTOMATION_KEY_PREFIXES):
             continue
-        if _is_generate_id(sk):
-            entry = _build_id_entry(sk_name, sk)
-            _attach_description(entry, field_descriptions)
-            inner_entries.append(entry)
-            continue
         entry = _build_entry(sk, sv)
+        if _is_generate_id(sk):
+            if entry is None:
+                entry = _build_id_entry(sk_name, sk)
+            elif entry.get("type") != "id":
+                entry["type"] = "id"
+                entry["advanced"] = _classify_advanced(sk_name, entry["required"])
         if entry is not None:
             _attach_description(entry, field_descriptions)
             inner_entries.append(entry)
@@ -1740,12 +1756,13 @@ def _build_nested_group(
             continue
         if any(sk_name.startswith(p) for p in AUTOMATION_KEY_PREFIXES):
             continue
-        if _is_generate_id(sk):
-            entry = _build_id_entry(sk_name, sk)
-            _attach_description(entry, field_descriptions)
-            inner_entries.append(entry)
-            continue
         entry = _build_entry(sk, sv)
+        if _is_generate_id(sk):
+            if entry is None:
+                entry = _build_id_entry(sk_name, sk)
+            elif entry.get("type") != "id":
+                entry["type"] = "id"
+                entry["advanced"] = _classify_advanced(sk_name, entry["required"])
         if entry is not None:
             _attach_description(entry, field_descriptions)
             inner_entries.append(entry)
@@ -1869,11 +1886,13 @@ def _build_unified_platform_component(
                         key_name.startswith(p) for p in AUTOMATION_KEY_PREFIXES
                     ):
                         continue
-                    if _is_generate_id(key):
-                        common_entries.append(_build_id_entry(key_name, key))
-                        seen_keys.add(key_name)
-                        continue
                     entry = _build_entry(key, validator)
+                    if _is_generate_id(key):
+                        if entry is None:
+                            entry = _build_id_entry(key_name, key)
+                        elif entry.get("type") != "id":
+                            entry["type"] = "id"
+                            entry["advanced"] = _classify_advanced(key_name, entry["required"])
                     if entry is not None:
                         common_entries.append(entry)
                         seen_keys.add(key_name)
@@ -1907,13 +1926,13 @@ def _build_unified_platform_component(
                 continue
             if key_name in seen_keys:
                 continue  # already covered by base schema or platform itself
-            if _is_generate_id(key):
-                id_entry = _build_id_entry(key_name, key)
-                id_entry["depends_on"] = "platform"
-                id_entry["depends_on_value"] = platform_name
-                config_entries.append(id_entry)
-                continue
             entry = _build_entry(key, validator)
+            if _is_generate_id(key):
+                if entry is None:
+                    entry = _build_id_entry(key_name, key)
+                elif entry.get("type") != "id":
+                    entry["type"] = "id"
+                    entry["advanced"] = _classify_advanced(key_name, entry["required"])
             if entry is None:
                 continue
             entry["depends_on"] = "platform"
