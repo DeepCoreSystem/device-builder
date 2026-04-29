@@ -545,18 +545,19 @@ IMPORTANT_KEY_ORDER: tuple[str, ...] = (
     "model",
     "variant",
     "inverted",
+    # Common esphome-block metadata
+    "area",
     # Important fields that stay flagged advanced — sort first within
     # the advanced section. Listed at the end so they appear after the
     # prominent fields above.
     "id",
     "comment",
-    "area",
 )
 IMPORTANT_KEYS: set[str] = set(IMPORTANT_KEY_ORDER)
 
 # Subset of IMPORTANT_KEYS that stays flagged as advanced. They keep
 # their sort priority but render under the form's "Advanced" section.
-ADVANCED_IMPORTANT_KEYS: set[str] = {"id", "comment", "area"}
+ADVANCED_IMPORTANT_KEYS: set[str] = {"id", "comment"}
 
 # Friendly names for well-known components
 COMPONENT_NAMES: dict[str, str] = {
@@ -668,9 +669,31 @@ def _key_to_label(key: str) -> str:
     return key.replace("_", " ").title()
 
 
+# Keys flagged ``cv.Required`` in CONFIG_SCHEMA but whose value is
+# injected by ESPHome at preload time — the user is free to omit them
+# from YAML even though the schema says they're required. We don't
+# surface a required indicator on these.
+_PRELOAD_INJECTED_KEYS: frozenset[str] = frozenset({"build_path"})
+
+
 def _is_required(key: Any) -> bool:
-    """Check if a voluptuous key is Required."""
-    return isinstance(key, vol.Required)
+    """
+    Check if a voluptuous key is required from the user's perspective.
+
+    Voluptuous has "Required with default" keys that are technically
+    flagged Required but always satisfied by the default value — the
+    user doesn't need to set them. ``_PRELOAD_INJECTED_KEYS`` covers
+    a smaller set of fields that have no compile-time default but get
+    injected during ESPHome's preload pass. Treat both as optional so
+    the form doesn't push a red asterisk on a field whose absence is
+    fine.
+    """
+    if not isinstance(key, vol.Required):
+        return False
+    if _key_name(key) in _PRELOAD_INJECTED_KEYS:
+        return False
+    has_default = getattr(key, "default", vol.UNDEFINED) is not vol.UNDEFINED
+    return not has_default
 
 
 def _get_default(key: Any) -> Any:
