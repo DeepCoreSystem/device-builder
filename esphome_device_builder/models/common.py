@@ -147,6 +147,13 @@ class ConfigEntryType(StrEnum):
     LAMBDA = "lambda"
     # Multi-line JSON editor (HTTP request bodies, custom payloads)
     JSON = "json"
+    # Structured value: the entry's value is itself a YAML mapping
+    # whose own fields are described by ``config_entries``. Frontend
+    # renders the field as a collapsible group containing the nested
+    # form. Used for nested config blocks (e.g.
+    # ``esp32_ble_tracker.scan_parameters``) and entity sub-readings
+    # (e.g. ``dht.temperature`` and ``dht.humidity``).
+    NESTED = "nested"
 
     # Layout / decoration entries (no value, used to structure the form)
     LABEL = "label"
@@ -305,3 +312,19 @@ class ConfigEntry(DataClassORJSONMixin):
     # Substitution params for the translation string (e.g.
     # `{"min": 0, "max": 100}` for a range message).
     translation_params: dict[str, Any] | None = None
+
+    # === nested entries (only meaningful when type == NESTED) ===
+
+    # Inner config entries when this entry's value is a structured YAML
+    # mapping (e.g. ``esp32_ble_tracker.scan_parameters`` →
+    # duration / interval / window / active / continuous, or DHT's
+    # temperature / humidity readings). Frontend renders the parent
+    # field as a collapsible group containing the inner form.
+    config_entries: list[ConfigEntry] | None = None
+
+    # Set when the nested entry represents an ESPHome entity (sensor,
+    # binary_sensor, ...) rather than a plain config group. The
+    # frontend should apply platform-default fields (name,
+    # device_class, ...) on top of `config_entries` for these. None
+    # means a plain structured group.
+    platform_type: str | None = None

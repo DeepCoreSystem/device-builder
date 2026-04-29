@@ -140,7 +140,6 @@ def build_automation_yaml(
 def generate_component_yaml(
     component: ComponentCatalogEntry,
     fields: dict[str, Any],
-    sub_entries: dict[str, dict[str, Any]] | None = None,
 ) -> str:
     """
     Generate a YAML block for adding a component to a device config.
@@ -149,6 +148,10 @@ def generate_component_yaml(
     as a list under their category with a ``- platform: <id>`` entry;
     everything else is emitted as a top-level mapping keyed by the
     component id.
+
+    Nested values in ``fields`` (dicts as values) are emitted as
+    indented YAML mappings — frontend submits the full structure as a
+    single ``fields`` argument, no separate sub-entries dict needed.
     """
     lines: list[str] = []
     category = component.category
@@ -167,13 +170,7 @@ def generate_component_yaml(
     for key, value in fields.items():
         if key == "id" and not value:
             value = _generate_id(comp_id, fields.get("name"))
-        lines.append(f"{indent}{key}: {_format_yaml_value(value)}")
-
-    if sub_entries:
-        for sub_key, sub_fields in sub_entries.items():
-            lines.append(f"{indent}{sub_key}:")
-            for sk, sv in sub_fields.items():
-                lines.append(f"{indent}  {sk}: {_format_yaml_value(sv)}")
+        lines.extend(_emit_field(key, value, indent))
 
     return "\n".join(lines)
 
@@ -207,6 +204,32 @@ def _format_yaml_value(value: Any) -> str:
             return f'"{value}"'
         return value
     return str(value)
+
+
+def _emit_field(key: str, value: Any, indent: str) -> list[str]:
+    """
+    Emit a single ``key: value`` pair as one or more YAML lines.
+
+    Nested mappings (dict values) recurse with deeper indent so a
+    ConfigEntry with type=NESTED renders as a YAML mapping under its
+    parent. Lists of dicts render as ``- mapping`` entries; lists of
+    scalars render as ``[a, b, c]`` flow-style for compactness.
+    """
+    if isinstance(value, dict):
+        lines = [f"{indent}{key}:"]
+        for sub_key, sub_value in value.items():
+            lines.extend(_emit_field(sub_key, sub_value, indent + "  "))
+        return lines
+    if isinstance(value, list) and value and isinstance(value[0], dict):
+        lines = [f"{indent}{key}:"]
+        for item in value:
+            first = True
+            for sub_key, sub_value in item.items():
+                prefix = f"{indent}  - " if first else f"{indent}    "
+                lines.append(f"{prefix}{sub_key}: {_format_yaml_value(sub_value)}")
+                first = False
+        return lines
+    return [f"{indent}{key}: {_format_yaml_value(value)}"]
 
 
 def _generate_id(component_id: str, name: str | None = None) -> str:

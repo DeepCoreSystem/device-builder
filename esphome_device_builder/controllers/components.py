@@ -11,7 +11,6 @@ from ..helpers.api import api_command
 from ..models import (
     ComponentCatalogEntry,
     ComponentCategory,
-    ComponentSubEntry,
     ConfigEntry,
     ConfigEntryType,
     ConfigValueOption,
@@ -177,14 +176,6 @@ def _materialise(
         multi_conf=component.multi_conf,
         supported_platforms=component.supported_platforms,
         config_entries=[_materialise_entry(e, target_platform) for e in component.config_entries],
-        sub_entries=[
-            ComponentSubEntry(
-                key=sub.key,
-                platform_type=sub.platform_type,
-                config_entries=[_materialise_entry(e, target_platform) for e in sub.config_entries],
-            )
-            for sub in component.sub_entries
-        ],
     )
 
 
@@ -194,12 +185,18 @@ def _materialise_entry(entry: ConfigEntry, target_platform: str | None) -> Confi
 
     The returned entry never carries platform_defaults — that field is
     a sync-time implementation detail the frontend doesn't need to
-    know about.
+    know about. Recurses into ``config_entries`` for nested entries
+    so the resolution applies at every depth.
     """
     default = entry.default_value
     if target_platform and entry.platform_defaults:
         if target_platform in entry.platform_defaults:
             default = entry.platform_defaults[target_platform]
+    nested = (
+        [_materialise_entry(e, target_platform) for e in entry.config_entries]
+        if entry.config_entries
+        else None
+    )
     return ConfigEntry(
         key=entry.key,
         type=entry.type,
@@ -225,6 +222,8 @@ def _materialise_entry(entry: ConfigEntry, target_platform: str | None) -> Confi
         help_link=entry.help_link,
         translation_key=entry.translation_key,
         translation_params=entry.translation_params,
+        config_entries=nested,
+        platform_type=entry.platform_type,
     )
 
 
@@ -282,6 +281,13 @@ def _load_config_entry(data: dict) -> ConfigEntry:
     if isinstance(raw_range, (list, tuple)) and len(raw_range) == 2:
         range_val = (raw_range[0], raw_range[1])
 
+    nested_raw = data.get("config_entries")
+    nested = (
+        [_load_config_entry(e) for e in nested_raw]
+        if isinstance(nested_raw, list) and nested_raw
+        else None
+    )
+
     return ConfigEntry(
         key=data["key"],
         type=_safe_enum(ConfigEntryType, data.get("type"), ConfigEntryType.UNKNOWN),
@@ -307,15 +313,8 @@ def _load_config_entry(data: dict) -> ConfigEntry:
         help_link=data.get("help_link"),
         translation_key=data.get("translation_key"),
         translation_params=data.get("translation_params"),
-    )
-
-
-def _load_sub_entry(data: dict) -> ComponentSubEntry:
-    """Load a ComponentSubEntry from its JSON representation."""
-    return ComponentSubEntry(
-        key=data["key"],
+        config_entries=nested,
         platform_type=data.get("platform_type") or None,
-        config_entries=[_load_config_entry(e) for e in data.get("config_entries", [])],
     )
 
 
@@ -332,9 +331,4 @@ def _load_component(data: dict) -> ComponentCatalogEntry:
         multi_conf=bool(data.get("multi_conf", False)),
         supported_platforms=list(data.get("supported_platforms", [])),
         config_entries=[_load_config_entry(e) for e in data.get("config_entries", [])],
-        # Accept the old ``sub_entities`` key as well so a stale
-        # components.json still loads. Sync writes the new key going forward.
-        sub_entries=[
-            _load_sub_entry(s) for s in (data.get("sub_entries") or data.get("sub_entities") or [])
-        ],
     )

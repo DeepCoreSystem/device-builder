@@ -1021,8 +1021,13 @@ def _identify_vol_all(validator: vol.All) -> dict[str, Any]:
     Identify the effective type of a ``vol.All`` chain.
 
     Range bounds from ``vol.Range`` are merged onto whichever inner
-    validator wins type identification. When no validator matches but
-    a Range is present, the range alone is returned.
+    validator wins type identification. A nested-schema inner
+    validator takes precedence over a primitive one — chains like
+    ``vol.All(<dict schema>, validate_scan_parameters)`` should
+    surface as a nested config group, not as a string from the
+    cv-fallback that catches the trailing post-validator. When no
+    validator matches but a Range is present, the range alone is
+    returned.
     """
     range_info: dict[str, Any] = {}
     for inner in validator.validators:
@@ -1034,17 +1039,23 @@ def _identify_vol_all(validator: vol.All) -> dict[str, Any]:
             elif inner.type is float:
                 range_info.setdefault("type", "float")
 
+    sub_schema_result: dict[str, Any] | None = None
+    primitive_result: dict[str, Any] | None = None
     for inner in reversed(validator.validators):
         inner_result = _identify_validator(inner)
-        if inner_result["type"] != "unknown":
-            inner_result.update(
-                {
-                    k: v
-                    for k, v in range_info.items()
-                    if k not in inner_result or k.startswith("range")
-                }
-            )
-            return inner_result
+        if inner_result["type"] == "unknown":
+            continue
+        if inner_result["type"] == "sub_schema":
+            sub_schema_result = inner_result
+        elif primitive_result is None:
+            primitive_result = inner_result
+
+    chosen = sub_schema_result or primitive_result
+    if chosen is not None:
+        chosen.update(
+            {k: v for k, v in range_info.items() if k not in chosen or k.startswith("range")}
+        )
+        return chosen
 
     if range_info.get("type"):
         return range_info
@@ -1357,6 +1368,23 @@ _UNITS_OF_MEASUREMENT: list[str] = _load_units_of_measurement()
 _SUGGESTION_FIELDS: frozenset[str] = frozenset({"unit_of_measurement"})
 
 
+def _apply_enum_options_recursive(entries: list[dict], platform: str | None) -> None:
+    """
+    Inject enum options for the entries and recurse into NESTED ones.
+
+    For an entity-typed nested entry (``platform_type`` set) we use
+    that as the platform context for the inner entries; for plain
+    nested groups we keep the outer platform.
+    """
+    _inject_enum_options(entries, platform)
+    for entry in entries:
+        nested = entry.get("config_entries")
+        if not nested:
+            continue
+        inner_platform = entry.get("platform_type") or platform
+        _apply_enum_options_recursive(nested, inner_platform)
+
+
 def _inject_enum_options(entries: list[dict], platform: str | None) -> None:
     """
     Populate ``options`` for entity-base fields that lack them.
@@ -1534,9 +1562,13 @@ def _parse_schema(
     schema: Any,
     component_id: str,
     field_descriptions: dict[str, str] | None = None,
-) -> tuple[list[dict], list[dict]]:
+) -> list[dict]:
     """
-    Parse a CONFIG_SCHEMA into config entries and sub-entries.
+    Parse a CONFIG_SCHEMA into a flat list of config entries.
+
+    Nested schemas (entity sub-readings, plain config groups) become
+    NESTED ConfigEntry instances inline in the returned list, each
+    carrying their own ``config_entries``.
 
     *field_descriptions* maps key-names to per-field help text pulled
     from the component docs. When given, it populates the
@@ -1547,14 +1579,13 @@ def _parse_schema(
 
     typed_dict = _unwrap_typed_schema(schema)
     if typed_dict is not None:
-        return _parse_typed_schema(typed_dict, component_id, field_descriptions), []
+        return _parse_typed_schema(typed_dict, component_id, field_descriptions)
 
     entries: list[dict] = []
-    sub_entries: list[dict] = []
 
     schema_dict = _unwrap_schema(schema)
     if schema_dict is None:
-        return entries, sub_entries
+        return entries
 
     for key, validator in schema_dict.items():
         key_name = _key_name(key)
@@ -1564,9 +1595,10 @@ def _parse_schema(
         if any(key_name.startswith(p) for p in AUTOMATION_KEY_PREFIXES):
             continue
 
-        # Sub-entry (e.g. DHT's temperature/humidity readings)
+        # Entity sub-entry (DHT's temperature/humidity readings) —
+        # emit as a NESTED ConfigEntry carrying platform_type.
         if _is_sub_entity_schema(validator):
-            sub_entries.append(_build_sub_entry(key_name, validator, field_descriptions))
+            entries.append(_build_entity_nested_entry(key_name, validator, field_descriptions))
             continue
 
         entry = _build_entry(key, validator)
@@ -1585,16 +1617,15 @@ def _parse_schema(
             entries.append(entry)
             continue
 
-        # Nested config group — a dict-shaped sub-schema that's not an
-        # entity sub-entry and didn't resolve to a primitive type. Emit
-        # it as a sub-entry without a platform_type so the frontend
-        # renders it as a collapsible nested group rather than dropping
-        # the whole nested block (e.g. esp32_ble_tracker.scan_parameters).
+        # Plain nested config group — a dict-shaped sub-schema that
+        # didn't resolve to a primitive type. Emit as a NESTED
+        # ConfigEntry without a platform_type (e.g.
+        # esp32_ble_tracker.scan_parameters, api.encryption).
         nested = _unwrap_schema(validator)
         if nested is not None:
-            sub_entries.append(_build_nested_group(key_name, nested, field_descriptions))
+            entries.append(_build_plain_nested_entry(key_name, nested, field_descriptions))
 
-    return _sort_entries(entries), sub_entries
+    return _sort_entries(entries)
 
 
 def _parse_typed_schema(
@@ -1692,12 +1723,20 @@ def _parse_subdict_to_map(schema_dict: dict) -> dict[str, dict]:
     return result
 
 
-def _build_sub_entry(
+def _build_entity_nested_entry(
     key_name: str,
     validator: Any,
     field_descriptions: dict[str, str] | None = None,
 ) -> dict:
-    """Build a sub-entry dict from a sub-schema validator."""
+    """
+    Build a NESTED ConfigEntry for an entity sub-reading.
+
+    Used for fields like DHT.temperature / DHT.humidity where the
+    parent schema embeds an entity sub-schema (something with name +
+    device_class + state_class). The resulting entry carries
+    ``platform_type`` so the frontend applies platform-default fields
+    (name, icon, ...) on top of the inner config entries.
+    """
     field_descriptions = field_descriptions or {}
     schema_keys = {_key_name(k) for k in validator.schema}
     platform_type = "sensor"
@@ -1710,47 +1749,52 @@ def _build_sub_entry(
                 platform_type = pt
                 break
 
-    inner_entries: list[dict] = []
-    for sk, sv in validator.schema.items():
-        sk_name = _key_name(sk)
-        if sk_name in SKIP_KEYS:
-            continue
-        if any(sk_name.startswith(p) for p in AUTOMATION_KEY_PREFIXES):
-            continue
-        entry = _build_entry(sk, sv)
-        if _is_generate_id(sk):
-            if entry is None:
-                entry = _build_id_entry(sk_name, sk)
-            elif entry.get("type") != "id":
-                entry["type"] = "id"
-                entry["advanced"] = _classify_advanced(sk_name, entry["required"])
-        if entry is not None:
-            _attach_description(entry, field_descriptions)
-            inner_entries.append(entry)
-
+    inner = _build_inner_entries(validator.schema, field_descriptions)
     return {
         "key": key_name,
+        "type": "nested",
+        "label": _key_to_label(key_name),
+        "required": False,
+        "advanced": False,
+        "translation_key": f"component.config.{key_name}",
         "platform_type": platform_type,
-        "config_entries": _sort_entries(inner_entries),
+        "config_entries": _sort_entries(inner),
     }
 
 
-def _build_nested_group(
+def _build_plain_nested_entry(
     key_name: str,
     nested_schema: dict,
     field_descriptions: dict[str, str] | None = None,
 ) -> dict:
     """
-    Build a sub-entry from an opaque nested config dict.
+    Build a NESTED ConfigEntry for a plain config-group dict.
 
-    Used for blocks like ``esp32_ble_tracker.scan_parameters`` that
-    bundle related settings without representing entities. The
-    resulting sub-entry has no ``platform_type`` (None) so the
-    frontend renders it as a plain collapsible nested group.
+    Used for blocks like ``esp32_ble_tracker.scan_parameters`` and
+    ``api.encryption`` that bundle related settings without
+    representing entities. ``platform_type`` is omitted so the
+    frontend renders a plain collapsible nested form.
     """
     field_descriptions = field_descriptions or {}
-    inner_entries: list[dict] = []
-    for sk, sv in nested_schema.items():
+    inner = _build_inner_entries(nested_schema, field_descriptions)
+    return {
+        "key": key_name,
+        "type": "nested",
+        "label": _key_to_label(key_name),
+        "required": False,
+        "advanced": False,
+        "translation_key": f"component.config.{key_name}",
+        "config_entries": _sort_entries(inner),
+    }
+
+
+def _build_inner_entries(
+    schema_dict: dict,
+    field_descriptions: dict[str, str],
+) -> list[dict]:
+    """Build the inner ConfigEntry list for a nested schema dict."""
+    out: list[dict] = []
+    for sk, sv in schema_dict.items():
         sk_name = _key_name(sk)
         if sk_name in SKIP_KEYS:
             continue
@@ -1765,13 +1809,8 @@ def _build_nested_group(
                 entry["advanced"] = _classify_advanced(sk_name, entry["required"])
         if entry is not None:
             _attach_description(entry, field_descriptions)
-            inner_entries.append(entry)
-
-    return {
-        "key": key_name,
-        "platform_type": None,
-        "config_entries": _sort_entries(inner_entries),
-    }
+            out.append(entry)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1954,7 +1993,6 @@ def _build_unified_platform_component(
         "multi_conf": True,
         "supported_platforms": [],
         "config_entries": _sort_entries(config_entries),
-        "sub_entries": [],
     }
 
 
@@ -2062,11 +2100,10 @@ def _build_component_entry(
     field_descriptions = dict(comp_docs.get("field_descriptions") or {})
 
     config_entries: list[dict] = []
-    sub_entries: list[dict] = []
     primary: str | None = None
     if schema is not None:
         try:
-            config_entries, sub_entries = _parse_schema(schema, component_id, field_descriptions)
+            config_entries = _parse_schema(schema, component_id, field_descriptions)
         except Exception as exc:
             _LOGGER.warning("Failed to parse schema for %s: %s", component_id, exc)
     elif platforms:
@@ -2079,15 +2116,13 @@ def _build_component_entry(
         try:
             platform_manifest = get_platform(primary, component_id)
             if platform_manifest and platform_manifest.config_schema:
-                config_entries, sub_entries = _parse_schema(
+                config_entries = _parse_schema(
                     platform_manifest.config_schema, component_id, merged
                 )
         except Exception as exc:
             _LOGGER.warning("Failed to parse schema for %s/%s: %s", primary, component_id, exc)
 
-    _inject_enum_options(config_entries, primary)
-    for sub in sub_entries:
-        _inject_enum_options(sub["config_entries"], sub.get("platform_type"))
+    _apply_enum_options_recursive(config_entries, primary)
 
     return {
         "id": component_id,
@@ -2100,7 +2135,6 @@ def _build_component_entry(
         "multi_conf": bool(manifest.multi_conf),
         "supported_platforms": supported_platforms,
         "config_entries": config_entries,
-        "sub_entries": sub_entries,
     }
 
 
@@ -2143,16 +2177,14 @@ def _build_platform_entry(
     description = _clean_description(qualified_docs.get("description", ""))
 
     try:
-        config_entries, sub_entries = _parse_schema(
+        config_entries = _parse_schema(
             platform_manifest.config_schema, component_id, field_descriptions
         )
     except Exception as exc:
         _LOGGER.warning("Failed to parse %s.%s schema: %s", platform_name, component_id, exc)
         return None
 
-    _inject_enum_options(config_entries, platform_name)
-    for sub in sub_entries:
-        _inject_enum_options(sub["config_entries"], sub.get("platform_type"))
+    _apply_enum_options_recursive(config_entries, platform_name)
 
     return {
         "id": qualified_id,
@@ -2165,7 +2197,6 @@ def _build_platform_entry(
         "multi_conf": bool(manifest.multi_conf),
         "supported_platforms": supported_platforms,
         "config_entries": config_entries,
-        "sub_entries": sub_entries,
     }
 
 
@@ -2263,16 +2294,17 @@ def sync(dry_run: bool = False) -> None:
 
     if dry_run:
         with_entries = sum(1 for c in components if c["config_entries"])
-        with_subs = sum(1 for c in components if c["sub_entries"])
+        nested_total = sum(
+            1 for c in components for e in c["config_entries"] if e.get("type") == "nested"
+        )
         total_entries = sum(len(c["config_entries"]) for c in components)
         print(f"\n[dry-run] Would write {len(components)} components to {OUTPUT_FILE.name}")
-        print(f"  {with_entries} have config entries ({total_entries} total fields)")
-        print(f"  {with_subs} have sub-entries")
+        print(f"  {with_entries} have config entries ({total_entries} top-level fields)")
+        print(f"  {nested_total} nested config entries")
         print("\nSample (first 10):")
         for c in components[:10]:
             entries = [e["key"] for e in c["config_entries"]]
-            subs = [s["key"] for s in c["sub_entries"]]
-            print(f"  {c['id']:30s} cat={c['category']:15s} fields={entries} subs={subs}")
+            print(f"  {c['id']:30s} cat={c['category']:15s} fields={entries}")
     else:
         OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
         OUTPUT_FILE.write_text(json.dumps(catalog, indent=2, default=str))

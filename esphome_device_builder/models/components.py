@@ -46,37 +46,6 @@ class ComponentCategory(StrEnum):
 
 
 @dataclass
-class ComponentSubEntry(DataClassORJSONMixin):
-    """
-    A nested sub-configuration inside a parent component.
-
-    Two shapes share this dataclass:
-
-    - **Entity sub-entries** — platform components that produce
-      multiple readings or instances. A DHT sensor block produces both
-      a temperature and a humidity entity; ``platform_type`` is set
-      ("sensor") so the frontend knows to apply platform-default
-      fields like name / device_class.
-    - **Nested config groups** — opaque sub-dicts in the schema like
-      ``esp32_ble_tracker.scan_parameters`` that just bundle related
-      settings without representing entities. ``platform_type`` is
-      None so the frontend renders them as a plain collapsible group.
-    """
-
-    # YAML key under the parent component (e.g. "temperature",
-    # "scan_parameters").
-    key: str
-
-    # Platform type the sub-entry represents (e.g. "sensor",
-    # "binary_sensor"). None when the sub-entry is just a nested
-    # config group rather than an entity definition.
-    platform_type: str | None = None
-
-    # Sub-entry-specific config fields beyond the platform defaults.
-    config_entries: list[ConfigEntry] = field(default_factory=list)
-
-
-@dataclass
 class ComponentCatalogEntry(DataClassORJSONMixin):
     """A component in the catalog.
 
@@ -122,11 +91,12 @@ class ComponentCatalogEntry(DataClassORJSONMixin):
     # available components based on the device's selected board.
     supported_platforms: list[str] = field(default_factory=list)
 
-    # The component's own configuration fields.
+    # The component's own configuration fields. Nested config blocks
+    # (e.g. ``esp32_ble_tracker.scan_parameters``) and entity
+    # sub-readings (DHT temperature / humidity) appear here as
+    # ConfigEntry instances of type=NESTED that carry their own
+    # ``config_entries``.
     config_entries: list[ConfigEntry] = field(default_factory=list)
-
-    # Nested configurations the component exposes (see ComponentSubEntry).
-    sub_entries: list[ComponentSubEntry] = field(default_factory=list)
 
 
 @dataclass
@@ -134,8 +104,10 @@ class AddComponentRequest(DataClassORJSONMixin):
     """Request to add a component to a device config."""
 
     component_id: str
+    # Field values keyed by config-entry key. Nested entries are
+    # represented as nested dicts (one level per ConfigEntry of
+    # type=NESTED).
     fields: dict[str, Any] = field(default_factory=dict)
-    sub_entries: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass

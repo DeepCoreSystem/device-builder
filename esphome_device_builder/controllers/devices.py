@@ -362,10 +362,15 @@ class DevicesController:
         configuration: str,
         component_id: str,
         fields: dict[str, Any] | None = None,
-        sub_entries: dict[str, dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> AddComponentResponse:
-        """Add a component block to an existing device YAML."""
+        """
+        Add a component block to an existing device YAML.
+
+        ``fields`` is a flat mapping of config-entry key → value. For
+        NESTED config entries the value is itself a dict matching the
+        nested entry's structure (recursive).
+        """
         assert self._db.components is not None  # type narrowing
         component = await self._db.components.get_component(component_id=component_id)
         if component is None:
@@ -378,7 +383,7 @@ class DevicesController:
                 msg = f"Missing required field: {entry.key}"
                 raise ValueError(msg)
 
-        yaml_block = generate_component_yaml(component, fields, sub_entries)
+        yaml_block = generate_component_yaml(component, fields)
 
         config_path = self._db.settings.rel_path(configuration)
         loop = asyncio.get_running_loop()
