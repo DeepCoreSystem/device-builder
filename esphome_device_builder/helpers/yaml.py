@@ -172,7 +172,7 @@ def _generate_id(component_id: str, name: str | None = None) -> str:
 def generate_component_yaml(
     component: ComponentCatalogEntry,
     fields: dict[str, Any],
-    sub_entities: dict[str, dict[str, Any]] | None = None,
+    sub_entries: dict[str, dict[str, Any]] | None = None,
 ) -> str:
     """Generate a YAML block for adding a component to a device config."""
     lines: list[str] = []
@@ -194,8 +194,8 @@ def generate_component_yaml(
             value = _generate_id(comp_id, fields.get("name"))
         lines.append(f"{indent}{key}: {_format_yaml_value(value)}")
 
-    if sub_entities:
-        for sub_key, sub_fields in sub_entities.items():
+    if sub_entries:
+        for sub_key, sub_fields in sub_entries.items():
             lines.append(f"{indent}{sub_key}:")
             for sk, sv in sub_fields.items():
                 lines.append(f"{indent}  {sk}: {_format_yaml_value(sv)}")

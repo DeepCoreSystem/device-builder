@@ -842,7 +842,7 @@ class DevicesController:
         configuration: str,
         component_id: str,
         fields: dict[str, Any] | None = None,
-        sub_entities: dict[str, dict[str, Any]] | None = None,
+        sub_entries: dict[str, dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> AddComponentResponse:
         """Add a component to a device configuration."""
@@ -858,7 +858,7 @@ class DevicesController:
                 msg = f"Missing required field: {entry.key}"
                 raise ValueError(msg)
 
-        yaml_block = generate_component_yaml(component, fields, sub_entities)
+        yaml_block = generate_component_yaml(component, fields, sub_entries)
 
         config_path = self._db.settings.rel_path(configuration)
         loop = asyncio.get_running_loop()

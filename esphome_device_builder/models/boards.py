@@ -7,31 +7,13 @@ from enum import StrEnum
 
 from mashumaro.mixins.orjson import DataClassORJSONMixin
 
-from .common import PagedResponse
+from .common import PagedResponse, PinFeature  # PinFeature re-exported
 
+# `PinFeature` lives in .common (it's shared with config-entry pin
+# constraints), but is re-imported here for stability of existing
+# `from .boards import PinFeature` paths.
 
-class PinFeature(StrEnum):
-    """Known GPIO pin features/capabilities."""
-
-    ADC = "adc"
-    DAC = "dac"
-    TOUCH = "touch"
-    PWM = "pwm"
-    I2C_SDA = "i2c_sda"
-    I2C_SCL = "i2c_scl"
-    SPI_MOSI = "spi_mosi"
-    SPI_MISO = "spi_miso"
-    SPI_CLK = "spi_clk"
-    SPI_CS = "spi_cs"
-    UART_TX = "uart_tx"
-    UART_RX = "uart_rx"
-    USB_DP = "usb_dp"
-    USB_DM = "usb_dm"
-    RGB_LED = "rgb_led"
-    JTAG = "jtag"
-    STRAPPING = "strapping"
-    INPUT_ONLY = "input_only"
-    BOOT_BUTTON = "boot_button"
+_ = PinFeature  # suppress "imported but unused" — this is a re-export
 
 
 class Connectivity(StrEnum):

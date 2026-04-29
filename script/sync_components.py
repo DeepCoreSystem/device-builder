@@ -315,6 +315,38 @@ COMPONENT_NAMES: dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 
+_DESC_STOP_PHRASES = (
+    "instructions for setting up",
+    "instructions for using",
+    "configuration variables:",
+    "configuration variables",
+    "see the configuration variables",
+    "see :ref:",
+)
+
+
+def _clean_description(raw: str) -> str:
+    """Trim ESPHome doc descriptions to the user-facing intro paragraph.
+
+    Some component docs prefix their description with boilerplate like
+    "Instructions for setting up...". This drops everything from such a
+    phrase onwards so the catalog only shows the actual explanation.
+    """
+    if not raw:
+        return ""
+    cleaned = raw.strip()
+    lower = cleaned.lower()
+    cut = len(cleaned)
+    for phrase in _DESC_STOP_PHRASES:
+        idx = lower.find(phrase)
+        if idx != -1 and idx < cut:
+            cut = idx
+    cleaned = cleaned[:cut].strip()
+    # Drop a trailing sentence like "...see the docs for details." once the
+    # boilerplate is gone — common after stripping.
+    return cleaned.rstrip(".:- \n\t") + ("." if cleaned and cleaned[-1] not in ".!?" else "")
+
+
 def _key_name(key: Any) -> str:
     """Extract the string name from a voluptuous key."""
     if isinstance(key, str):
@@ -353,12 +385,38 @@ def _get_default(key: Any) -> Any:
     return default
 
 
+# Lambda-only validators captured once at module load — re-resolved every
+# call would be wasteful and `set` construction trips on unhashable items.
+_LAMBDA_VALIDATORS: tuple[Any, ...] = tuple(
+    v for v in (getattr(cv, n, None) for n in ("returning_lambda", "lambda_")) if v is not None
+)
+
+
 def _identify_validator(validator: Any) -> dict[str, Any]:
     """Identify the type and constraints of a voluptuous validator.
 
-    Returns a dict with: type, options, range_min, range_max.
+    Returns a dict with: type, options, range_min, range_max, templatable.
     """
     result: dict[str, Any] = {"type": "unknown"}
+
+    # cv.templatable wraps another validator and accepts !lambda OR a literal.
+    # The wrapped function is named `validator` but its `__qualname__` is
+    # `templatable.<locals>.validator` — that's the reliable signature.
+    name = getattr(validator, "__name__", "") or ""
+    qualname = getattr(validator, "__qualname__", "") or ""
+    name_lower = name.lower()
+    if "templatable" in qualname.lower() and getattr(validator, "__closure__", None):
+        for cell in validator.__closure__:
+            try:
+                inner = cell.cell_contents
+            except (ValueError, TypeError):
+                continue
+            if callable(inner) and inner is not validator:
+                inner_result = _identify_validator(inner)
+                inner_result["templatable"] = True
+                return inner_result
+        # Couldn't unwrap — at least mark it as templatable string
+        return {"type": "string", "templatable": True}
 
     # Identity checks against known cv validators
     if validator is cv.boolean:
@@ -378,14 +436,26 @@ def _identify_validator(validator: Any) -> dict[str, Any]:
     if validator is cv.port:
         return {"type": "integer", "range_min": 1, "range_max": 65535}
 
+    # Lambda: returning_lambda / lambda_ accept ONLY a !lambda block.
+    # Use identity-equality (`is`) because the parsing chain can recurse
+    # into voluptuous _Schema instances which are unhashable.
+    if any(validator is v for v in _LAMBDA_VALIDATORS):
+        return {"type": "lambda"}
+
+    # Color
+    if any(getattr(cv, n, None) is validator for n in ("hex_int", "rgb_color", "color")):
+        # hex_int is integer-typed but rgb_color/color are color pickers
+        if name_lower in ("rgb_color", "color"):
+            return {"type": "color"}
+
+    # MAC address — cv.mac_address returns a MACAddress instance
+    if getattr(cv, "mac_address", None) is validator:
+        return {"type": "mac_address"}
+
     # Check module — esphome.pins validators are pin types
     vmod = getattr(validator, "__module__", "")
     if vmod == "esphome.pins":
         return {"type": "pin"}
-
-    # Check function name
-    name = getattr(validator, "__name__", "") or getattr(validator, "__qualname__", "")
-    name_lower = name.lower()
 
     if "pin" in name_lower and "spin" not in name_lower:
         return {"type": "pin"}
@@ -395,14 +465,23 @@ def _identify_validator(validator: Any) -> dict[str, Any]:
         return {"type": "boolean"}
     if name == "use_id" or "declare_id" in name:
         return {"type": "id"}
+    if "mac_address" in name_lower:
+        return {"type": "mac_address"}
+    if name_lower in ("rgb_color", "color"):
+        return {"type": "color"}
+    if name_lower == "returning_lambda" or name_lower == "lambda_":
+        return {"type": "lambda"}
 
-    # Check for enum/one_of via closure inspection
+    # Check for enum/one_of via closure inspection.
+    # An enum-like validator wraps a {label: value} mapping in a closure;
+    # we surface the keys as `options` and keep the value type primitive
+    # (string by default — drop-down vs free-text is a UI concern).
     if hasattr(validator, "__closure__") and validator.__closure__:
         for cell in validator.__closure__:
             try:
                 val = cell.cell_contents
                 if isinstance(val, dict) and len(val) > 0 and all(isinstance(k, str) for k in val):
-                    return {"type": "select", "options": list(val.keys())}
+                    return {"type": "string", "options": list(val.keys())}
             except (ValueError, TypeError):
                 pass
 
@@ -510,18 +589,76 @@ def _is_sub_entity_schema(validator: Any) -> bool:
     return len(schema_keys & entity_keys) >= 2
 
 
-def _parse_schema(schema: Any, component_id: str) -> tuple[list[dict], list[dict]]:
-    """Parse a CONFIG_SCHEMA into config entries and sub-entities.
+def _build_entry(key: Any, validator: Any) -> dict | None:
+    """Build a single config-entry dict from a voluptuous (key, validator) pair.
 
-    Returns (config_entries, sub_entities).
+    Returns None when the validator is unrecognised or describes a nested schema.
+    """
+    info = _identify_validator(validator)
+    if info["type"] in ("unknown", "sub_schema"):
+        return None
+
+    key_name = _key_name(key)
+    required = _is_required(key)
+    default = _get_default(key)
+
+    range_val: list[Any] | None = None
+    if info.get("range_min") is not None or info.get("range_max") is not None:
+        range_val = [info.get("range_min"), info.get("range_max")]
+
+    entry: dict[str, Any] = {
+        "key": key_name,
+        "type": info["type"],
+        "label": _key_to_label(key_name),
+        "required": required,
+        "default_value": default if not callable(default) else None,
+        "options": info.get("options"),
+        "range": range_val,
+        "advanced": not required,
+        # Auto-generated translation key — frontend i18n can override.
+        "translation_key": f"component.config.{key_name}",
+    }
+
+    # Templatable flag set by _identify_validator when cv.templatable() is detected.
+    if info.get("templatable"):
+        entry["templatable"] = True
+
+    return entry
+
+
+def _unwrap_schema(schema: Any) -> dict | None:
+    """Find the dict schema buried inside vol.All / vol.Schema wrappers.
+
+    ESPHome wraps many CONFIG_SCHEMAs in `cv.All(...)` for chained validation
+    (e.g. version checks, post-processing). The actual key-validator mapping
+    lives inside one of the wrapped validators.
+    """
+    if isinstance(schema, dict):
+        return schema
+    inner = getattr(schema, "schema", None)
+    if isinstance(inner, dict):
+        return inner
+    if isinstance(schema, vol.All):
+        for v in schema.validators:
+            unwrapped = _unwrap_schema(v)
+            if unwrapped is not None:
+                return unwrapped
+    return None
+
+
+def _parse_schema(schema: Any, component_id: str) -> tuple[list[dict], list[dict]]:
+    """Parse a CONFIG_SCHEMA into config entries and sub-entries.
+
+    Returns (config_entries, sub_entries).
     """
     entries: list[dict] = []
-    sub_entities: list[dict] = []
+    sub_entries: list[dict] = []
 
-    if not hasattr(schema, "schema") or not isinstance(schema.schema, dict):
-        return entries, sub_entities
+    schema_dict = _unwrap_schema(schema)
+    if schema_dict is None:
+        return entries, sub_entries
 
-    for key, validator in schema.schema.items():
+    for key, validator in schema_dict.items():
         key_name = _key_name(key)
 
         # Skip internal/inherited keys
@@ -533,77 +670,45 @@ def _parse_schema(schema: Any, component_id: str) -> tuple[list[dict], list[dict
         if hasattr(key, "schema") and callable(getattr(key.schema, "__func__", None)):
             continue
 
-        required = _is_required(key)
-        default = _get_default(key)
-
-        # Check for sub-entity first
+        # Sub-entry (e.g. DHT's temperature/humidity readings)
         if _is_sub_entity_schema(validator):
-            # Detect which platform type this sub-entity is
-            schema_keys = {_key_name(k) for k in validator.schema}
-            platform_type = "sensor"  # default assumption
-            if "brightness" in schema_keys or "color_mode" in schema_keys:
-                platform_type = "light"
-            elif "device_class" in schema_keys:
-                # Try to infer from the module path
-                vmod = getattr(validator, "__module__", "")
-                for pt in ("sensor", "binary_sensor", "text_sensor", "number", "switch"):
-                    if pt in vmod:
-                        platform_type = pt
-                        break
-
-            # Parse sub-entity's own config entries (non-inherited only)
-            sub_entries = []
-            for sk, sv in validator.schema.items():
-                sk_name = _key_name(sk)
-                if sk_name in SKIP_KEYS:
-                    continue
-                info = _identify_validator(sv)
-                if info["type"] == "unknown" or info["type"] == "sub_schema":
-                    continue
-                sub_entries.append(
-                    {
-                        "key": sk_name,
-                        "type": info["type"],
-                        "label": _key_to_label(sk_name),
-                        "required": _is_required(sk),
-                        "default_value": _get_default(sk),
-                        "options": info.get("options"),
-                        "advanced": not _is_required(sk),
-                    }
-                )
-
-            sub_entities.append(
-                {
-                    "key": key_name,
-                    "platform_type": platform_type,
-                    "config_entries": sub_entries,
-                }
-            )
+            sub_entries.append(_build_sub_entry(key_name, validator))
             continue
 
-        # Regular config entry
-        info = _identify_validator(validator)
-        if info["type"] == "sub_schema":
-            continue  # complex nested schema, skip for now
+        entry = _build_entry(key, validator)
+        if entry is not None:
+            entries.append(entry)
 
-        range_val = None
-        if info.get("range_min") is not None or info.get("range_max") is not None:
-            range_val = [info.get("range_min"), info.get("range_max")]
+    return entries, sub_entries
 
-        entries.append(
-            {
-                "key": key_name,
-                "type": info["type"],
-                "label": _key_to_label(key_name),
-                "required": required,
-                "default_value": default if not callable(default) else None,
-                "options": info.get("options"),
-                "range": range_val,
-                "advanced": not required,
-            }
-        )
 
-    return entries, sub_entities
+def _build_sub_entry(key_name: str, validator: Any) -> dict:
+    """Build a sub-entry dict from a sub-schema validator."""
+    schema_keys = {_key_name(k) for k in validator.schema}
+    platform_type = "sensor"
+    if "brightness" in schema_keys or "color_mode" in schema_keys:
+        platform_type = "light"
+    elif "device_class" in schema_keys:
+        vmod = getattr(validator, "__module__", "")
+        for pt in ("sensor", "binary_sensor", "text_sensor", "number", "switch"):
+            if pt in vmod:
+                platform_type = pt
+                break
+
+    inner_entries: list[dict] = []
+    for sk, sv in validator.schema.items():
+        sk_name = _key_name(sk)
+        if sk_name in SKIP_KEYS:
+            continue
+        entry = _build_entry(sk, sv)
+        if entry is not None:
+            inner_entries.append(entry)
+
+    return {
+        "key": key_name,
+        "platform_type": platform_type,
+        "config_entries": inner_entries,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -679,8 +784,11 @@ def _sync_component(
     if manifest is None:
         return None
 
-    # Skip platform types and target platforms
-    if manifest.is_platform_component or manifest.is_target_platform:
+    # Skip platform-component aggregators (sensor, binary_sensor, switch, ...)
+    # — these are the parents of platform-providing components, not user-facing
+    # entries themselves. Target platforms (esp32, esp8266, ...) ARE included
+    # because users configure them directly.
+    if manifest.is_platform_component:
         return None
 
     # Find which platforms this component provides
@@ -699,7 +807,7 @@ def _sync_component(
                 if comp_docs:
                     break
     name = _generate_name(component_id, category, comp_docs)
-    description = comp_docs.get("description", "")
+    description = _clean_description(comp_docs.get("description", ""))
 
     # Build image URL from docs image file
     image_url = ""
@@ -719,7 +827,7 @@ def _sync_component(
 
     # Parse config schema
     config_entries: list[dict] = []
-    sub_entities: list[dict] = []
+    sub_entries: list[dict] = []
 
     if platforms:
         primary_platform = platforms[0]
@@ -730,7 +838,7 @@ def _sync_component(
         try:
             platform_manifest = get_platform(primary_platform, component_id)
             if platform_manifest and platform_manifest.config_schema:
-                config_entries, sub_entities = _parse_schema(
+                config_entries, sub_entries = _parse_schema(
                     platform_manifest.config_schema, component_id
                 )
         except Exception as exc:
@@ -739,22 +847,14 @@ def _sync_component(
             )
     elif manifest.config_schema:
         try:
-            config_entries, sub_entities = _parse_schema(manifest.config_schema, component_id)
+            config_entries, sub_entries = _parse_schema(manifest.config_schema, component_id)
         except Exception as exc:
             _LOGGER.warning("Failed to parse schema for %s: %s", component_id, exc)
 
-    # Extract metadata
     dependencies = list(manifest.dependencies) if manifest.dependencies else []
-    auto_load_val = manifest.auto_load
-    if callable(auto_load_val):
-        try:
-            auto_load_val = auto_load_val()
-        except Exception:
-            auto_load_val = []
-    auto_load = list(auto_load_val) if auto_load_val else []
 
-    # Determine platform compatibility from dependencies
-    # If a component depends on a target platform, it only works on that platform
+    # Determine platform compatibility from dependencies. If a component
+    # depends on a target platform, it only works on that platform.
     target_platforms = {
         "esp32",
         "esp8266",
@@ -766,7 +866,9 @@ def _sync_component(
         "host",
     }
     supported_platforms = [d for d in dependencies if str(d) in target_platforms]
-    # Empty = works on all platforms
+    # The target-platform components themselves only support themselves.
+    if manifest.is_target_platform:
+        supported_platforms = [component_id]
 
     return {
         "id": component_id,
@@ -776,11 +878,10 @@ def _sync_component(
         "docs_url": docs_url,
         "image_url": image_url,
         "dependencies": dependencies,
-        "auto_load": auto_load,
         "multi_conf": bool(manifest.multi_conf),
         "supported_platforms": supported_platforms,
         "config_entries": config_entries,
-        "sub_entities": sub_entities,
+        "sub_entries": sub_entries,
     }
 
 
@@ -823,15 +924,15 @@ def sync(dry_run: bool = False) -> None:
 
     if dry_run:
         with_entries = sum(1 for c in components if c["config_entries"])
-        with_subs = sum(1 for c in components if c["sub_entities"])
+        with_subs = sum(1 for c in components if c["sub_entries"])
         total_entries = sum(len(c["config_entries"]) for c in components)
         print(f"\n[dry-run] Would write {len(components)} components to {OUTPUT_FILE.name}")
         print(f"  {with_entries} have config entries ({total_entries} total fields)")
-        print(f"  {with_subs} have sub-entities")
+        print(f"  {with_subs} have sub-entries")
         print("\nSample (first 10):")
         for c in components[:10]:
             entries = [e["key"] for e in c["config_entries"]]
-            subs = [s["key"] for s in c["sub_entities"]]
+            subs = [s["key"] for s in c["sub_entries"]]
             print(f"  {c['id']:30s} cat={c['category']:15s} fields={entries} subs={subs}")
     else:
         OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)

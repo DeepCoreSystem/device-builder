@@ -11,11 +11,13 @@ from ..helpers.api import api_command
 from ..models import (
     ComponentCatalogEntry,
     ComponentCategory,
-    ComponentSubEntity,
+    ComponentSubEntry,
     ConfigEntry,
     ConfigEntryType,
     ConfigValueOption,
     PagedComponentsResponse,
+    PinFeature,
+    PinMode,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -23,42 +25,80 @@ _LOGGER = logging.getLogger(__name__)
 _COMPONENTS_JSON = Path(__file__).resolve().parent.parent / "definitions" / "components.json"
 
 
-def _load_config_entry(data: dict) -> ConfigEntry:
-    """Load a ConfigEntry from a dict."""
-    range_val = None
-    raw_range = data.get("range")
-    if raw_range and isinstance(raw_range, (list, tuple)) and len(raw_range) == 2:
-        range_val = (raw_range[0], raw_range[1])
+def _safe_enum(enum_cls: type, value: Any, default: Any | None = None) -> Any:
+    """Coerce *value* to an enum member, returning *default* on failure."""
+    if value is None or value == "":
+        return default
+    try:
+        return enum_cls(value)
+    except (ValueError, KeyError):
+        return default
 
-    # Normalise options: JSON may contain plain strings or {label, value} dicts
-    raw_options = data.get("options")
-    options = None
-    if raw_options and isinstance(raw_options, list):
-        options = [
-            ConfigValueOption(label=str(o), value=str(o))
-            if isinstance(o, str)
-            else ConfigValueOption(
-                label=o.get("label", o.get("value", "")), value=o.get("value", "")
-            )
-            for o in raw_options
-        ]
+
+def _load_pin_features(raw: Any) -> list[PinFeature]:
+    """Parse a list of pin-feature strings, dropping unknown values."""
+    if not isinstance(raw, list):
+        return []
+    out: list[PinFeature] = []
+    for item in raw:
+        feat = _safe_enum(PinFeature, item)
+        if feat is not None:
+            out.append(feat)
+    return out
+
+
+def _load_options(raw: Any) -> list[ConfigValueOption] | None:
+    """Normalise the JSON `options` field into ConfigValueOption objects.
+
+    Accepts either a list of plain strings or a list of {label, value} dicts.
+    """
+    if not isinstance(raw, list) or not raw:
+        return None
+    out: list[ConfigValueOption] = []
+    for item in raw:
+        if isinstance(item, str):
+            out.append(ConfigValueOption(label=item, value=item))
+        elif isinstance(item, dict):
+            value = str(item.get("value", ""))
+            label = str(item.get("label", value))
+            out.append(ConfigValueOption(label=label, value=value))
+    return out or None
+
+
+def _load_config_entry(data: dict) -> ConfigEntry:
+    """Load a ConfigEntry from its JSON representation."""
+    range_val: tuple[int | float, int | float] | None = None
+    raw_range = data.get("range")
+    if isinstance(raw_range, (list, tuple)) and len(raw_range) == 2:
+        range_val = (raw_range[0], raw_range[1])
 
     return ConfigEntry(
         key=data["key"],
-        type=ConfigEntryType(data.get("type", "unknown")),
-        label=data.get("label", data["key"]),
-        required=data.get("required", False),
-        default_value=data.get("default_value"),
+        type=_safe_enum(ConfigEntryType, data.get("type"), ConfigEntryType.UNKNOWN),
+        label=data.get("label") or data["key"],
         description=data.get("description"),
-        options=options,
+        required=bool(data.get("required", False)),
+        default_value=data.get("default_value"),
+        options=_load_options(data.get("options")),
         range=range_val,
-        advanced=data.get("advanced", False),
+        multi_value=bool(data.get("multi_value", False)),
+        templatable=bool(data.get("templatable", False)),
+        depends_on=data.get("depends_on"),
+        depends_on_value=data.get("depends_on_value"),
+        depends_on_value_not=data.get("depends_on_value_not"),
+        pin_features=_load_pin_features(data.get("pin_features")),
+        pin_mode=_safe_enum(PinMode, data.get("pin_mode")),
+        advanced=bool(data.get("advanced", False)),
+        hidden=bool(data.get("hidden", False)),
+        help_link=data.get("help_link"),
+        translation_key=data.get("translation_key"),
+        translation_params=data.get("translation_params"),
     )
 
 
-def _load_sub_entity(data: dict) -> ComponentSubEntity:
-    """Load a ComponentSubEntity from a dict."""
-    return ComponentSubEntity(
+def _load_sub_entry(data: dict) -> ComponentSubEntry:
+    """Load a ComponentSubEntry from its JSON representation."""
+    return ComponentSubEntry(
         key=data["key"],
         platform_type=data["platform_type"],
         config_entries=[_load_config_entry(e) for e in data.get("config_entries", [])],
@@ -66,25 +106,24 @@ def _load_sub_entity(data: dict) -> ComponentSubEntity:
 
 
 def _load_component(data: dict) -> ComponentCatalogEntry:
-    """Load a ComponentCatalogEntry from a dict."""
-    try:
-        category = ComponentCategory(data.get("category", "misc"))
-    except ValueError:
-        category = ComponentCategory.MISC
-
+    """Load a ComponentCatalogEntry from its JSON representation."""
     return ComponentCatalogEntry(
         id=data["id"],
         name=data.get("name", data["id"]),
         description=data.get("description", ""),
-        category=category,
+        category=_safe_enum(ComponentCategory, data.get("category"), ComponentCategory.MISC),
         docs_url=data.get("docs_url", ""),
         image_url=data.get("image_url", ""),
-        dependencies=data.get("dependencies", []),
-        auto_load=data.get("auto_load", []),
-        multi_conf=data.get("multi_conf", False),
-        supported_platforms=data.get("supported_platforms", []),
+        dependencies=list(data.get("dependencies", [])),
+        multi_conf=bool(data.get("multi_conf", False)),
+        supported_platforms=list(data.get("supported_platforms", [])),
         config_entries=[_load_config_entry(e) for e in data.get("config_entries", [])],
-        sub_entities=[_load_sub_entity(s) for s in data.get("sub_entities", [])],
+        # Accept the old `sub_entities` key as well so a stale components.json
+        # still loads. Sync script writes the new `sub_entries` key going
+        # forward.
+        sub_entries=[
+            _load_sub_entry(s) for s in (data.get("sub_entries") or data.get("sub_entities") or [])
+        ],
     )
 
 

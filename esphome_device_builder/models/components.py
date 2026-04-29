@@ -46,31 +46,79 @@ class ComponentCategory(StrEnum):
 
 
 @dataclass
-class ComponentSubEntity(DataClassORJSONMixin):
-    """A sub-entity provided by a component (e.g. DHT's temperature/humidity sensors)."""
+class ComponentSubEntry(DataClassORJSONMixin):
+    """A nested sub-configuration inside a parent component.
 
+    Used by platform components that report multiple readings or expose
+    multiple inner instances. For example, a DHT sensor block has a
+    single platform config but produces both a temperature and a
+    humidity reading — each rendered as a sub-entry with its own key
+    and config_entries.
+    """
+
+    # YAML key under the parent component (e.g. "temperature", "humidity").
     key: str
+
+    # ESPHome platform type the sub-entry represents (e.g. "sensor",
+    # "binary_sensor"). Used by the frontend to apply platform-default
+    # config entries (name, device_class, etc.) on top of `config_entries`.
     platform_type: str
+
+    # Sub-entry-specific config fields beyond the platform defaults.
     config_entries: list[ConfigEntry] = field(default_factory=list)
 
 
 @dataclass
 class ComponentCatalogEntry(DataClassORJSONMixin):
-    """A component in the catalog."""
+    """A component in the catalog.
 
+    Components map 1:1 to ESPHome's `components/` directory. Each entry
+    describes how to render and serialize one block in the user's YAML
+    config (e.g. `wifi:`, `sensor:`, `i2c:`).
+    """
+
+    # Component ID — matches ESPHome's component directory name and the
+    # YAML key the user types (e.g. "wifi", "dht", "i2c").
     id: str
+
+    # Human-readable name shown in the UI ("Wi-Fi", "DHT Temperature
+    # & Humidity Sensor", "I²C Bus").
     name: str
+
+    # Description shown on the component card and detail view. Sourced
+    # from the ESPHome docs frontmatter and first paragraph.
     description: str
+
+    # Group the component is filed under in the catalog UI.
     category: ComponentCategory
+
+    # Direct link to the official ESPHome docs page for this component.
     docs_url: str = ""
+
+    # Optional image / illustration shown on the component card.
     image_url: str = ""
+
+    # Other components this one requires to be configured. ESPHome
+    # rejects the YAML if a dependency is missing — the frontend should
+    # warn the user and offer to add the missing component.
     dependencies: list[str] = field(default_factory=list)
-    auto_load: list[str] = field(default_factory=list)
+
+    # Whether the same component can be added multiple times (e.g.
+    # multiple sensors, multiple I²C buses). When False, the component
+    # is a singleton (e.g. `wifi:`, `api:`).
     multi_conf: bool = False
-    # Empty = works on all platforms. Non-empty = only these platforms.
+
+    # Empty list = component works on every target platform. Non-empty
+    # = component is restricted to those platforms (e.g. ["esp32"] for
+    # ESP32-only hardware features). Frontend uses this to filter the
+    # available components based on the device's selected board.
     supported_platforms: list[str] = field(default_factory=list)
+
+    # The component's own configuration fields.
     config_entries: list[ConfigEntry] = field(default_factory=list)
-    sub_entities: list[ComponentSubEntity] = field(default_factory=list)
+
+    # Nested configurations the component exposes (see ComponentSubEntry).
+    sub_entries: list[ComponentSubEntry] = field(default_factory=list)
 
 
 @dataclass
@@ -79,7 +127,7 @@ class AddComponentRequest(DataClassORJSONMixin):
 
     component_id: str
     fields: dict[str, Any] = field(default_factory=dict)
-    sub_entities: dict[str, dict[str, Any]] = field(default_factory=dict)
+    sub_entries: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass
