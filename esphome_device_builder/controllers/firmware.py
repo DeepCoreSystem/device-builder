@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import gzip
 import importlib
 import logging
@@ -27,7 +28,8 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 _JOBS_KEY = "_firmware_jobs"
 
-# Error patterns in output that indicate failure regardless of exit code
+# Output patterns that indicate failure even when the subprocess exit
+# code is 0 (Python tracebacks routed through `print()`, etc.).
 _ERROR_PATTERNS = [
     "ModuleNotFoundError",
     "ImportError",
@@ -38,16 +40,17 @@ _ERROR_PATTERNS = [
 
 
 def _find_esphome_cmd() -> list[str]:
-    """Find the esphome command, preferring the venv's Python."""
-    # Use the same Python that's running this process
+    """Locate the ``esphome`` CLI, preferring the active venv's Python."""
     python = sys.executable
 
-    # But verify esphome is actually importable from it
+    # Prefer "<venv>/bin/python" (or "<venv>/Scripts/python") so we
+    # invoke esphome from the same interpreter that imports it here.
     venv_python = Path(python).parent / "python"
     if venv_python.exists():
         python = str(venv_python)
 
-    # Also check if esphome is a standalone script in the venv
+    # If a standalone `esphome` script exists in the same venv, use it
+    # directly — slightly cheaper than `python -m esphome`.
     esphome_bin = shutil.which("esphome")
     if esphome_bin and str(Path(python).parent) in esphome_bin:
         return [esphome_bin]
@@ -56,7 +59,8 @@ def _find_esphome_cmd() -> list[str]:
 
 
 class FirmwareController:
-    """Manage firmware build jobs with a persistent queue.
+    """
+    Manage firmware build jobs with a persistent queue.
 
     Only one job runs at a time. Jobs are persisted to disk so they
     survive page refreshes and server restarts. Progress is broadcast
@@ -72,6 +76,10 @@ class FirmwareController:
         self._runner_task: asyncio.Task | None = None
         self._esphome_cmd: list[str] = []
 
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
     async def start(self) -> None:
         """Start the queue processor and restore persisted jobs."""
         self._esphome_cmd = _find_esphome_cmd()
@@ -80,245 +88,7 @@ class FirmwareController:
         self._runner_task = self._db.create_background_task(self._run_queue())
 
     # ------------------------------------------------------------------
-    # Queue processing
-    # ------------------------------------------------------------------
-
-    async def _run_queue(self) -> None:
-        """Background loop: process one job at a time."""
-        try:
-            while True:
-                job = await self._queue.get()
-                if job.status == JobStatus.CANCELLED:
-                    continue
-                await self._execute_job(job)
-        except asyncio.CancelledError:
-            pass
-
-    async def _verify_chip(self, job: FirmwareJob) -> None:
-        """Verify the chip on the serial port matches the device config.
-
-        Runs esptool chip-id to detect the actual chip, then compares
-        against the target platform in the device config. Raises ValueError
-        on mismatch so the job fails early with a clear error.
-        """
-        if not job.port or job.port.upper() == "OTA" or not job.port.startswith("/dev"):
-            return  # only check serial ports
-
-        # Find the expected platform from our loaded devices
-        device = (
-            self._db.devices._find_device_by_name(
-                job.configuration.removesuffix(".yaml").removesuffix(".yml")
-            )
-            if self._db.devices
-            else None
-        )
-
-        expected_platform = ""
-        if device and device.target_platform:
-            expected_platform = device.target_platform.lower()
-        if not expected_platform:
-            return  # can't verify without knowing expected platform
-
-        # Run esptool to detect the actual chip
-        proc = await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-m",
-            "esptool",
-            "--port",
-            job.port,
-            "chip-id",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        assert proc.stdout is not None  # type narrowing
-        output = (await proc.stdout.read()).decode("utf-8", errors="replace")
-        await proc.wait()
-
-        # Parse "Detecting chip type... ESP32-C3"
-        detected = ""
-        for line in output.splitlines():
-            if "Detecting chip type" in line:
-                detected = line.split("...")[-1].strip().lower().replace("-", "")
-                break
-
-        if not detected:
-            _LOGGER.warning("Could not detect chip type on %s", job.port)
-            return
-
-        # Normalize: "esp32c3" matches "esp32c3", "esp32" matches "esp32"
-        # The target_platform from StorageJSON might be "ESP32S3" (uppercase)
-        expected_normalized = expected_platform.lower().replace("-", "").replace("_", "")
-        detected_normalized = detected.replace(" ", "")
-
-        if expected_normalized != detected_normalized:
-            msg = (
-                f"Chip mismatch: config expects {expected_platform} "
-                f"but {job.port} has {detected}. Wrong board selected?"
-            )
-            raise ValueError(msg)
-
-        _LOGGER.debug("Chip verified: %s on %s", detected, job.port)
-
-    async def _execute_job(self, job: FirmwareJob) -> None:
-        """Execute a single firmware job."""
-        job.status = JobStatus.RUNNING
-        job.started_at = datetime.now(UTC).isoformat()
-        self._current_job = job
-        _LOGGER.info(
-            "Starting job %s: %s %s",
-            job.job_id,
-            job.job_type,
-            job.configuration,
-        )
-        self._db.bus.fire(EventType.JOB_STARTED, {"job": job})
-        await self._persist_jobs()
-
-        try:
-            # Pre-flight: verify chip type for serial uploads
-            if job.job_type in (JobType.UPLOAD, JobType.INSTALL):
-                await self._verify_chip(job)
-
-            config_path = str(self._db.settings.rel_path(job.configuration))
-            cmd = self._build_command(job.job_type, config_path, job.port)
-            _LOGGER.debug("Running: %s", " ".join(cmd))
-
-            # Force ANSI color output even though stdout is piped
-            env = {**os.environ, "PLATFORMIO_FORCE_ANSI": "true"}
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                env=env,
-            )
-            self._current_process = proc
-
-            has_error_in_output = False
-            assert proc.stdout is not None  # type narrowing
-            async for line_bytes in proc.stdout:
-                line = line_bytes.decode("utf-8", errors="replace").rstrip("\n\r")
-                job.output.append(line)
-                self._db.bus.fire(
-                    EventType.JOB_OUTPUT,
-                    {"job_id": job.job_id, "line": line},
-                )
-                # Detect errors in output even if exit code is 0
-                if not has_error_in_output:
-                    for pattern in _ERROR_PATTERNS:
-                        if pattern in line:
-                            has_error_in_output = True
-                            break
-
-            exit_code = await proc.wait()
-            job.exit_code = exit_code
-
-            # Determine real success — exit code AND output content
-            success = exit_code == 0 and not has_error_in_output
-            job.status = JobStatus.COMPLETED if success else JobStatus.FAILED
-            job.completed_at = datetime.now(UTC).isoformat()
-
-            if has_error_in_output and exit_code == 0:
-                job.error = "Process exited 0 but output contains errors"
-                _LOGGER.warning("Job %s: exit code 0 but errors detected in output", job.job_id)
-
-            event = EventType.JOB_COMPLETED if success else EventType.JOB_FAILED
-            self._db.bus.fire(event, {"job": job})
-            _LOGGER.info(
-                "Job %s %s (exit code %s)",
-                job.job_id,
-                job.status,
-                exit_code,
-            )
-
-        except asyncio.CancelledError:
-            if self._current_process:
-                self._current_process.terminate()
-            job.status = JobStatus.CANCELLED
-            job.completed_at = datetime.now(UTC).isoformat()
-            _LOGGER.info("Job %s cancelled", job.job_id)
-            raise
-        except Exception as exc:
-            job.status = JobStatus.FAILED
-            job.error = str(exc)
-            job.completed_at = datetime.now(UTC).isoformat()
-            self._db.bus.fire(EventType.JOB_FAILED, {"job": job})
-            _LOGGER.exception("Job %s failed: %s", job.job_id, exc)
-        finally:
-            self._current_job = None
-            self._current_process = None
-            await self._persist_jobs()
-
-    def _build_command(self, job_type: JobType, config_path: str, port: str) -> list[str]:
-        """Build the esphome CLI command for a job type."""
-        cmd_map = {
-            JobType.COMPILE: "compile",
-            JobType.UPLOAD: "upload",
-            JobType.INSTALL: "run",
-            JobType.CLEAN: "clean",
-        }
-        cmd = [*self._esphome_cmd, cmd_map[job_type], config_path]
-        if job_type == JobType.INSTALL:
-            # Don't tail logs after upload — the job would never complete
-            cmd.append("--no-logs")
-        if job_type in (JobType.UPLOAD, JobType.INSTALL) and port:
-            cmd.extend(["--device", port])
-        return cmd
-
-    # ------------------------------------------------------------------
-    # Job management
-    # ------------------------------------------------------------------
-
-    def _create_job(self, configuration: str, job_type: JobType, port: str = "") -> FirmwareJob:
-        """Create a new job and add it to the queue."""
-        job = FirmwareJob(
-            job_id=uuid4().hex[:12],
-            configuration=configuration,
-            job_type=job_type,
-            created_at=datetime.now(UTC).isoformat(),
-            port=port,
-        )
-        self._jobs[job.job_id] = job
-        return job
-
-    async def _enqueue(self, job: FirmwareJob) -> FirmwareJob:
-        """Enqueue a job, persist, and fire event."""
-        await self._queue.put(job)
-        self._db.bus.fire(EventType.JOB_QUEUED, {"job": job})
-        await self._persist_jobs()
-        return job
-
-    # ------------------------------------------------------------------
-    # Persistence
-    # ------------------------------------------------------------------
-
-    async def _load_jobs(self) -> None:
-        """Load persisted jobs and re-queue incomplete ones."""
-        loop = asyncio.get_running_loop()
-        data = await loop.run_in_executor(None, _load_metadata, self._db.settings.config_dir)
-        for job_data in data.get(_JOBS_KEY, []):
-            try:
-                job = FirmwareJob.from_dict(job_data)
-                self._jobs[job.job_id] = job
-                # Re-queue incomplete jobs
-                if job.status in (JobStatus.QUEUED, JobStatus.RUNNING):
-                    job.status = JobStatus.QUEUED
-                    await self._queue.put(job)
-            except Exception:
-                _LOGGER.warning("Failed to restore job: %s", job_data.get("job_id", "?"))
-
-    async def _persist_jobs(self) -> None:
-        """Save all jobs to disk."""
-        loop = asyncio.get_running_loop()
-        config_dir = self._db.settings.config_dir
-
-        def _save() -> None:
-            data = _load_metadata(config_dir)
-            data[_JOBS_KEY] = [j.to_dict() for j in self._jobs.values()]
-            _save_metadata(config_dir, data)
-
-        await loop.run_in_executor(None, _save)
-
-    # ------------------------------------------------------------------
-    # API commands
+    # API commands — job submission
     # ------------------------------------------------------------------
 
     @api_command("firmware/compile")
@@ -367,6 +137,10 @@ class FirmwareController:
             jobs.append(job)
         return jobs
 
+    # ------------------------------------------------------------------
+    # API commands — job inspection
+    # ------------------------------------------------------------------
+
     @api_command("firmware/get_jobs")
     async def get_jobs(
         self,
@@ -392,10 +166,11 @@ class FirmwareController:
     async def follow_job(
         self, *, job_id: str, client: Any = None, message_id: str = "", **kwargs: Any
     ) -> None:
-        """Follow a job's output: sends historical lines then streams new ones.
+        """
+        Follow a job's output: send historical lines then stream new ones.
 
-        Like `tail -f` with history. No race conditions, no dedup needed.
-        If the job is already finished, sends all output and a result event.
+        Behaves like ``tail -f`` with history. If the job is already
+        finished, sends all output and a final result event.
         """
         job = self._jobs.get(job_id)
         if not job:
@@ -476,9 +251,10 @@ class FirmwareController:
 
     @api_command("firmware/clear")
     async def clear(self, *, status: JobStatus | str | None = None, **kwargs: Any) -> None:
-        """Remove finished jobs from the list.
+        """
+        Remove finished jobs from the list.
 
-        If status is given, only remove jobs with that status.
+        If ``status`` is given, only remove jobs with that status.
         Otherwise removes completed, failed, and cancelled jobs.
         """
         terminal = {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED}
@@ -492,15 +268,16 @@ class FirmwareController:
         await self._persist_jobs()
 
     # ------------------------------------------------------------------
-    # Binary download
+    # API commands — binary download
     # ------------------------------------------------------------------
 
     @api_command("firmware/get_binaries")
     async def get_binaries(self, *, configuration: str, **kwargs: Any) -> list[dict]:
-        """List available firmware binaries for a compiled device.
+        """
+        List available firmware binaries for a compiled device.
 
-        Returns [{title, file}] — the file names can be passed to
-        firmware/download to retrieve the binary content.
+        Returns ``[{title, file}]`` — the file names can be passed to
+        ``firmware/download`` to retrieve the binary content.
         """
         loop = asyncio.get_running_loop()
 
@@ -533,13 +310,13 @@ class FirmwareController:
         compressed: bool = False,
         **kwargs: Any,
     ) -> dict:
-        """Download a compiled firmware binary.
-
-        Returns {filename, data, content_type} where data is base64-encoded.
-        For Web Serial flashing, the frontend decodes the base64 data.
         """
-        import base64
+        Download a compiled firmware binary.
 
+        Returns ``{filename, data, size, compressed}`` where ``data`` is
+        base64-encoded bytes. For Web Serial flashing the frontend
+        decodes the base64 itself.
+        """
         loop = asyncio.get_running_loop()
 
         def _read_binary() -> dict:
@@ -573,3 +350,239 @@ class FirmwareController:
             }
 
         return await loop.run_in_executor(None, _read_binary)
+
+    # ------------------------------------------------------------------
+    # Internals — queue processing
+    # ------------------------------------------------------------------
+
+    async def _run_queue(self) -> None:
+        """Background loop: process one job at a time."""
+        try:
+            while True:
+                job = await self._queue.get()
+                if job.status == JobStatus.CANCELLED:
+                    continue
+                await self._execute_job(job)
+        except asyncio.CancelledError:
+            pass
+
+    async def _execute_job(self, job: FirmwareJob) -> None:
+        """Execute a single firmware job."""
+        job.status = JobStatus.RUNNING
+        job.started_at = datetime.now(UTC).isoformat()
+        self._current_job = job
+        _LOGGER.info(
+            "Starting job %s: %s %s",
+            job.job_id,
+            job.job_type,
+            job.configuration,
+        )
+        self._db.bus.fire(EventType.JOB_STARTED, {"job": job})
+        await self._persist_jobs()
+
+        try:
+            # Pre-flight: verify chip type for serial uploads
+            if job.job_type in (JobType.UPLOAD, JobType.INSTALL):
+                await self._verify_chip(job)
+
+            config_path = str(self._db.settings.rel_path(job.configuration))
+            cmd = self._build_command(job.job_type, config_path, job.port)
+            _LOGGER.debug("Running: %s", " ".join(cmd))
+
+            # Force ANSI color output even though stdout is piped
+            env = {**os.environ, "PLATFORMIO_FORCE_ANSI": "true"}
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env=env,
+            )
+            self._current_process = proc
+
+            has_error_in_output = False
+            assert proc.stdout is not None  # type narrowing
+            async for line_bytes in proc.stdout:
+                line = line_bytes.decode("utf-8", errors="replace").rstrip("\n\r")
+                job.output.append(line)
+                self._db.bus.fire(
+                    EventType.JOB_OUTPUT,
+                    {"job_id": job.job_id, "line": line},
+                )
+                if not has_error_in_output:
+                    for pattern in _ERROR_PATTERNS:
+                        if pattern in line:
+                            has_error_in_output = True
+                            break
+
+            exit_code = await proc.wait()
+            job.exit_code = exit_code
+
+            success = exit_code == 0 and not has_error_in_output
+            job.status = JobStatus.COMPLETED if success else JobStatus.FAILED
+            job.completed_at = datetime.now(UTC).isoformat()
+
+            if has_error_in_output and exit_code == 0:
+                job.error = "Process exited 0 but output contains errors"
+                _LOGGER.warning("Job %s: exit code 0 but errors detected in output", job.job_id)
+
+            event = EventType.JOB_COMPLETED if success else EventType.JOB_FAILED
+            self._db.bus.fire(event, {"job": job})
+            _LOGGER.info(
+                "Job %s %s (exit code %s)",
+                job.job_id,
+                job.status,
+                exit_code,
+            )
+
+        except asyncio.CancelledError:
+            if self._current_process:
+                self._current_process.terminate()
+            job.status = JobStatus.CANCELLED
+            job.completed_at = datetime.now(UTC).isoformat()
+            _LOGGER.info("Job %s cancelled", job.job_id)
+            raise
+        except Exception as exc:
+            job.status = JobStatus.FAILED
+            job.error = str(exc)
+            job.completed_at = datetime.now(UTC).isoformat()
+            self._db.bus.fire(EventType.JOB_FAILED, {"job": job})
+            _LOGGER.exception("Job %s failed: %s", job.job_id, exc)
+        finally:
+            self._current_job = None
+            self._current_process = None
+            await self._persist_jobs()
+
+    async def _verify_chip(self, job: FirmwareJob) -> None:
+        """
+        Verify the chip on the serial port matches the device config.
+
+        Runs ``esptool chip-id`` to detect the actual chip, then
+        compares against the target platform in the device config.
+        Raises ValueError on mismatch so the job fails early with a
+        clear error message.
+        """
+        if not job.port or job.port.upper() == "OTA" or not job.port.startswith("/dev"):
+            return  # only check serial ports
+
+        device = None
+        if self._db.devices:
+            target_name = job.configuration.removesuffix(".yaml").removesuffix(".yml")
+            device = next(
+                (d for d in self._db.devices.get_devices() if d.name == target_name),
+                None,
+            )
+
+        expected_platform = ""
+        if device and device.target_platform:
+            expected_platform = device.target_platform.lower()
+        if not expected_platform:
+            return  # can't verify without knowing expected platform
+
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m",
+            "esptool",
+            "--port",
+            job.port,
+            "chip-id",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        assert proc.stdout is not None  # type narrowing
+        output = (await proc.stdout.read()).decode("utf-8", errors="replace")
+        await proc.wait()
+
+        # Parse "Detecting chip type... ESP32-C3"
+        detected = ""
+        for line in output.splitlines():
+            if "Detecting chip type" in line:
+                detected = line.split("...")[-1].strip().lower().replace("-", "")
+                break
+
+        if not detected:
+            _LOGGER.warning("Could not detect chip type on %s", job.port)
+            return
+
+        # Normalise: "esp32c3" matches "esp32c3", "esp32" matches "esp32".
+        # The target_platform from StorageJSON might be "ESP32S3" (uppercase).
+        expected_normalized = expected_platform.lower().replace("-", "").replace("_", "")
+        detected_normalized = detected.replace(" ", "")
+
+        if expected_normalized != detected_normalized:
+            msg = (
+                f"Chip mismatch: config expects {expected_platform} "
+                f"but {job.port} has {detected}. Wrong board selected?"
+            )
+            raise ValueError(msg)
+
+        _LOGGER.debug("Chip verified: %s on %s", detected, job.port)
+
+    def _build_command(self, job_type: JobType, config_path: str, port: str) -> list[str]:
+        """Build the esphome CLI command for a given job type."""
+        cmd_map = {
+            JobType.COMPILE: "compile",
+            JobType.UPLOAD: "upload",
+            JobType.INSTALL: "run",
+            JobType.CLEAN: "clean",
+        }
+        cmd = [*self._esphome_cmd, cmd_map[job_type], config_path]
+        if job_type == JobType.INSTALL:
+            # Without --no-logs the CLI tails logs forever after the
+            # upload, never returning — the job would never complete.
+            cmd.append("--no-logs")
+        if job_type in (JobType.UPLOAD, JobType.INSTALL) and port:
+            cmd.extend(["--device", port])
+        return cmd
+
+    # ------------------------------------------------------------------
+    # Internals — job management
+    # ------------------------------------------------------------------
+
+    def _create_job(self, configuration: str, job_type: JobType, port: str = "") -> FirmwareJob:
+        """Create a new job and add it to the in-memory map."""
+        job = FirmwareJob(
+            job_id=uuid4().hex[:12],
+            configuration=configuration,
+            job_type=job_type,
+            created_at=datetime.now(UTC).isoformat(),
+            port=port,
+        )
+        self._jobs[job.job_id] = job
+        return job
+
+    async def _enqueue(self, job: FirmwareJob) -> FirmwareJob:
+        """Enqueue a job, persist, and fire JOB_QUEUED."""
+        await self._queue.put(job)
+        self._db.bus.fire(EventType.JOB_QUEUED, {"job": job})
+        await self._persist_jobs()
+        return job
+
+    # ------------------------------------------------------------------
+    # Internals — persistence
+    # ------------------------------------------------------------------
+
+    async def _load_jobs(self) -> None:
+        """Load persisted jobs and re-queue any incomplete ones."""
+        loop = asyncio.get_running_loop()
+        data = await loop.run_in_executor(None, _load_metadata, self._db.settings.config_dir)
+        for job_data in data.get(_JOBS_KEY, []):
+            try:
+                job = FirmwareJob.from_dict(job_data)
+                self._jobs[job.job_id] = job
+                if job.status in (JobStatus.QUEUED, JobStatus.RUNNING):
+                    job.status = JobStatus.QUEUED
+                    await self._queue.put(job)
+            except Exception:
+                _LOGGER.warning("Failed to restore job: %s", job_data.get("job_id", "?"))
+
+    async def _persist_jobs(self) -> None:
+        """Save all jobs to disk."""
+        loop = asyncio.get_running_loop()
+        config_dir = self._db.settings.config_dir
+
+        def _save() -> None:
+            data = _load_metadata(config_dir)
+            data[_JOBS_KEY] = [j.to_dict() for j in self._jobs.values()]
+            _save_metadata(config_dir, data)
+
+        await loop.run_in_executor(None, _save)
