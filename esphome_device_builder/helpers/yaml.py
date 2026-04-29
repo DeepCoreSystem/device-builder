@@ -1,4 +1,4 @@
-"""Utilities for appending blocks to ESPHome YAML config files."""
+"""Utilities for generating and modifying ESPHome YAML config files."""
 
 from __future__ import annotations
 
@@ -9,14 +9,50 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from ..models import ComponentCatalogEntry
 
+# Platform categories that use the list-under-platform YAML pattern
+# (`sensor: [- platform: ...]`) rather than a single top-level key.
+_ENTITY_CATEGORIES = {
+    "sensor",
+    "binary_sensor",
+    "switch",
+    "light",
+    "fan",
+    "cover",
+    "climate",
+    "button",
+    "number",
+    "select",
+    "text",
+    "text_sensor",
+    "lock",
+    "valve",
+    "media_player",
+    "speaker",
+    "microphone",
+    "camera",
+    "display",
+    "touchscreen",
+    "output",
+    "datetime",
+    "event",
+    "update",
+    "alarm_control_panel",
+}
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
 
 def rewrite_esphome_name(yaml: str, old_name: str, new_name: str) -> str:
-    """Replace `name:` under the top-level `esphome:` block.
+    """
+    Replace ``name:`` under the top-level ``esphome:`` block.
 
-    Only changes lines inside the `esphome:` section whose value equals
-    *old_name* (with optional surrounding quotes). Leaves indentation and
-    trailing comments intact. Returns the original text unchanged when
-    nothing matches so callers can detect a no-op.
+    Only changes lines inside the ``esphome:`` section whose value
+    equals *old_name* (with optional surrounding quotes). Indentation
+    and trailing comments are preserved. Returns the original text
+    unchanged when nothing matches so callers can detect a no-op.
     """
     lines = yaml.splitlines(keepends=True)
     in_esphome = False
@@ -45,19 +81,6 @@ def rewrite_esphome_name(yaml: str, old_name: str, new_name: str) -> str:
         changed = True
         break
     return "".join(lines) if changed else yaml
-
-
-def _fill_template(template: str, fields: dict[str, Any]) -> str:
-    """Replace {key} placeholders in a YAML template with field values."""
-    result = template
-    for key, value in fields.items():
-        result = result.replace(f"{{{key}}}", str(value))
-    lines = []
-    for line in result.splitlines(keepends=True):
-        if re.search(r"\{[a-zA-Z_][a-zA-Z0-9_]*\}", line):
-            continue
-        lines.append(line)
-    return "".join(lines)
 
 
 def append_yaml_block(yaml_path: Path, block: str) -> str:
@@ -114,67 +137,19 @@ def build_automation_yaml(
     return new_content
 
 
-# ---------------------------------------------------------------------------
-# Structural component YAML generation
-# ---------------------------------------------------------------------------
-
-# Platform categories that use the list-under-platform pattern
-_ENTITY_CATEGORIES = {
-    "sensor",
-    "binary_sensor",
-    "switch",
-    "light",
-    "fan",
-    "cover",
-    "climate",
-    "button",
-    "number",
-    "select",
-    "text",
-    "text_sensor",
-    "lock",
-    "valve",
-    "media_player",
-    "speaker",
-    "microphone",
-    "camera",
-    "display",
-    "touchscreen",
-    "output",
-    "datetime",
-    "event",
-    "update",
-    "alarm_control_panel",
-}
-
-
-def _format_yaml_value(value: Any) -> str:
-    """Format a Python value for YAML output."""
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, str):
-        if value in ("true", "false", "null", "yes", "no", "on", "off"):
-            return f'"{value}"'
-        if value.startswith("!") or ":" in value or "#" in value:
-            return f'"{value}"'
-        return value
-    return str(value)
-
-
-def _generate_id(component_id: str, name: str | None = None) -> str:
-    """Auto-generate a component ID from the component type and optional name."""
-    if name:
-        slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
-        return f"{component_id}_{slug}"
-    return component_id
-
-
 def generate_component_yaml(
     component: ComponentCatalogEntry,
     fields: dict[str, Any],
     sub_entries: dict[str, dict[str, Any]] | None = None,
 ) -> str:
-    """Generate a YAML block for adding a component to a device config."""
+    """
+    Generate a YAML block for adding a component to a device config.
+
+    Platform-style components (``sensor``, ``switch``, ...) are emitted
+    as a list under their category with a ``- platform: <id>`` entry;
+    everything else is emitted as a top-level mapping keyed by the
+    component id.
+    """
     lines: list[str] = []
     category = component.category
     comp_id = component.id
@@ -201,3 +176,42 @@ def generate_component_yaml(
                 lines.append(f"{indent}  {sk}: {_format_yaml_value(sv)}")
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Internals
+# ---------------------------------------------------------------------------
+
+
+def _fill_template(template: str, fields: dict[str, Any]) -> str:
+    """Replace ``{key}`` placeholders in a YAML template with field values."""
+    result = template
+    for key, value in fields.items():
+        result = result.replace(f"{{{key}}}", str(value))
+    lines = []
+    for line in result.splitlines(keepends=True):
+        if re.search(r"\{[a-zA-Z_][a-zA-Z0-9_]*\}", line):
+            continue
+        lines.append(line)
+    return "".join(lines)
+
+
+def _format_yaml_value(value: Any) -> str:
+    """Format a Python value for YAML output."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        if value in ("true", "false", "null", "yes", "no", "on", "off"):
+            return f'"{value}"'
+        if value.startswith("!") or ":" in value or "#" in value:
+            return f'"{value}"'
+        return value
+    return str(value)
+
+
+def _generate_id(component_id: str, name: str | None = None) -> str:
+    """Auto-generate a component ID from the component type and optional name."""
+    if name:
+        slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+        return f"{component_id}_{slug}"
+    return component_id

@@ -16,11 +16,10 @@ class BoardCatalog:
     """In-memory board catalog with search and pagination."""
 
     def __init__(self) -> None:
-        """Initialize the board catalog."""
         self._boards: list[BoardCatalogEntry] = []
 
     def load(self) -> None:
-        """Load boards from YAML definitions."""
+        """Load boards from YAML definitions on disk."""
         catalog = load_board_catalog()
         self._boards = list(catalog.boards)
         _LOGGER.info("Board catalog loaded: %d boards", len(self._boards))
@@ -32,21 +31,6 @@ class BoardCatalog:
             if board.id == board_id:
                 return board
         return None
-
-    def find_by_pio_board(self, pio_board: str, pio_variant: str = "") -> BoardCatalogEntry | None:
-        """Find a board by its PlatformIO board ID, preferring matching variant.
-
-        Used to derive a board_id from a user-provided YAML config. Returns
-        None if no entry has a matching `esphome.board` value.
-        """
-        matches = [b for b in self._boards if b.esphome.board == pio_board]
-        if not matches:
-            return None
-        if pio_variant:
-            for b in matches:
-                if b.esphome.variant and b.esphome.variant.value == pio_variant:
-                    return b
-        return matches[0]
 
     @api_command("boards/get_boards")
     async def get_boards(
@@ -60,7 +44,13 @@ class BoardCatalog:
         limit: int = 50,
         **kwargs: Any,
     ) -> PagedBoardsResponse:
-        """Get boards with optional filtering, search, and pagination."""
+        """
+        Get boards with optional filtering, search, and pagination.
+
+        ``query`` matches the board id, name, manufacturer, description
+        and tags. Featured boards are sorted first; generic fallback
+        boards last; the rest alphabetically.
+        """
         results = self._boards
 
         if platform:
@@ -98,3 +88,19 @@ class BoardCatalog:
         total = len(results)
         page = results[offset : offset + limit]
         return PagedBoardsResponse(boards=page, total=total, offset=offset, limit=limit)
+
+    def find_by_pio_board(self, pio_board: str, pio_variant: str = "") -> BoardCatalogEntry | None:
+        """
+        Find a board by its PlatformIO board id, preferring a matching variant.
+
+        Used to derive a board_id from a user-provided YAML config.
+        Returns None if no entry has a matching ``esphome.board`` value.
+        """
+        matches = [b for b in self._boards if b.esphome.board == pio_board]
+        if not matches:
+            return None
+        if pio_variant:
+            for b in matches:
+                if b.esphome.variant and b.esphome.variant.value == pio_variant:
+                    return b
+        return matches[0]
