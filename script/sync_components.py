@@ -900,14 +900,23 @@ def _identify_from_closure(validator: Any, name_lower: str) -> dict[str, Any] | 
     if not closure:
         return None
 
-    # Enum mapping {label: value} → drop-down with primitive value type
+    # Enum mapping {label: value} → drop-down with primitive value type.
+    # An empty string is sometimes used as the "none" value (e.g.
+    # sensor state_class). Surface it with a friendly label so the
+    # frontend doesn't render a blank dropdown row.
     for cell in closure:
         try:
             val = cell.cell_contents
         except (ValueError, TypeError):
             continue
         if isinstance(val, dict) and val and all(isinstance(k, str) for k in val):
-            return {"type": "string", "options": list(val.keys())}
+            options: list[str | dict[str, str]] = []
+            for option_value in val:
+                if option_value == "":
+                    options.append({"label": "(none)", "value": ""})
+                else:
+                    options.append(option_value)
+            return {"type": "string", "options": options}
 
     # Numeric range
     if "int_range" in name_lower or "float_range" in name_lower:
