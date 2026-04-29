@@ -838,6 +838,18 @@ def _identify_validator(validator: Any) -> dict[str, Any]:
     if "templatable" in qualname.lower() and getattr(validator, "__closure__", None):
         return _unwrap_templatable(validator)
 
+    # cv.use_id(SomeClass) produces a wrapper whose qualname is
+    # `use_id.<locals>.validator` and whose closure carries a
+    # MockObjClass for the referenced ESPHome type. Extract the
+    # component domain (the C++ namespace) so the frontend can show
+    # a dropdown of matching components in the device.
+    if qualname.startswith("use_id.") and getattr(validator, "__closure__", None):
+        ref = _extract_use_id_reference(validator)
+        result: dict[str, Any] = {"type": "id"}
+        if ref:
+            result["references_component"] = ref
+        return result
+
     if any(validator is v for v in _LAMBDA_VALIDATORS):
         return {"type": "lambda"}
 
@@ -923,6 +935,30 @@ def _identify_validator(validator: Any) -> dict[str, Any]:
         return {"type": "string"}
 
     return {"type": "unknown"}
+
+
+def _extract_use_id_reference(validator: Any) -> str | None:
+    """
+    Return the component domain a ``cv.use_id`` validator references.
+
+    ``cv.use_id(SomeClass)`` carries a ``MockObjClass`` in its closure
+    whose ``.base`` attribute holds the C++ qualified name like
+    ``"output::FloatOutput"``. The first segment is the ESPHome
+    component the referenced id must be declared in. Returns None
+    when the closure shape doesn't match.
+    """
+    closure = getattr(validator, "__closure__", None)
+    if not closure:
+        return None
+    for cell in closure:
+        try:
+            value = cell.cell_contents
+        except (ValueError, TypeError):
+            continue
+        base = getattr(value, "base", None)
+        if isinstance(base, str) and "::" in base:
+            return base.split("::", 1)[0]
+    return None
 
 
 def _unwrap_templatable(validator: Any) -> dict[str, Any]:
@@ -1140,7 +1176,11 @@ def _build_entry(key: Any, validator: Any) -> dict | None:
     if info.get("range_min") is not None or info.get("range_max") is not None:
         range_val = [info.get("range_min"), info.get("range_max")]
 
-    advanced = _classify_advanced(key_name, required)
+    references = info.get("references_component")
+    # use_id-style references wire components together; they're
+    # structural even when the schema marks them optional, so always
+    # show them on the main form rather than under "Advanced".
+    advanced = False if references else _classify_advanced(key_name, required)
 
     entry: dict[str, Any] = {
         "key": key_name,
@@ -1164,6 +1204,9 @@ def _build_entry(key: Any, validator: Any) -> dict | None:
     component_dependency = _FIELD_COMPONENT_DEPENDENCY.get(key_name)
     if component_dependency:
         entry["depends_on_component"] = component_dependency
+
+    if references:
+        entry["references_component"] = references
 
     return entry
 

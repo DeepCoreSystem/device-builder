@@ -260,6 +260,14 @@ class ConfigEntry(DataClassORJSONMixin):
     # block. None = always visible (the default).
     depends_on_component: str | None = None
 
+    # When ``type`` is ID, identifies the component domain the value
+    # must reference. The frontend renders a dropdown of existing
+    # components of that domain in the device's YAML — e.g.
+    # ``rtttl.output`` references "output", ``integration.sensor``
+    # references "sensor", many sensors reference "i2c" / "spi" /
+    # "uart" buses. None when the field is a free-form ID.
+    references_component: str | None = None
+
     # === pin selection (only meaningful when type == PIN) ===
 
     # Pin capabilities required for this field. Frontend filters the
