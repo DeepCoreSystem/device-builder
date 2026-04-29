@@ -1457,6 +1457,20 @@ def _classify_advanced(key_name: str, required: bool) -> bool:
     return True
 
 
+def _all_inner_advanced(inner_entries: list[dict]) -> bool:
+    """
+    Return True iff every inner entry is flagged advanced.
+
+    Used to propagate ``advanced`` up to a NESTED parent: when none of
+    the children would be visible on the main form anyway, there's no
+    reason to expose the collapsible group there either. Empty groups
+    return False so they don't get hidden by accident.
+    """
+    if not inner_entries:
+        return False
+    return all(e.get("advanced") for e in inner_entries)
+
+
 def _unwrap_schema(schema: Any) -> dict | None:
     """
     Find the dict schema buried inside vol.All / vol.Schema wrappers.
@@ -1755,7 +1769,7 @@ def _build_entity_nested_entry(
         "type": "nested",
         "label": _key_to_label(key_name),
         "required": False,
-        "advanced": False,
+        "advanced": _all_inner_advanced(inner),
         "translation_key": f"component.config.{key_name}",
         "platform_type": platform_type,
         "config_entries": _sort_entries(inner),
@@ -1782,7 +1796,7 @@ def _build_plain_nested_entry(
         "type": "nested",
         "label": _key_to_label(key_name),
         "required": False,
-        "advanced": False,
+        "advanced": _all_inner_advanced(inner),
         "translation_key": f"component.config.{key_name}",
         "config_entries": _sort_entries(inner),
     }
