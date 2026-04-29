@@ -1803,15 +1803,16 @@ def _sync_component(
 
     entries: list[dict] = []
 
-    # Generate the parent / hub entry under the unqualified id when
-    # there's something meaningful to put in it:
-    #   - has own schema (any number of platforms — includes hubs like
-    #     ble_client, daly_bms, and core components like wifi)
-    #   - exactly one platform and no own schema (single-platform
-    #     providers like dht — keeps the short id `dht`)
-    # Components with 2+ platforms and no own schema (template, gpio,
-    # copy, ...) skip the parent and produce only per-platform entries.
-    if manifest.config_schema is not None or len(platforms) < 2:
+    # Hub / top-level entry under the unqualified id, only when the
+    # component itself has a top-level CONFIG_SCHEMA or doesn't
+    # provide any platforms at all. Examples:
+    #   - wifi / api / esphome — own schema, no platforms
+    #   - ble_client / daly_bms — own schema (the hub) AND platforms
+    #     (the sensor / switch / etc. providers)
+    # Pure platform providers (dht, ledc, status, adc, template, ...)
+    # have no own schema and skip this branch — they're emitted only
+    # under their qualified <domain>.<id> form below.
+    if manifest.config_schema is not None or not platforms:
         entries.append(
             _build_component_entry(
                 component_id=component_id,
@@ -1824,11 +1825,12 @@ def _sync_component(
             )
         )
 
-    # Per-platform entries when the component provides multiple
-    # platforms (template/gpio/copy/ble_client/...). Single-platform
-    # components without their own schema already got their entry
-    # above with the platform schema.
-    if len(platforms) >= 2:
+    # Per-platform entries — emitted for ANY platform-providing
+    # component (single or multi). The qualified form (<domain>.<id>)
+    # is consistent with how users think about platform configs in
+    # YAML: a "sensor" with `platform: dht`, an "output" with
+    # `platform: ledc`, etc.
+    if platforms:
         for platform_name in platforms:
             entry = _build_platform_entry(
                 component_id=component_id,
