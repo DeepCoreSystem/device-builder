@@ -1279,6 +1279,72 @@ def _sort_entries(entries: list[dict]) -> list[dict]:
     return [entry for _idx, entry in sorted(enumerate(entries), key=sort_key)]
 
 
+def _load_platform_enums() -> dict[str, dict[str, list[str]]]:
+    """
+    Load device_class / state_class enums from each ESPHome platform module.
+
+    Returns ``{platform: {"device_class": [...], "state_class": [...]}}``
+    so per-platform entries can populate the right options for their
+    domain. Platforms without these constants are simply absent from
+    the result.
+    """
+    out: dict[str, dict[str, list[str]]] = {}
+    components_dir = Path(const.__file__).parent / "components"
+    for d in sorted(components_dir.iterdir()):
+        if not d.is_dir() or d.name.startswith("_"):
+            continue
+        try:
+            module = importlib.import_module(f"esphome.components.{d.name}")
+        except Exception:  # noqa: S112 — missing optional deps are common
+            continue
+        enums: dict[str, list[str]] = {}
+        for src_attr, dst_key in (
+            ("DEVICE_CLASSES", "device_class"),
+            ("STATE_CLASSES", "state_class"),
+        ):
+            value = getattr(module, src_attr, None)
+            if value and hasattr(value, "__iter__"):
+                enums[dst_key] = [str(v) for v in value]
+        if enums:
+            out[d.name] = enums
+    return out
+
+
+def _load_entity_categories() -> list[str]:
+    """Load the universal ``entity_category`` options from cv."""
+    raw = getattr(cv, "ENTITY_CATEGORIES", None)
+    if not raw:
+        return []
+    return list(raw.keys() if hasattr(raw, "keys") else raw)
+
+
+_PLATFORM_ENUMS: dict[str, dict[str, list[str]]] = _load_platform_enums()
+_ENTITY_CATEGORIES: list[str] = _load_entity_categories()
+
+
+def _inject_enum_options(entries: list[dict], platform: str | None) -> None:
+    """
+    Populate ``options`` for entity-base fields that lack them.
+
+    ``device_class`` / ``state_class`` come from the platform's own
+    constants; ``entity_category`` is universal. Only fills in
+    options when the entry doesn't already have any — domain-specific
+    enums that the schema introspection picked up keep priority.
+    """
+    platform_enums = _PLATFORM_ENUMS.get(platform, {}) if platform else {}
+    for entry in entries:
+        if entry.get("options"):
+            continue
+        key = entry["key"]
+        values: list[str] | None = None
+        if key in ("device_class", "state_class"):
+            values = platform_enums.get(key)
+        elif key == "entity_category":
+            values = _ENTITY_CATEGORIES
+        if values:
+            entry["options"] = [_make_option(v) for v in values]
+
+
 def _make_option(value: str) -> dict[str, str]:
     """
     Build a ``ConfigValueOption``-shaped dict for a SELECT option.
@@ -1940,6 +2006,7 @@ def _build_component_entry(
 
     config_entries: list[dict] = []
     sub_entries: list[dict] = []
+    primary: str | None = None
     if schema is not None:
         try:
             config_entries, sub_entries = _parse_schema(schema, component_id, field_descriptions)
@@ -1960,6 +2027,10 @@ def _build_component_entry(
                 )
         except Exception as exc:
             _LOGGER.warning("Failed to parse schema for %s/%s: %s", primary, component_id, exc)
+
+    _inject_enum_options(config_entries, primary)
+    for sub in sub_entries:
+        _inject_enum_options(sub["config_entries"], sub.get("platform_type"))
 
     return {
         "id": component_id,
@@ -2021,6 +2092,10 @@ def _build_platform_entry(
     except Exception as exc:
         _LOGGER.warning("Failed to parse %s.%s schema: %s", platform_name, component_id, exc)
         return None
+
+    _inject_enum_options(config_entries, platform_name)
+    for sub in sub_entries:
+        _inject_enum_options(sub["config_entries"], sub.get("platform_type"))
 
     return {
         "id": qualified_id,
