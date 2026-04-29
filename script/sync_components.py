@@ -699,13 +699,22 @@ def _is_required(key: Any) -> bool:
 
 def _get_default(key: Any) -> Any:
     """
-    Return the default value of a voluptuous key.
+    Return the platform-agnostic default value of a voluptuous key.
 
     Returns None when there is no default or accessing it raises. Some
     ESPHome defaults are descriptors that look up CORE.data, which
     isn't always populated during sync — KeyError is the common
     failure mode there.
+
+    ``cv.SplitDefault`` keys explicitly return None here — their
+    per-platform map is surfaced separately by
+    :func:`_get_platform_defaults`. Frontend looks up the device's
+    target platform there and only falls back to ``default_value``
+    when the platform isn't listed.
     """
+    if hasattr(key, "_defaults"):
+        return None
+
     try:
         default = getattr(key, "default", vol.UNDEFINED)
     except Exception:
@@ -717,11 +726,37 @@ def _get_default(key: Any) -> Any:
             default = default()
         except Exception:
             return None
-    if hasattr(default, "total_seconds"):
-        return f"{int(default.total_seconds())}s"
-    if hasattr(default, "total_milliseconds"):
-        return f"{int(default.total_milliseconds)}ms"
-    return default
+    return _normalise_time_value(default)
+
+
+def _get_platform_defaults(key: Any) -> dict[str, Any]:
+    """
+    Return ``{platform: default_value}`` for a ``cv.SplitDefault`` key.
+
+    Returns an empty dict for keys that aren't SplitDefault or whose
+    per-platform factories can't be invoked. Each factory is called
+    directly so we don't have to fully populate ESPHome's CORE state.
+    """
+    factories = getattr(key, "_defaults", None)
+    if not isinstance(factories, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for platform, factory in factories.items():
+        try:
+            value = factory() if callable(factory) else factory
+        except Exception:  # noqa: S112 — defaults are user-controlled; skip ones we can't resolve
+            continue
+        out[platform] = _normalise_time_value(value)
+    return out
+
+
+def _normalise_time_value(value: Any) -> Any:
+    """Render TimePeriod-like objects as their YAML string form."""
+    if hasattr(value, "total_seconds"):
+        return f"{int(value.total_seconds())}s"
+    if hasattr(value, "total_milliseconds"):
+        return f"{int(value.total_milliseconds)}ms"
+    return value
 
 
 # Lambda-only validators captured once at module load — re-resolved every
@@ -1118,6 +1153,10 @@ def _build_entry(key: Any, validator: Any) -> dict | None:
         "advanced": advanced,
         "translation_key": f"component.config.{key_name}",
     }
+
+    platform_defaults = _get_platform_defaults(key)
+    if platform_defaults:
+        entry["platform_defaults"] = platform_defaults
 
     if info.get("templatable"):
         entry["templatable"] = True

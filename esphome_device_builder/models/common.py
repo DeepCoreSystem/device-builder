@@ -206,6 +206,15 @@ class ConfigEntry(DataClassORJSONMixin):
     # `multi_value` entries this is the default *list* of values.
     default_value: ConfigPrimitive | list[ConfigPrimitive] | None = None
 
+    # Per-target-platform default values for fields that use
+    # ``cv.SplitDefault`` (e.g. wifi.power_save_mode is "light" on
+    # ESP32 but "none" on ESP8266). Frontend should look up the
+    # device's target platform here and fall back to ``default_value``
+    # when the platform isn't listed (which means the field has no
+    # built-in default for that platform — usually because it isn't
+    # commonly used there).
+    platform_defaults: dict[str, ConfigPrimitive] | None = None
+
     # === value constraints ===
 
     # Constrains the value to a fixed set of choices. When populated the

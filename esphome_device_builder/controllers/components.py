@@ -193,6 +193,7 @@ def _load_config_entry(data: dict) -> ConfigEntry:
         description=data.get("description"),
         required=bool(data.get("required", False)),
         default_value=data.get("default_value"),
+        platform_defaults=data.get("platform_defaults"),
         options=_load_options(data.get("options")),
         range=range_val,
         multi_value=bool(data.get("multi_value", False)),
