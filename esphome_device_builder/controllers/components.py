@@ -77,10 +77,24 @@ class ComponentCatalog:
 
     @api_command("components/get_component")
     async def get_component(
-        self, *, component_id: str, **kwargs: Any
+        self,
+        *,
+        component_id: str,
+        platform: str | None = None,
+        **kwargs: Any,
     ) -> ComponentCatalogEntry | None:
-        """Get a single component by ID."""
-        return self._by_id.get(component_id)
+        """
+        Get a single component by ID.
+
+        When ``platform`` is provided, ``platform_defaults`` are
+        resolved into ``default_value`` for the device's target
+        platform — frontend gets the right default without having to
+        know the cv.SplitDefault details.
+        """
+        component = self._by_id.get(component_id)
+        if component is None:
+            return None
+        return _materialise(component, platform)
 
     @api_command("components/get_components")
     async def get_components(
@@ -99,7 +113,9 @@ class ComponentCatalog:
         ``query`` matches against the component id, name, and description.
         ``platform`` filters to components compatible with the given
         target platform — components with an empty ``supported_platforms``
-        list are considered platform-agnostic and always included.
+        list are considered platform-agnostic and always included. When
+        ``platform`` is set, each entry's ``platform_defaults`` map is
+        also resolved into its ``default_value`` for that platform.
         """
         results = self._components
 
@@ -122,7 +138,7 @@ class ComponentCatalog:
             ]
 
         total = len(results)
-        page = results[offset : offset + limit]
+        page = [_materialise(c, platform) for c in results[offset : offset + limit]]
         return PagedComponentsResponse(
             components=page,
             total=total,
@@ -130,6 +146,86 @@ class ComponentCatalog:
             limit=limit,
             categories=self.categories,
         )
+
+
+# ---------------------------------------------------------------------------
+# API helpers
+# ---------------------------------------------------------------------------
+
+
+def _materialise(
+    component: ComponentCatalogEntry,
+    target_platform: str | None,
+) -> ComponentCatalogEntry:
+    """
+    Return a copy of *component* with platform_defaults resolved.
+
+    When *target_platform* is given, every config entry's
+    ``platform_defaults`` map is consulted: if the platform is listed,
+    that value replaces ``default_value``. The ``platform_defaults``
+    field itself is always cleared in the returned copy so the API
+    surface stays simple — the frontend just reads ``default_value``.
+    """
+    return ComponentCatalogEntry(
+        id=component.id,
+        name=component.name,
+        description=component.description,
+        category=component.category,
+        docs_url=component.docs_url,
+        image_url=component.image_url,
+        dependencies=component.dependencies,
+        multi_conf=component.multi_conf,
+        supported_platforms=component.supported_platforms,
+        config_entries=[_materialise_entry(e, target_platform) for e in component.config_entries],
+        sub_entries=[
+            ComponentSubEntry(
+                key=sub.key,
+                platform_type=sub.platform_type,
+                config_entries=[_materialise_entry(e, target_platform) for e in sub.config_entries],
+            )
+            for sub in component.sub_entries
+        ],
+    )
+
+
+def _materialise_entry(entry: ConfigEntry, target_platform: str | None) -> ConfigEntry:
+    """
+    Resolve platform_defaults into default_value for *target_platform*.
+
+    The returned entry never carries platform_defaults — that field is
+    a sync-time implementation detail the frontend doesn't need to
+    know about.
+    """
+    default = entry.default_value
+    if target_platform and entry.platform_defaults:
+        if target_platform in entry.platform_defaults:
+            default = entry.platform_defaults[target_platform]
+    return ConfigEntry(
+        key=entry.key,
+        type=entry.type,
+        label=entry.label,
+        description=entry.description,
+        required=entry.required,
+        default_value=default,
+        platform_defaults=None,
+        options=entry.options,
+        range=entry.range,
+        multi_value=entry.multi_value,
+        templatable=entry.templatable,
+        depends_on=entry.depends_on,
+        depends_on_value=entry.depends_on_value,
+        depends_on_value_not=entry.depends_on_value_not,
+        depends_on_component=entry.depends_on_component,
+        references_component=entry.references_component,
+        pin_features=entry.pin_features,
+        pin_mode=entry.pin_mode,
+        advanced=entry.advanced,
+        hidden=entry.hidden,
+        help_link=entry.help_link,
+        translation_key=entry.translation_key,
+        translation_params=entry.translation_params,
+        value=entry.value,
+    )
 
 
 # ---------------------------------------------------------------------------
