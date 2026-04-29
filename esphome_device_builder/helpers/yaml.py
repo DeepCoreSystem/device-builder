@@ -137,6 +137,30 @@ def build_automation_yaml(
     return new_content
 
 
+def merge_component_yaml(
+    existing: str,
+    component: ComponentCatalogEntry,
+    fields: dict[str, Any],
+) -> str:
+    """
+    Render *component* and merge it into *existing* YAML.
+
+    For platform-style components (``sensor:``, ``output:``, ...) the
+    new ``- platform: ...`` list item is appended under the existing
+    domain block when one is already present — without this, repeatedly
+    adding components of the same domain would produce duplicate
+    top-level ``output:`` / ``sensor:`` blocks. Other components fall
+    through to a plain append.
+    """
+    block = generate_component_yaml(component, fields)
+    is_platform = component.category in _ENTITY_CATEGORIES
+    if is_platform:
+        spliced = _splice_into_domain_block(existing, str(component.category), block)
+        if spliced is not None:
+            return spliced
+    return _append_block(existing, block)
+
+
 def generate_component_yaml(
     component: ComponentCatalogEntry,
     fields: dict[str, Any],
@@ -160,16 +184,22 @@ def generate_component_yaml(
     is_platform = category in _ENTITY_CATEGORIES
 
     if is_platform:
+        # Catalog ids are qualified as ``<domain>.<platform>`` (e.g.
+        # ``output.gpio``, ``light.binary``) so distinct platforms can
+        # share a stem across categories. ESPHome YAML expects the bare
+        # platform stem under ``platform:``, so strip the qualifier.
+        unqualified = comp_id.split(".", 1)[1] if "." in comp_id else comp_id
         lines.append(f"{category}:")
-        lines.append(f"  - platform: {comp_id}")
+        lines.append(f"  - platform: {unqualified}")
         indent = "    "
     else:
+        unqualified = comp_id
         lines.append(f"{comp_id}:")
         indent = "  "
 
     for key, value in fields.items():
         if key == "id" and not value:
-            value = _generate_id(comp_id, fields.get("name"))
+            value = _generate_id(unqualified, fields.get("name"))
         lines.extend(_emit_field(key, value, indent))
 
     return "\n".join(lines)
@@ -178,6 +208,64 @@ def generate_component_yaml(
 # ---------------------------------------------------------------------------
 # Internals
 # ---------------------------------------------------------------------------
+
+
+def _append_block(existing: str, block: str) -> str:
+    """Append *block* as a new top-level section, normalising spacing."""
+    base = existing.rstrip()
+    separator = "\n\n" if base else ""
+    return f"{base}{separator}{block}\n"
+
+
+def _splice_into_domain_block(existing: str, domain: str, block: str) -> str | None:
+    """
+    Insert the platform-list item from *block* under an existing ``<domain>:``.
+
+    Returns the merged YAML, or ``None`` when the existing file has no
+    ``<domain>:`` section (caller should fall back to appending). The
+    splice walks line-by-line: it locates the domain header, then finds
+    the first subsequent line that starts a new top-level key (column
+    zero, alphabetic) — everything in between is the existing block. The
+    new list item is inserted before that boundary, preserving any
+    trailing blank lines and content that follows.
+    """
+    block_lines = block.splitlines()
+    if len(block_lines) < 2 or block_lines[0].rstrip() != f"{domain}:":
+        return None
+    inner_lines = block_lines[1:]
+
+    file_lines = existing.splitlines(keepends=True)
+    header_re = re.compile(rf"^{re.escape(domain)}:\s*(?:#.*)?$")
+    domain_start: int | None = None
+    for idx, line in enumerate(file_lines):
+        if header_re.match(line.rstrip("\n\r")):
+            domain_start = idx
+            break
+    if domain_start is None:
+        return None
+
+    # Walk forward to find the first line that opens a new top-level
+    # block, or stop at EOF.
+    domain_end = len(file_lines)
+    for idx in range(domain_start + 1, len(file_lines)):
+        stripped = file_lines[idx].rstrip("\n\r")
+        if stripped and stripped[0].isalpha() and not stripped.startswith(" "):
+            domain_end = idx
+            break
+
+    # Trim trailing blank lines belonging to the domain block — we want
+    # the new item appended directly after the last content line, then
+    # the blank lines preserved before whatever comes next.
+    last_content = domain_end
+    while last_content > domain_start + 1 and not file_lines[last_content - 1].strip():
+        last_content -= 1
+
+    before = "".join(file_lines[:last_content])
+    after = "".join(file_lines[last_content:])
+    if before and not before.endswith("\n"):
+        before += "\n"
+    insertion = "\n".join(inner_lines) + "\n"
+    return before + insertion + after
 
 
 def _fill_template(template: str, fields: dict[str, Any]) -> str:

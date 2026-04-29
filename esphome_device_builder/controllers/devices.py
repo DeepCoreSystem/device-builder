@@ -22,7 +22,7 @@ from ..helpers.device_yaml import (
     generate_device_yaml,
     parse_platform_from_yaml,
 )
-from ..helpers.yaml import generate_component_yaml, rewrite_esphome_name
+from ..helpers.yaml import merge_component_yaml, rewrite_esphome_name
 from ..models import (
     AddComponentResponse,
     AdoptableDevice,
@@ -383,12 +383,10 @@ class DevicesController:
                 msg = f"Missing required field: {entry.key}"
                 raise ValueError(msg)
 
-        yaml_block = generate_component_yaml(component, fields)
-
         config_path = self._db.settings.rel_path(configuration)
         loop = asyncio.get_running_loop()
         existing = await loop.run_in_executor(None, config_path.read_text, "utf-8")
-        new_yaml = existing.rstrip() + "\n\n" + yaml_block + "\n"
+        new_yaml = merge_component_yaml(existing, component, fields)
         await loop.run_in_executor(None, config_path.write_text, new_yaml, "utf-8")
         await self._scanner.scan()
 
