@@ -339,28 +339,33 @@ CATEGORY_OVERRIDES: dict[str, str] = {
     "globals": "automation",
 }
 
-# Schema keys to skip (internal/inherited from base platform schemas)
+# Schema keys that are pure plumbing — never user-facing.
 SKIP_KEYS: set[str] = {
-    "id",
     "mqtt_id",
     "web_server",
     "setup_priority",
     "type_id",
-    # Base entity keys (inherited from platform type)
-    "name",
+    "device_id",  # MQTT internal
+    "zigbee_id",  # Zigbee internal
+}
+
+# Schema keys that are automation triggers (skip)
+AUTOMATION_KEY_PREFIXES = ("on_",)
+
+# Base entity / framework fields that are valid but rarely tweaked.
+# Surfaced in forms but collapsed under "Advanced" by default.
+ADVANCED_BASE_KEYS: set[str] = {
     "internal",
     "disabled_by_default",
     "entity_category",
-    "device_class",
     "state_class",
-    "unit_of_measurement",
     "accuracy_decimals",
     "force_update",
     "expire_after",
     "filters",
-    "icon",
-    # MQTT inherited keys
-    "device_id",
+    "interlock",
+    "interlock_wait_time",
+    # MQTT entity options
     "qos",
     "retain",
     "discovery",
@@ -368,13 +373,39 @@ SKIP_KEYS: set[str] = {
     "state_topic",
     "command_topic",
     "availability",
-    # Zigbee inherited keys
-    "zigbee_id",
+    # Zigbee entity options
     "zigbee_sensor",
+    "zigbee_switch",
+    "zigbee_binary_sensor",
+    "zigbee_button",
+    "zigbee_cover",
+    "zigbee_climate",
+    "zigbee_fan",
+    "zigbee_light",
+    "zigbee_lock",
+    "zigbee_number",
+    "zigbee_select",
+    "zigbee_text",
+    "zigbee_text_sensor",
 }
 
-# Schema keys that are automation triggers (skip)
-AUTOMATION_KEY_PREFIXES = ("on_",)
+# Fields important enough to always show without an "Advanced" toggle
+# even when they happen to be optional in the schema.
+IMPORTANT_KEYS: set[str] = {
+    "pin",
+    "id",
+    "name",
+    "platform",
+    "restore_mode",
+    "device_class",
+    "unit_of_measurement",
+    "icon",
+    "address",
+    "i2c_id",
+    "spi_id",
+    "uart_id",
+    "update_interval",
+}
 
 # Friendly names for well-known components
 COMPONENT_NAMES: dict[str, str] = {
@@ -788,6 +819,30 @@ def _is_sub_entity_schema(validator: Any) -> bool:
 _SECRET_KEY_FRAGMENTS = ("password", "passcode", "secret", "token", "api_key", "apikey")
 
 
+def _is_generate_id(key: Any) -> bool:
+    """
+    Detect a ``cv.GenerateID`` (or ``cv.declare_id``) voluptuous key.
+
+    Matches by class name to avoid importing the private symbol.
+    """
+    return type(key).__name__ in ("GenerateID", "DeclareID")
+
+
+def _build_id_entry(key_name: str, key: Any) -> dict:
+    """Build the config entry for an auto-generated component ID."""
+    return {
+        "key": key_name,
+        "type": "id",
+        "label": _key_to_label(key_name),
+        "required": False,
+        "default_value": None,
+        "options": None,
+        "range": None,
+        "advanced": False,  # important: users may want to set this
+        "translation_key": f"component.config.{key_name}",
+    }
+
+
 def _build_entry(key: Any, validator: Any) -> dict | None:
     """
     Build a single config-entry dict.
@@ -815,6 +870,8 @@ def _build_entry(key: Any, validator: Any) -> dict | None:
     if info.get("range_min") is not None or info.get("range_max") is not None:
         range_val = [info.get("range_min"), info.get("range_max")]
 
+    advanced = _classify_advanced(key_name, required)
+
     entry: dict[str, Any] = {
         "key": key_name,
         "type": entry_type,
@@ -823,7 +880,7 @@ def _build_entry(key: Any, validator: Any) -> dict | None:
         "default_value": default if not callable(default) else None,
         "options": info.get("options"),
         "range": range_val,
-        "advanced": not required,
+        "advanced": advanced,
         "translation_key": f"component.config.{key_name}",
     }
 
@@ -831,6 +888,23 @@ def _build_entry(key: Any, validator: Any) -> dict | None:
         entry["templatable"] = True
 
     return entry
+
+
+def _classify_advanced(key_name: str, required: bool) -> bool:
+    """
+    Decide whether a config entry should be hidden under "Advanced".
+
+    Required fields and those in IMPORTANT_KEYS always render at the
+    top level. ADVANCED_BASE_KEYS always render as advanced. Anything
+    else falls back to "advanced when optional".
+    """
+    if required:
+        return False
+    if key_name in IMPORTANT_KEYS:
+        return False
+    if key_name in ADVANCED_BASE_KEYS:
+        return True
+    return True
 
 
 def _unwrap_schema(schema: Any) -> dict | None:
@@ -868,18 +942,23 @@ def _parse_schema(schema: Any, component_id: str) -> tuple[list[dict], list[dict
     for key, validator in schema_dict.items():
         key_name = _key_name(key)
 
-        # Skip internal/inherited keys
+        # Skip internal-only keys and automation triggers
         if key_name in SKIP_KEYS:
             continue
         if any(key_name.startswith(p) for p in AUTOMATION_KEY_PREFIXES):
-            continue
-        # Skip GenerateID
-        if hasattr(key, "schema") and callable(getattr(key.schema, "__func__", None)):
             continue
 
         # Sub-entry (e.g. DHT's temperature/humidity readings)
         if _is_sub_entity_schema(validator):
             sub_entries.append(_build_sub_entry(key_name, validator))
+            continue
+
+        # GenerateID keys (the "id" field on most components) appear
+        # as keys whose .schema is a callable function. Surface them as
+        # a regular ID-typed entry — users can pick their own id, or
+        # the frontend can derive one from the device name.
+        if _is_generate_id(key):
+            entries.append(_build_id_entry(key_name, key))
             continue
 
         entry = _build_entry(key, validator)
@@ -906,6 +985,11 @@ def _build_sub_entry(key_name: str, validator: Any) -> dict:
     for sk, sv in validator.schema.items():
         sk_name = _key_name(sk)
         if sk_name in SKIP_KEYS:
+            continue
+        if any(sk_name.startswith(p) for p in AUTOMATION_KEY_PREFIXES):
+            continue
+        if _is_generate_id(sk):
+            inner_entries.append(_build_id_entry(sk_name, sk))
             continue
         entry = _build_entry(sk, sv)
         if entry is not None:
@@ -1030,6 +1114,10 @@ def _build_unified_platform_component(
                         key_name.startswith(p) for p in AUTOMATION_KEY_PREFIXES
                     ):
                         continue
+                    if _is_generate_id(key):
+                        common_entries.append(_build_id_entry(key_name, key))
+                        seen_keys.add(key_name)
+                        continue
                     entry = _build_entry(key, validator)
                     if entry is not None:
                         common_entries.append(entry)
@@ -1064,6 +1152,12 @@ def _build_unified_platform_component(
                 continue
             if key_name in seen_keys:
                 continue  # already covered by base schema or platform itself
+            if _is_generate_id(key):
+                id_entry = _build_id_entry(key_name, key)
+                id_entry["depends_on"] = "platform"
+                id_entry["depends_on_value"] = platform_name
+                config_entries.append(id_entry)
+                continue
             entry = _build_entry(key, validator)
             if entry is None:
                 continue
