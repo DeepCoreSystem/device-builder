@@ -82,13 +82,14 @@ _MD_BOLD_ITALIC = re_module.compile(r"(\*\*|__|\*|_)([^*_\n]+)\1")
 _HTML_TAG = re_module.compile(r"<[^>]+>")
 
 
-def _build_doc_meta(mdx_file: Path, category: str) -> dict[str, str]:
+def _build_doc_meta(mdx_file: Path, category: str) -> dict[str, Any]:
     """
     Read a single MDX file and produce its docs-metadata entry.
 
     Combines frontmatter (title, description) with a body-prose
     fallback when the frontmatter description is empty or just
-    boilerplate.
+    boilerplate, and a ``field_descriptions`` map extracted from the
+    ``## Configuration variables`` section.
     """
     content = mdx_file.read_text(errors="ignore")
     fm = _parse_mdx_frontmatter(content)
@@ -96,7 +97,6 @@ def _build_doc_meta(mdx_file: Path, category: str) -> dict[str, str]:
 
     description = fm.get("description", "").strip()
     body_intro = _extract_body_intro(content)
-    # Prefer the body intro when frontmatter is empty / boilerplate-only.
     if not description or description.lower().startswith("instructions for "):
         description = body_intro or description
 
@@ -105,6 +105,7 @@ def _build_doc_meta(mdx_file: Path, category: str) -> dict[str, str]:
         "description": description,
         "image_file": image,
         "category": category,
+        "field_descriptions": _extract_field_descriptions(content),
     }
 
 
@@ -178,6 +179,114 @@ def _flatten_markdown(text: str) -> str:
     return re_module.sub(r"\s+", " ", text).strip()
 
 
+# Top-level bullet introducing a config variable:
+#   - **field_name** (Required, type): Description goes here
+_CONFIG_VAR_LINE = re_module.compile(
+    r"^- \*\*(?P<name>[A-Za-z_][A-Za-z0-9_]*)\*\*[^:\n]*?:\s*(?P<desc>.*)$"
+)
+
+
+def _extract_field_descriptions(mdx_content: str) -> dict[str, str]:
+    """
+    Parse the ``## Configuration variables`` section into ``{key: description}``.
+
+    The section uses a markdown bullet list where each top-level
+    bullet starts with ``- **field_name** (...): description``. We
+    capture the description text — including continuation lines from
+    indented prose, but excluding nested sub-bullets (those describe
+    sub-fields and would clutter the tooltip).
+    """
+    body = re_module.sub(
+        r"^---\s*\n.*?\n---\s*\n", "", mdx_content, count=1, flags=re_module.DOTALL
+    )
+
+    # Two header styles in the wild:
+    #   - "## Configuration variables" (most component pages)
+    #   - "Configuration variables:" as plain prose (some base / platform pages)
+    section_re = re_module.compile(
+        r"^(?:##\s+Configuration variables\s*|Configuration variables:\s*)\n"
+        r"(.*?)(?=^##\s|\Z)",
+        re_module.MULTILINE | re_module.DOTALL,
+    )
+    match = section_re.search(body)
+    if not match:
+        return {}
+
+    descriptions: dict[str, str] = {}
+    current_key: str | None = None
+    current_parts: list[str] = []
+    section = match.group(1)
+
+    def _commit() -> None:
+        if current_key is None:
+            return
+        text = " ".join(p for p in current_parts if p)
+        text = _flatten_markdown(text).rstrip(" .,:") + (
+            "." if text and text[-1] not in ".!?" else ""
+        )
+        if text:
+            descriptions[current_key] = text
+
+    for raw_line in section.splitlines():
+        line = raw_line.rstrip()
+        # New top-level bullet → commit previous, start new
+        m = _CONFIG_VAR_LINE.match(line)
+        if m:
+            _commit()
+            current_key = m.group("name")
+            initial = m.group("desc").strip()
+            current_parts = [initial] if initial else []
+            continue
+        if current_key is None:
+            continue
+        stripped = line.strip()
+        # Block-quotes / GitHub alerts (`> [!NOTE]`, `> ...`) end the
+        # description for the current field — they're side notes, not
+        # part of the field's own help text.
+        if stripped.startswith(">"):
+            _commit()
+            current_key = None
+            current_parts = []
+            continue
+        # Sub-bullets describe sub-fields and would clutter the tooltip.
+        if stripped.startswith(("- ", "* ", "+ ")):
+            continue
+        if stripped:
+            current_parts.append(stripped)
+
+    _commit()
+    return descriptions
+
+
+def _attach_description(entry: dict, field_descriptions: dict[str, str]) -> None:
+    """Set ``entry['description']`` from the docs map when the key is known."""
+    desc = field_descriptions.get(entry["key"])
+    if desc:
+        entry["description"] = desc
+
+
+def _merge_field_descriptions(
+    docs: dict[str, dict[str, Any]],
+    base_platform: str,
+    overrides: dict[str, str],
+) -> dict[str, str]:
+    """
+    Combine the base platform's field descriptions with platform-specific overrides.
+
+    ``sensor/index.mdx`` documents the common entity fields (name, id,
+    device_class, state_class, ...). Platform-specific docs typically
+    only re-document the platform's own fields. Merging the two means
+    a ``sensor.template`` form has tooltips for both ``name`` (from
+    sensor base) and the template-specific fields (from template).
+    Platform-specific entries win on conflict.
+    """
+    base_docs = docs.get(base_platform, {})
+    base_descriptions: dict[str, str] = base_docs.get("field_descriptions") or {}
+    merged = dict(base_descriptions)
+    merged.update(overrides)
+    return merged
+
+
 def _parse_first_image(mdx_content: str) -> str | None:
     """Extract the first image filename from MDX content."""
     # Pattern 1: ES module import — import x from './images/foo.jpg';
@@ -248,25 +357,36 @@ def fetch_docs_metadata() -> dict[str, dict[str, str]]:
     for mdx_file in components_dir.glob("*.mdx"):
         metadata[mdx_file.stem] = _build_doc_meta(mdx_file, "")
 
-    # Category subdirectories. We always store per-domain entries under
-    # the qualified key `<domain>.<id>` (e.g. ``sensor.template``) so
-    # multi-platform components like ``template`` get distinct docs per
-    # domain. We also populate the unqualified key `<id>` with the FIRST
-    # encountered entry — for components that exist in only one domain
-    # (most of them) the short key keeps lookups simple. Top-level
-    # `<id>.mdx` always wins over per-category docs of the same stem.
+    # Pass 1: every `<dir>/index.mdx` documents the directory's own
+    # platform-component (sensor/index.mdx → "Sensor Component",
+    # ota/index.mdx → "Over-the-Air Updates"). These claim the
+    # unqualified key for their directory before any other per-category
+    # file gets a chance to.
+    for cat_dir in sorted(components_dir.iterdir()):
+        if not cat_dir.is_dir() or cat_dir.name == "images":
+            continue
+        index_mdx = cat_dir / "index.mdx"
+        if not index_mdx.exists():
+            continue
+        doc_meta = _build_doc_meta(index_mdx, cat_dir.name)
+        metadata[cat_dir.name] = doc_meta
+        metadata[f"{cat_dir.name}.{cat_dir.name}"] = doc_meta
+
+    # Pass 2: regular per-category .mdx files. Always store under the
+    # qualified key `<domain>.<id>` (so multi-platform components like
+    # ``template`` get distinct docs per domain). Also populate the
+    # unqualified key `<id>` for the FIRST encountered entry — for
+    # components that exist in only one domain the short key keeps
+    # lookups simple. Top-level docs and `<dir>/index.mdx` always win.
     for cat_dir in sorted(components_dir.iterdir()):
         if not cat_dir.is_dir() or cat_dir.name == "images":
             continue
         cat_name = cat_dir.name
-        mdx_files = list(cat_dir.glob("*.mdx"))
+        mdx_files = [m for m in cat_dir.glob("*.mdx") if m.stem != "index"]
         if mdx_files:
             print(f"  {cat_name}: {len(mdx_files)} docs")
         for mdx_file in mdx_files:
-            # `<dir>/index.mdx` documents the platform-component itself
-            # (e.g. ota/index.mdx → ota). Use the directory name in that
-            # case so we can resolve docs for unified entries like ota/time.
-            stem = cat_name if mdx_file.stem == "index" else mdx_file.stem
+            stem = mdx_file.stem
             doc_meta = _build_doc_meta(mdx_file, cat_name)
             qualified_key = f"{cat_name}.{stem}"
             metadata[qualified_key] = doc_meta
@@ -913,11 +1033,12 @@ def _classify_advanced(key_name: str, required: bool) -> bool:
 
 
 def _unwrap_schema(schema: Any) -> dict | None:
-    """Find the dict schema buried inside vol.All / vol.Schema wrappers.
+    """
+    Find the dict schema buried inside vol.All / vol.Schema wrappers.
 
-    ESPHome wraps many CONFIG_SCHEMAs in `cv.All(...)` for chained validation
-    (e.g. version checks, post-processing). The actual key-validator mapping
-    lives inside one of the wrapped validators.
+    ESPHome wraps many CONFIG_SCHEMAs in ``cv.All(...)`` for chained
+    validation (version checks, post-processing). The actual
+    key-validator mapping lives inside one of the wrapped validators.
     """
     if isinstance(schema, dict):
         return schema
@@ -932,11 +1053,62 @@ def _unwrap_schema(schema: Any) -> dict | None:
     return None
 
 
-def _parse_schema(schema: Any, component_id: str) -> tuple[list[dict], list[dict]]:
-    """Parse a CONFIG_SCHEMA into config entries and sub-entries.
-
-    Returns (config_entries, sub_entries).
+def _unwrap_typed_schema(validator: Any) -> dict[str, Any] | None:
     """
+    Find a ``cv.typed_schema`` dict inside *validator*.
+
+    Components like ``output.template``, ``datetime.template`` and many
+    BLE-client platforms use ``cv.typed_schema({type_value: sub_schema,
+    ...})`` to discriminate on a ``type:`` field. The wrapper function
+    has ``typed_schema`` in its ``__qualname__`` and stores the dict in
+    its closure. Returns the discriminator dict or None when not found.
+    """
+    candidates: list[Any] = []
+    if isinstance(validator, vol.All):
+        candidates.extend(validator.validators)
+    else:
+        candidates.append(validator)
+
+    for candidate in candidates:
+        qualname = getattr(candidate, "__qualname__", "") or ""
+        if "typed_schema" not in qualname:
+            continue
+        closure = getattr(candidate, "__closure__", None)
+        if not closure:
+            continue
+        for cell in closure:
+            try:
+                value = cell.cell_contents
+            except (ValueError, TypeError):
+                continue
+            if (
+                isinstance(value, dict)
+                and value
+                and all(_unwrap_schema(v) is not None for v in value.values())
+            ):
+                return value
+    return None
+
+
+def _parse_schema(
+    schema: Any,
+    component_id: str,
+    field_descriptions: dict[str, str] | None = None,
+) -> tuple[list[dict], list[dict]]:
+    """
+    Parse a CONFIG_SCHEMA into config entries and sub-entries.
+
+    *field_descriptions* maps key-names to per-field help text pulled
+    from the component docs. When given, it populates the
+    ``description`` of each entry so the frontend can render an info
+    tooltip per field.
+    """
+    field_descriptions = field_descriptions or {}
+
+    typed_dict = _unwrap_typed_schema(schema)
+    if typed_dict is not None:
+        return _parse_typed_schema(typed_dict, component_id, field_descriptions), []
+
     entries: list[dict] = []
     sub_entries: list[dict] = []
 
@@ -947,7 +1119,6 @@ def _parse_schema(schema: Any, component_id: str) -> tuple[list[dict], list[dict
     for key, validator in schema_dict.items():
         key_name = _key_name(key)
 
-        # Skip internal-only keys and automation triggers
         if key_name in SKIP_KEYS:
             continue
         if any(key_name.startswith(p) for p in AUTOMATION_KEY_PREFIXES):
@@ -955,26 +1126,122 @@ def _parse_schema(schema: Any, component_id: str) -> tuple[list[dict], list[dict
 
         # Sub-entry (e.g. DHT's temperature/humidity readings)
         if _is_sub_entity_schema(validator):
-            sub_entries.append(_build_sub_entry(key_name, validator))
+            sub_entries.append(_build_sub_entry(key_name, validator, field_descriptions))
             continue
 
-        # GenerateID keys (the "id" field on most components) appear
-        # as keys whose .schema is a callable function. Surface them as
-        # a regular ID-typed entry — users can pick their own id, or
-        # the frontend can derive one from the device name.
         if _is_generate_id(key):
-            entries.append(_build_id_entry(key_name, key))
+            entry = _build_id_entry(key_name, key)
+            _attach_description(entry, field_descriptions)
+            entries.append(entry)
             continue
 
         entry = _build_entry(key, validator)
         if entry is not None:
+            _attach_description(entry, field_descriptions)
             entries.append(entry)
 
     return entries, sub_entries
 
 
-def _build_sub_entry(key_name: str, validator: Any) -> dict:
+def _parse_typed_schema(
+    typed_dict: dict[str, Any],
+    component_id: str,
+    field_descriptions: dict[str, str],
+) -> list[dict]:
+    """
+    Expand a ``cv.typed_schema`` into a flat list with a ``type`` discriminator.
+
+    The first entry is a SELECT-style ``type`` field with one option
+    per type-key in the typed_schema. Fields shared across every
+    type-key are emitted unconditionally; type-specific fields are
+    gated with ``depends_on=type, depends_on_value=<key>``.
+    """
+    type_options = sorted(typed_dict.keys())
+    entries: list[dict] = [
+        {
+            "key": "type",
+            "type": "string",
+            "label": "Type",
+            "required": True,
+            "default_value": None,
+            "options": type_options,
+            "range": None,
+            "advanced": False,
+            "translation_key": "component.config.type",
+            "description": field_descriptions.get("type"),
+        }
+    ]
+
+    # Walk each sub-schema once, capturing key→entry per type
+    per_type: dict[str, dict[str, dict]] = {}
+    for type_value, sub_schema in typed_dict.items():
+        sub_dict = _unwrap_schema(sub_schema)
+        if sub_dict is None:
+            per_type[type_value] = {}
+            continue
+        per_type[type_value] = _parse_subdict_to_map(sub_dict)
+
+    # A field is "common" when present in every type with the same
+    # serialised representation — emit those unconditionally.
+    common: dict[str, dict] = {}
+    if per_type:
+        all_keys = (
+            set.intersection(*(set(m.keys()) for m in per_type.values())) if per_type else set()
+        )
+        for key_name in all_keys:
+            sample = next(iter(per_type.values()))[key_name]
+            if all(per_type[t].get(key_name) == sample for t in per_type):
+                common[key_name] = sample
+    for entry in common.values():
+        e = dict(entry)
+        _attach_description(e, field_descriptions)
+        entries.append(e)
+
+    # Type-specific fields gated by depends_on
+    for type_value, by_key in per_type.items():
+        for key_name, entry in by_key.items():
+            if key_name in common:
+                continue
+            e = dict(entry)
+            e["depends_on"] = "type"
+            e["depends_on_value"] = type_value
+            _attach_description(e, field_descriptions)
+            entries.append(e)
+
+    return entries
+
+
+def _parse_subdict_to_map(schema_dict: dict) -> dict[str, dict]:
+    """
+    Build a ``{key_name: entry_dict}`` map from a raw schema dict.
+
+    Used by typed-schema expansion to compare per-type field shapes.
+    Skipped keys / automation prefixes / unrecognised validators are
+    omitted so the comparison only sees real, surfaced fields.
+    """
+    result: dict[str, dict] = {}
+    for key, validator in schema_dict.items():
+        key_name = _key_name(key)
+        if key_name in SKIP_KEYS:
+            continue
+        if any(key_name.startswith(p) for p in AUTOMATION_KEY_PREFIXES):
+            continue
+        if _is_generate_id(key):
+            result[key_name] = _build_id_entry(key_name, key)
+            continue
+        entry = _build_entry(key, validator)
+        if entry is not None:
+            result[key_name] = entry
+    return result
+
+
+def _build_sub_entry(
+    key_name: str,
+    validator: Any,
+    field_descriptions: dict[str, str] | None = None,
+) -> dict:
     """Build a sub-entry dict from a sub-schema validator."""
+    field_descriptions = field_descriptions or {}
     schema_keys = {_key_name(k) for k in validator.schema}
     platform_type = "sensor"
     if "brightness" in schema_keys or "color_mode" in schema_keys:
@@ -994,10 +1261,13 @@ def _build_sub_entry(key_name: str, validator: Any) -> dict:
         if any(sk_name.startswith(p) for p in AUTOMATION_KEY_PREFIXES):
             continue
         if _is_generate_id(sk):
-            inner_entries.append(_build_id_entry(sk_name, sk))
+            entry = _build_id_entry(sk_name, sk)
+            _attach_description(entry, field_descriptions)
+            inner_entries.append(entry)
             continue
         entry = _build_entry(sk, sv)
         if entry is not None:
+            _attach_description(entry, field_descriptions)
             inner_entries.append(entry)
 
     return {
@@ -1288,23 +1558,27 @@ def _build_component_entry(
     comp_docs = _resolve_docs(component_id, docs)
     name = _generate_name(component_id, category, comp_docs)
     description = _clean_description(comp_docs.get("description", ""))
+    field_descriptions = dict(comp_docs.get("field_descriptions") or {})
 
     config_entries: list[dict] = []
     sub_entries: list[dict] = []
     if schema is not None:
         try:
-            config_entries, sub_entries = _parse_schema(schema, component_id)
+            config_entries, sub_entries = _parse_schema(schema, component_id, field_descriptions)
         except Exception as exc:
             _LOGGER.warning("Failed to parse schema for %s: %s", component_id, exc)
     elif platforms:
         # Single-platform component with no own schema — surface its
         # platform schema under the short id (e.g. dht as `dht`).
         primary = _primary_platform(platforms)
+        # Inherit base-platform field descriptions so common entity
+        # fields (name, id, device_class, ...) carry tooltips.
+        merged = _merge_field_descriptions(docs, primary, field_descriptions)
         try:
             platform_manifest = get_platform(primary, component_id)
             if platform_manifest and platform_manifest.config_schema:
                 config_entries, sub_entries = _parse_schema(
-                    platform_manifest.config_schema, component_id
+                    platform_manifest.config_schema, component_id, merged
                 )
         except Exception as exc:
             _LOGGER.warning("Failed to parse schema for %s/%s: %s", primary, component_id, exc)
@@ -1350,6 +1624,9 @@ def _build_platform_entry(
 
     qualified_id = f"{platform_name}.{component_id}"
     qualified_docs = docs.get(qualified_id) or _resolve_docs(component_id, docs)
+    field_descriptions = _merge_field_descriptions(
+        docs, platform_name, qualified_docs.get("field_descriptions") or {}
+    )
     domain_label = platform_name.replace("_", " ").title()
     title = qualified_docs.get("title", "")
     if title:
@@ -1360,7 +1637,9 @@ def _build_platform_entry(
     description = _clean_description(qualified_docs.get("description", ""))
 
     try:
-        config_entries, sub_entries = _parse_schema(platform_manifest.config_schema, component_id)
+        config_entries, sub_entries = _parse_schema(
+            platform_manifest.config_schema, component_id, field_descriptions
+        )
     except Exception as exc:
         _LOGGER.warning("Failed to parse %s.%s schema: %s", platform_name, component_id, exc)
         return None
