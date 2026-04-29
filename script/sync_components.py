@@ -901,22 +901,16 @@ def _identify_from_closure(validator: Any, name_lower: str) -> dict[str, Any] | 
         return None
 
     # Enum mapping {label: value} → drop-down with primitive value type.
-    # An empty string is sometimes used as the "none" value (e.g.
-    # sensor state_class). Surface it with a friendly label so the
-    # frontend doesn't render a blank dropdown row.
+    # Always emit options as ConfigValueOption-shaped dicts so the
+    # JSON contract is uniform. Empty-string values get a friendly
+    # "(none)" label so the frontend doesn't render a blank row.
     for cell in closure:
         try:
             val = cell.cell_contents
         except (ValueError, TypeError):
             continue
         if isinstance(val, dict) and val and all(isinstance(k, str) for k in val):
-            options: list[str | dict[str, str]] = []
-            for option_value in val:
-                if option_value == "":
-                    options.append({"label": "(none)", "value": ""})
-                else:
-                    options.append(option_value)
-            return {"type": "string", "options": options}
+            return {"type": "string", "options": [_make_option(k) for k in val]}
 
     # Numeric range
     if "int_range" in name_lower or "float_range" in name_lower:
@@ -1102,6 +1096,19 @@ def _sort_entries(entries: list[dict]) -> list[dict]:
     return [entry for _idx, entry in sorted(enumerate(entries), key=sort_key)]
 
 
+def _make_option(value: str) -> dict[str, str]:
+    """
+    Build a ``ConfigValueOption``-shaped dict for a SELECT option.
+
+    Empty-string values get a ``"(none)"`` label so the frontend
+    renders a meaningful row; everything else uses the value as both
+    the label and the YAML-serialised value.
+    """
+    if value == "":
+        return {"label": "(none)", "value": ""}
+    return {"label": value, "value": value}
+
+
 def _classify_advanced(key_name: str, required: bool) -> bool:
     """
     Decide whether a config entry should be hidden under "Advanced".
@@ -1243,7 +1250,7 @@ def _parse_typed_schema(
     type-key are emitted unconditionally; type-specific fields are
     gated with ``depends_on=type, depends_on_value=<key>``.
     """
-    type_options = sorted(typed_dict.keys())
+    type_options = [_make_option(k) for k in sorted(typed_dict.keys())]
     entries: list[dict] = [
         {
             "key": "type",
@@ -1485,7 +1492,7 @@ def _build_unified_platform_component(
                         common_entries.append(entry)
                         seen_keys.add(key_name)
 
-    platform_options = sorted(p for p, _ in providers)
+    platform_options = [_make_option(p) for p in sorted(p for p, _ in providers)]
     config_entries: list[dict] = [
         {
             "key": "platform",
