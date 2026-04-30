@@ -111,9 +111,9 @@ _PLATFORM_DOMAINS: frozenset[str] = frozenset(
     }
 )
 
-# Plain top-level keys we don't want to surface as user-facing components
-# (build-system internals, deprecated wrappers, etc.).
-_HIDDEN_TOP_LEVEL: frozenset[str] = frozenset({"core", "esphome.ota"})
+# Plain top-level keys we don't want to surface as user-facing components.
+# ``core`` is the indexing-only metadata block in esphome.json.
+_HIDDEN_TOP_LEVEL: frozenset[str] = frozenset({"core"})
 
 # Map prebuilt-schema ``type`` strings to our ConfigEntryType enum.
 # Things not in this table fall through to STRING.
@@ -521,8 +521,6 @@ def build_catalog(
     image_map = load_image_map()
     out: list[dict] = []
     for path in iter_schema_files(schema_dir):
-        if path.name == "esphome.json":
-            continue
         try:
             entries = build_entries_from_file(path, index, schema_dir, image_map)
         except Exception:
@@ -646,11 +644,13 @@ def build_component_entry(
     docs = clean_docs(meta.get("docs"))
     dependencies = list(meta.get("dependencies") or [])
 
-    # Narrow esphome introspection — adds multi_conf, platform_defaults
-    # and supported_platforms which the schema bundle doesn't surface.
-    # No-ops when esphome isn't importable.
+    # Narrow esphome introspection — adds multi_conf, platform_defaults,
+    # supported_platforms, and refined types (boolean/float/...) the
+    # schema bundle doesn't surface. No-ops when esphome isn't
+    # importable.
     introspection = introspect_component(stem if domain else top_key)
     _apply_platform_defaults(config_entries, introspection.get("platform_defaults") or {})
+    _apply_refined_types(config_entries, introspection.get("refined_types") or {})
 
     return {
         "id": component_id,
@@ -769,15 +769,17 @@ def _convert_field(key: str, raw: dict, schema_dir: Path) -> dict | None:
     # Required vs Optional vs GeneratedID
     schema_key = raw.get("key")
     required = schema_key == "Required"
-    is_generated_id = schema_key == "GeneratedID"
 
     schema_type = raw.get("type")
     inner_schema = raw.get("schema")
     data_type = raw.get("data_type")
 
-    # GeneratedID is always a (mostly-hidden) ID field.
-    if is_generated_id:
-        return _build_id_entry(key, raw)
+    # Own-id fields ⇒ always rendered as a free-form id input. The
+    # ``key: GeneratedID`` form auto-generates and stays under
+    # "Advanced"; the ``key: Required`` + ``id_type`` form is a
+    # required user-supplied id (e.g. ``output.gpio.id``).
+    if _is_own_id_field(raw):
+        return _build_id_entry(key, raw, required=required)
 
     # Resolve the entry type. Priority: explicit type → data_type
     # → enum shape → extends → docs hints → default-value hints → string.
@@ -888,19 +890,23 @@ def _convert_field(key: str, raw: dict, schema_dir: Path) -> dict | None:
     return entry
 
 
-def _build_id_entry(key: str, raw: dict) -> dict:
-    """Build a ConfigEntry for a ``GeneratedID`` field.
+def _build_id_entry(key: str, raw: dict, *, required: bool = False) -> dict:
+    """Build a ConfigEntry for an own-id field.
 
-    These render as advanced ID inputs — most users let ESPHome derive
-    the id, but power-users want to set one for cross-references.
+    Auto-generated ids (``key: GeneratedID``) stay flagged advanced —
+    most users let ESPHome derive them. Required / Optional ids
+    (``key: Required`` with ``id_type``) stay on the main form because
+    the user has to supply them. ``references_component`` is never set:
+    own ids are free-form names, not references to other components.
     """
     docs = clean_docs(raw.get("docs"))
+    is_generated = raw.get("key") == "GeneratedID"
     return {
         "key": key,
         "type": "id",
         "label": _key_to_label(key),
         "description": docs.text or None,
-        "required": False,
+        "required": required,
         "default_value": None,
         "options": None,
         "allow_custom_value": False,
@@ -914,7 +920,7 @@ def _build_id_entry(key: str, raw: dict) -> dict:
         "references_component": None,
         "pin_features": [],
         "pin_mode": None,
-        "advanced": True,
+        "advanced": is_generated and not required,
         "hidden": False,
         "help_link": docs.url,
         "translation_key": None,
@@ -953,20 +959,33 @@ def _coerce_default(value: Any) -> Any:
 def _resolve_use_id_reference(raw: dict) -> str | None:
     """Map ``use_id_type: 'ns::Class'`` to a component domain.
 
-    Returns the namespace (with the ``switch_`` trailing-underscore
-    quirk patched), which matches the catalog's component domain ids.
+    ``use_id_type`` is the schema's marker for *cross-references* —
+    fields like ``i2c_id`` that point at another component instance.
+    Do NOT confuse with ``id_type``, which describes the type of id
+    this field *creates* (its own id) — those are free-form strings,
+    not references.
     """
-    namespace = None
     use_id_type = raw.get("use_id_type")
-    if isinstance(use_id_type, str) and "::" in use_id_type:
-        namespace = use_id_type.split("::", 1)[0]
-    elif isinstance(raw.get("id_type"), dict):
-        cls = raw["id_type"].get("class") or ""
-        if "::" in cls:
-            namespace = cls.split("::", 1)[0]
-    if not namespace:
+    if not isinstance(use_id_type, str) or "::" not in use_id_type:
         return None
+    namespace = use_id_type.split("::", 1)[0]
     return _USE_ID_NAMESPACE_OVERRIDES.get(namespace, namespace)
+
+
+def _is_own_id_field(raw: dict) -> bool:
+    """Return True iff this field defines the component's own id.
+
+    Two shapes signal an own-id:
+      - ``key: "GeneratedID"`` — auto-generated id (rare to set manually)
+      - ``id_type: { class: ... }`` without ``use_id_type`` — required
+        or optional id field whose type the schema knows but which is
+        still the *component's own* identifier, not a reference.
+    """
+    if raw.get("key") == "GeneratedID":
+        return True
+    if isinstance(raw.get("id_type"), dict) and "use_id_type" not in raw:
+        return True
+    return False
 
 
 def _resolve_pin_features(raw: dict) -> list[str]:
@@ -1271,7 +1290,7 @@ _TARGET_PLATFORMS: frozenset[str] = frozenset(
 
 
 def introspect_component(component_id: str) -> dict[str, Any]:
-    """Return ``{multi_conf, platform_defaults, supported_platforms}``.
+    """Return ``{multi_conf, platform_defaults, supported_platforms, refined_types}``.
 
     Best-effort: returns an empty dict when ``esphome`` isn't importable
     or the component module can't be loaded.
@@ -1292,6 +1311,7 @@ def introspect_component(component_id: str) -> dict[str, Any]:
         "multi_conf": bool(getattr(manifest, "multi_conf", False)),
         "is_target_platform": bool(getattr(manifest, "is_target_platform", False)),
         "platform_defaults": _collect_platform_defaults(manifest),
+        "refined_types": _collect_refined_types(manifest),
     }
 
 
@@ -1465,6 +1485,142 @@ def _collect_platform_defaults(manifest: Any) -> dict[tuple[str, ...], dict[str,
     except Exception:
         return {}
     return out
+
+
+def _collect_refined_types(manifest: Any) -> dict[tuple[str, ...], str]:
+    """Walk the live ``CONFIG_SCHEMA`` to recover types the schema lost.
+
+    The pre-built schema collapses many ``cv.boolean`` / ``cv.float_`` /
+    ``cv.icon`` / ``cv.lambda_`` validators into bare strings. By
+    inspecting the actual voluptuous validators we can promote those
+    fields back to the right type. Returns ``{key_path: type_name}``.
+    """
+    schema = getattr(manifest, "config_schema", None)
+    if schema is None:
+        return {}
+    try:
+        from esphome import config_validation as cv
+    except Exception:
+        return {}
+
+    # Map runtime validator identities / names to our type strings. The
+    # schema bundle already gets ``cv.string`` and ``cv.int_`` right via
+    # explicit ``type:`` markers; we focus on the cases where the
+    # bundle silently emits no type at all. Identity is keyed by
+    # ``id()`` because some voluptuous validators (notably _Schema
+    # subclasses) override __hash__ to be unhashable.
+    by_identity: dict[int, str] = {}
+    by_name: dict[str, str] = {}
+
+    def add(name: str, type_str: str, *attrs: str) -> None:
+        by_name[name] = type_str
+        for a in attrs:
+            obj = getattr(cv, a, None)
+            if obj is not None:
+                by_identity[id(obj)] = type_str
+
+    add("boolean", "boolean", "boolean")
+    add("float_", "float", "float_", "positive_float", "negative_float")
+    add("float_range", "float", "float_range")
+    add("frequency", "float", "frequency")
+    add("icon", "icon", "icon")
+    add("lambda_", "lambda", "lambda_")
+    add("returning_lambda", "lambda", "returning_lambda")
+    add("mac_address", "mac_address", "mac_address")
+    add("color_temperature", "string", "color_temperature")
+
+    out: dict[tuple[str, ...], str] = {}
+    visited: set[int] = set()
+
+    def unwrap_to_dict(node: Any) -> dict | None:
+        for _ in range(8):
+            if isinstance(node, dict):
+                return node
+            if hasattr(node, "schema"):
+                node = node.schema
+                continue
+            inner = getattr(node, "validators", None)
+            if inner:
+                next_node = None
+                for v in inner:
+                    if isinstance(v, dict) or hasattr(v, "schema"):
+                        next_node = v
+                        break
+                if next_node is None:
+                    return None
+                node = next_node
+                continue
+            return None
+        return None
+
+    def classify(validator: Any) -> str | None:
+        if id(validator) in by_identity:
+            return by_identity[id(validator)]
+        # Some validators are wrapped (vol.All chains or partials);
+        # peel down to find the inner.
+        inner = getattr(validator, "validators", None)
+        if inner:
+            for v in inner:
+                t = classify(v)
+                if t is not None:
+                    return t
+        # Fall back to name-based matching for closures and partials
+        # that lose identity but keep the name.
+        name = (
+            getattr(validator, "__name__", None) or getattr(validator, "__qualname__", None) or ""
+        ).lower()
+        for k, t in by_name.items():
+            if k in name:
+                return t
+        return None
+
+    def walk(node: Any, path: tuple[str, ...], depth: int) -> None:
+        if depth > 6:
+            return
+        candidate = unwrap_to_dict(node)
+        if candidate is None:
+            return
+        if id(candidate) in visited:
+            return
+        visited.add(id(candidate))
+        for key, val in candidate.items():
+            key_name = key.schema if hasattr(key, "schema") else str(key)
+            sub_path = (*path, key_name)
+            t = classify(val)
+            if t is not None:
+                out[sub_path] = t
+            walk(val, sub_path, depth + 1)
+
+    try:
+        walk(schema, (), 0)
+    except Exception:
+        return {}
+    return out
+
+
+def _apply_refined_types(
+    entries: list[dict],
+    refined: dict[tuple[str, ...], str],
+) -> None:
+    """Promote entry types from string → boolean/float/... where known.
+
+    Only acts on entries currently typed ``string`` so we don't
+    override the schema's explicit type assignments.
+    """
+    if not refined:
+        return
+
+    def walk(items: list[dict], path: tuple[str, ...]) -> None:
+        for entry in items:
+            sub_path = (*path, entry["key"])
+            new_type = refined.get(sub_path)
+            if new_type and entry.get("type") == "string":
+                entry["type"] = new_type
+            inner = entry.get("config_entries")
+            if inner:
+                walk(inner, sub_path)
+
+    walk(entries, ())
 
 
 def _apply_platform_defaults(
