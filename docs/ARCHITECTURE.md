@@ -8,9 +8,9 @@
 
 3. **Frontend and backend are separate repos.** The frontend is a separate pip package. The backend try-imports it and serves the static files.
 
-4. **WS-first API.** Everything goes through a single `/ws` WebSocket with command/response protocol (43 commands). REST endpoints only for HA backward compat.
+4. **WS-first API.** Everything goes through a single `/ws` WebSocket with command/response protocol. REST endpoints only for HA backward compat.
 
-5. **Real-time events.** Clients subscribe once via `subscribe_events`, get instant push notifications. No polling.
+5. **Real-time events.** Clients subscribe once via `subscribe_events`, get instant push notifications. No polling needed.
 
 6. **Persistent firmware jobs.** Compile/upload jobs are queued, run one at a time, survive page refreshes and server restarts.
 
@@ -52,22 +52,22 @@ esphome_device_builder/
 │   └── legacy.py              # HA compat endpoints
 │
 └── definitions/               # Data files
-    ├── boards/                # 559 board YAML manifests
-    ├── components.json        # 655 components
+    ├── boards/                # board YAML manifests
+    ├── components.json        # components definitions (auto generated from schema.esphome.io)
     └── schemas/               # JSON schemas
 ```
 
 ## Controllers
 
-| Controller | Commands | Responsibility |
-|-----------|----------|---------------|
-| Devices | 14 | Device CRUD, file scanning, YAML validation, live logs |
-| Firmware | 13 | Job queue, compile, install, upload, download binaries |
-| Boards | 3 | Board catalog with search, filtering, pin maps |
-| Components | 3 | Component catalog with search, config entries |
-| Automations | 3 | Context-aware triggers + actions |
-| Config | 5 | Version, serial ports, preferences, secrets |
-| Built-in | 2 | ping, subscribe_events |
+| Controller | Responsibility |
+|-----------|---------------|
+| Devices | Device CRUD, file scanning, YAML validation, live logs |
+| Firmware | Job queue, compile, install, upload, download binaries |
+| Boards | Board catalog with search, filtering, pin maps |
+| Components | Component catalog with search, config entries |
+| Automations | Context-aware triggers + actions |
+| Config | Version, serial ports, preferences, secrets |
+| Built-in | ping, subscribe_events |
 
 ## Firmware Job Queue
 

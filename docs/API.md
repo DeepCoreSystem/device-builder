@@ -56,7 +56,7 @@ On connect, the server sends a [`ServerInfoMessage`](../esphome_device_builder/m
 
 ## Commands
 
-### Devices (14 commands)
+### Devices
 
 > Models: [`Device`](../esphome_device_builder/models/devices.py), [`DevicesResponse`](../esphome_device_builder/models/devices.py)
 >
@@ -83,7 +83,7 @@ On connect, the server sends a [`ServerInfoMessage`](../esphome_device_builder/m
 `Device.has_pending_changes`: `true` = config changed since last compile, `false` = up to date, `null` = never compiled.
 `Device.update_available`: `true` = device was compiled with a different ESPHome version than the server.
 
-### Firmware (14 commands)
+### Firmware
 
 > Models: [`FirmwareJob`](../esphome_device_builder/models/firmware.py), [`JobStatus`](../esphome_device_builder/models/firmware.py), [`JobType`](../esphome_device_builder/models/firmware.py)
 >
@@ -125,7 +125,7 @@ On connect, the server sends a [`ServerInfoMessage`](../esphome_device_builder/m
 
 The subscription stays open for the connection's lifetime; closing the WebSocket cancels the stream.
 
-### Boards (3 commands)
+### Boards
 
 > Controller: [`BoardCatalog`](../esphome_device_builder/controllers/boards.py)
 >
@@ -136,7 +136,7 @@ The subscription stays open for the connection's lifetime; closing the WebSocket
 | `boards/get_boards` | `{query?, platform?, variant?, tag?, offset?, limit?}` | `PagedBoardsResponse` | Search/list boards |
 | `boards/get_board` | `{board_id}` | `BoardCatalogEntry` | Get board with pin map |
 
-### Components (3 commands)
+### Components
 
 > Controller: [`ComponentCatalog`](../esphome_device_builder/controllers/components.py)
 >
@@ -148,7 +148,7 @@ The subscription stays open for the connection's lifetime; closing the WebSocket
 | `components/get_components` | `{query?, category?, platform?, offset?, limit?}` | `PagedComponentsResponse` | Search/list components (filter by platform) |
 | `components/get_component` | `{component_id}` | `ComponentCatalogEntry` | Get component with config entries |
 
-### Automations (3 commands)
+### Automations
 
 > Controller: [`AutomationsController`](../esphome_device_builder/controllers/automations.py)
 
@@ -158,7 +158,7 @@ The subscription stays open for the connection's lifetime; closing the WebSocket
 | `automations/get_actions` | — | `[AutomationAction]` | List all actions |
 | `automations/get_available` | `{configuration}` | `{triggers, actions, present_platform_types}` | Context-aware for a device |
 
-### Config (5 commands)
+### Config
 
 > Controller: [`ConfigController`](../esphome_device_builder/controllers/config.py)
 >
@@ -172,7 +172,7 @@ The subscription stays open for the connection's lifetime; closing the WebSocket
 | `config/set_preferences` | `{theme?, dashboard_view?, ...}` | `UserPreferences` | Update preferences (partial) |
 | `config/get_secrets` | — | `[string]` | List secret key names |
 
-### Utility (2 commands)
+### Utility
 
 | Command | Args | Response | Description |
 |---------|------|----------|-------------|
