@@ -8,7 +8,7 @@ import gzip
 import importlib
 import logging
 import os
-import shutil
+import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -40,22 +40,55 @@ _ERROR_PATTERNS = [
 
 
 def _find_esphome_cmd() -> list[str]:
-    """Locate the ``esphome`` CLI, preferring the active venv's Python."""
+    """Locate the ``esphome`` CLI, preferring the same interpreter as ours.
+
+    The backend's own interpreter (``sys.executable``) is the
+    authoritative source: if it can import ``esphome`` to start the
+    server, it can run ``python -m esphome`` for compile jobs. We
+    don't try to substitute a sibling ``python`` next to
+    ``sys.executable`` — that's an easy way to silently jump to a
+    different interpreter (e.g. a system Python without esphome
+    installed) and produce confusing "No module named esphome"
+    errors at compile time.
+
+    A standalone ``esphome`` script in the *same* bin directory as
+    our interpreter is preferred when present (slightly cheaper than
+    ``python -m esphome`` and surfaces a friendlier traceback when
+    something goes wrong inside esphome).
+    """
     python = sys.executable
+    bin_dir = Path(python).parent
 
-    # Prefer "<venv>/bin/python" (or "<venv>/Scripts/python") so we
-    # invoke esphome from the same interpreter that imports it here.
-    venv_python = Path(python).parent / "python"
-    if venv_python.exists():
-        python = str(venv_python)
-
-    # If a standalone `esphome` script exists in the same venv, use it
-    # directly — slightly cheaper than `python -m esphome`.
-    esphome_bin = shutil.which("esphome")
-    if esphome_bin and str(Path(python).parent) in esphome_bin:
-        return [esphome_bin]
+    sibling_esphome = bin_dir / ("esphome.exe" if os.name == "nt" else "esphome")
+    if sibling_esphome.exists():
+        return [str(sibling_esphome)]
 
     return [python, "-m", "esphome"]
+
+
+def _verify_esphome_importable(cmd: list[str]) -> tuple[bool, str]:
+    """Sanity-check that ``cmd`` can actually import esphome.
+
+    Runs ``cmd --version`` synchronously with a short timeout. Used at
+    backend startup so misconfigured environments (venv missing
+    esphome, wrong sys.executable, broken shim script) surface as a
+    clear log line rather than a cryptic "No module named esphome"
+    output captured during the user's first compile attempt.
+    """
+    try:
+        proc = subprocess.run(  # noqa: S603 — cmd is built from sys.executable, not user input
+            [*cmd, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    output = (proc.stdout + proc.stderr).strip()
+    if proc.returncode != 0 or "No module named" in output or "ModuleNotFoundError" in output:
+        return False, output or f"exit {proc.returncode}"
+    return True, output
 
 
 class FirmwareController:
@@ -83,7 +116,23 @@ class FirmwareController:
     async def start(self) -> None:
         """Start the queue processor and restore persisted jobs."""
         self._esphome_cmd = _find_esphome_cmd()
-        _LOGGER.info("ESPHome command: %s", " ".join(self._esphome_cmd))
+        _LOGGER.info(
+            "ESPHome command: %s (interpreter: %s)",
+            " ".join(self._esphome_cmd),
+            sys.executable,
+        )
+        loop = asyncio.get_running_loop()
+        ok, detail = await loop.run_in_executor(None, _verify_esphome_importable, self._esphome_cmd)
+        if ok:
+            _LOGGER.info("ESPHome CLI sanity check OK — %s", detail)
+        else:
+            _LOGGER.error(
+                "ESPHome CLI sanity check FAILED — %s. Compile/upload jobs "
+                "will fail with this command. Make sure esphome is installed "
+                "in the same environment as the dashboard "
+                "(e.g. ``pip install -e '.[esphome]'`` from the project root).",
+                detail,
+            )
         await self._load_jobs()
         self._runner_task = self._db.create_background_task(self._run_queue())
 
@@ -476,8 +525,17 @@ class FirmwareController:
             job.completed_at = datetime.now(UTC).isoformat()
 
             if has_error_in_output and exit_code == 0:
-                job.error = "Process exited 0 but output contains errors"
-                _LOGGER.warning("Job %s: exit code 0 but errors detected in output", job.job_id)
+                full_output = "".join(job.output)
+                if "No module named esphome" in full_output:
+                    job.error = (
+                        "esphome is not importable from the dashboard's Python "
+                        f"environment ({sys.executable}). Install it with "
+                        "``pip install -e '.[esphome]'`` (or ``pip install esphome``) "
+                        "in the same venv and restart the dashboard."
+                    )
+                else:
+                    job.error = "Process exited 0 but output contains errors"
+                _LOGGER.warning("Job %s: %s", job.job_id, job.error)
 
             event = EventType.JOB_COMPLETED if success else EventType.JOB_FAILED
             self._db.bus.fire(event, {"job": job})
