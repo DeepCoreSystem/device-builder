@@ -1,0 +1,93 @@
+name: 🪲 Device Builder Dashboard bug report
+description: Report a problem with the Device Builder Dashboard itself (UI, backend, install).
+title: "[Bug] "
+labels: ["bugfix"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for trying the new dashboard! 🙏
+
+        Before filing, please confirm:
+        - **Not an ESPHome core problem** — compile errors / device behaviour /
+          component bugs belong in the [esphome repo](https://github.com/esphome/esphome/issues/new/choose).
+        - **Not already tracked** — check
+          [open issues](https://github.com/esphome/device-builder-dashboard-backend/issues)
+          and the
+          [project backlog](https://github.com/orgs/esphome/projects/7/views/1?filterQuery=project%3A%22device-builder-dashboard%22).
+        - **Not better suited to chat** — quick questions and feedback land
+          faster in the
+          [Discord channel](https://discord.gg/Rf2jWGVjaK).
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: |
+        A clear description of the problem. Include reproduction steps
+        — "I clicked X, expected Y, got Z" is ideal.
+      placeholder: |
+        1. Open the dashboard at http://localhost:6052
+        2. Click "Add device" → pick board "ESP32-DevKit-V1"
+        3. ...
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Dashboard version
+      description: |
+        Output of `esphome-device-builder --version`, or the release tag /
+        commit you installed from. Pre-release builds end in `bN`
+        (e.g. `2026.5.0b1`).
+      placeholder: "e.g. 2026.5.0b1"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install-method
+    attributes:
+      label: How did you install it?
+      multiple: false
+      options:
+        - Wheel from a GitHub release
+        - From source (script/setup)
+        - PyPI (once available)
+        - ESPHome container (preview toggle)
+        - Home Assistant add-on (preview toggle)
+        - Other / not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Where is it running?
+      multiple: false
+      options:
+        - Local — Linux
+        - Local — macOS
+        - Local — Windows
+        - Docker container
+        - Home Assistant add-on
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs / errors
+      description: |
+        Server log (preferably with `--log-level debug`) and / or browser
+        console output. Trim to the relevant section if it's huge.
+      render: shell
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?
+      description: |
+        Screenshots, related YAML config, board picked, anything else
+        that might help us reproduce.

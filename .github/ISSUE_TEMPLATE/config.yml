@@ -1,0 +1,39 @@
+# Issue chooser shown when a user clicks "New issue".
+#
+# ``blank_issues_enabled: false`` disables the "Open a blank issue"
+# escape hatch so reporters always pick one of the curated paths
+# below — most of which redirect them to a more appropriate venue
+# (esphome core repo, org-wide discussions, the project backlog,
+# Discord) before they end up filing here. The single real template
+# (``bug_report.yml``) is reserved for actual dashboard bugs.
+
+blank_issues_enabled: false
+contact_links:
+  - name: 🐛 ESPHome compilation / firmware / component issues
+    url: https://github.com/esphome/esphome/issues/new/choose
+    about: |
+      For issues with ESPHome itself — compile errors, runtime
+      problems on the device, component behaviour. Those live in
+      the esphome core repo, not in the dashboard.
+
+  - name: 💡 Feature requests for ESPHome
+    url: https://github.com/orgs/esphome/discussions
+    about: |
+      ESPHome-wide ideas and proposals (new components, language
+      features, behaviour changes) belong in the org-level
+      Discussions board. Discuss it there first; if it lands as a
+      concrete plan, it'll move to a tracked issue.
+
+  - name: 🗺️ Device Builder backlog (planned / in-progress work)
+    url: https://github.com/orgs/esphome/projects/7/views/1?filterQuery=project%3A%22device-builder-dashboard%22
+    about: |
+      The dashboard is still in active development. Before filing,
+      please check the project board — your idea or issue may
+      already be on the roadmap or assigned to an upcoming release.
+
+  - name: 💬 Discord — Device Builder feedback channel
+    url: https://discord.gg/Rf2jWGVjaK
+    about: |
+      Real-time discussion, quick questions, and informal feedback.
+      Best place to chat with the team about the dashboard before
+      (or instead of) filing an issue.
