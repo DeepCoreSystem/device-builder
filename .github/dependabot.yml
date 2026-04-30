@@ -1,0 +1,34 @@
+# Dependabot — keeps the action versions and Python deps fresh.
+# Every PR gets the ``dependencies`` label so it lands under the
+# corresponding release-drafter section (and so pr-labels.yaml is
+# satisfied).
+
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "daily"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "ci"
+    commit-message:
+      prefix: "ci"
+
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "deps"
+    # Ignore esphome itself — bumping it requires a coordinated
+    # catalog re-sync (see .github/workflows/sync-component-catalog.yml).
+    # Easier to bump it manually when shipping a new dashboard
+    # release than to chase dependabot PRs that may break the
+    # catalog smoke test.
+    ignore:
+      - dependency-name: "esphome"

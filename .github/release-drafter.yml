@@ -1,0 +1,56 @@
+# Release-drafter config — drives the rolling draft maintained by
+# .github/workflows/release-drafter.yml. Each merged PR's label
+# decides which section it lands in; the version bump (major/minor/
+# patch) is derived from the labels too. Mirrors matter-server's
+# convention so contributors familiar with that repo land in the
+# right place by default.
+
+name-template: "$RESOLVED_VERSION"
+tag-template: "$RESOLVED_VERSION"
+change-template: "- #$NUMBER - $TITLE (@$AUTHOR)"
+
+categories:
+  - title: "⚠ Breaking changes"
+    labels:
+      - "breaking-change"
+  - title: "🚀 New features"
+    labels:
+      - "new-feature"
+      - "enhancement"
+  - title: "🐛 Bug fixes"
+    labels:
+      - "bugfix"
+  - title: "🔄 Refactor"
+    labels:
+      - "refactor"
+  - title: "📚 Documentation"
+    labels:
+      - "docs"
+  - title: "🧹 Maintenance"
+    labels:
+      - "maintenance"
+  - title: "⬆️ Dependencies / CI"
+    collapse-after: 1
+    labels:
+      - "dependencies"
+      - "ci"
+
+template: |
+  ## What's changed
+
+  $CHANGES
+
+# Label-driven version resolution. ``breaking-change`` bumps major,
+# ``new-feature`` / ``enhancement`` bumps minor, anything else patch.
+# The drafter doesn't pick the actual tag — the maintainer types it
+# when publishing — but ``$RESOLVED_VERSION`` shows up in the draft
+# title as a suggestion.
+version-resolver:
+  major:
+    labels:
+      - "breaking-change"
+  minor:
+    labels:
+      - "new-feature"
+      - "enhancement"
+  default: patch

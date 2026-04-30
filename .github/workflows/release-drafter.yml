@@ -1,0 +1,23 @@
+name: Release Drafter
+
+# Maintains a rolling draft release on every push to ``main``. Each
+# merged PR adds a line under the matching category (driven by its
+# label, see ``.github/release-drafter.yml``). When it's time to
+# ship, the maintainer just edits the draft, picks the tag, ticks
+# "Set as a pre-release" if needed, and publishes — that handoff
+# kicks off ``release.yml``.
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  update_release_draft:
+    permissions:
+      contents: write       # release-drafter creates / updates the draft
+      pull-requests: read   # to read merged-PR titles + labels
+    runs-on: ubuntu-latest
+    steps:
+      - uses: release-drafter/release-drafter@6a93d829887aa2e0748befe2e808c66c0ec6e4c7  # v6
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

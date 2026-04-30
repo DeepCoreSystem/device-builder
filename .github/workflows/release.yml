@@ -1,0 +1,119 @@
+name: Publish release
+
+# Triggered when a GitHub release is published. The release form's
+# "Set as a pre-release" checkbox is the betaness toggle: when
+# checked, the tag MUST contain ``b`` (e.g. ``2026.5.0b1``); when
+# unchecked, the tag MUST be a final release (e.g. ``2026.5.0``).
+# That mirrors the matter-server / music-assistant convention so
+# downstream tools can detect channel from the tag alone.
+#
+# Each run:
+#   1. validates the tag matches the prerelease checkbox
+#   2. rewrites ``pyproject.toml``'s placeholder version with the tag
+#   3. builds an sdist + wheel
+#   4. attaches both to the GitHub release as downloadable assets
+#   5. publishes to PyPI when a ``PYPI_TOKEN`` secret is configured
+#      — skipped gracefully otherwise so this works before PyPI is
+#      set up. README documents the "grab the wheel from the release"
+#      install path that always works.
+
+on:
+  release:
+    types: [published]
+
+env:
+  PYTHON_VERSION: "3.13"
+
+permissions:
+  contents: write  # to attach wheels to the release
+
+jobs:
+  build-and-publish:
+    name: Build + publish
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.vars.outputs.tag }}
+      is_prerelease: ${{ github.event.release.prerelease }}
+    steps:
+      - name: Check out code from GitHub
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - name: Resolve tag
+        id: vars
+        run: echo "tag=${GITHUB_REF#refs/*/}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate tag against prerelease checkbox
+        # PEP 440 betas use a ``b`` separator (``2026.5.0b1``). The
+        # release form's checkbox is the source of truth for "is
+        # this a beta"; fail loudly when the tag and the checkbox
+        # disagree.
+        run: |
+          set -euo pipefail
+          TAG='${{ steps.vars.outputs.tag }}'
+          IS_PRE='${{ github.event.release.prerelease }}'
+          if [[ "$IS_PRE" == "true" ]]; then
+            if [[ "$TAG" != *"b"* ]]; then
+              echo "::error::Pre-release checkbox is set but tag '$TAG' has no 'b' suffix."
+              echo "::error::Tag a beta as e.g. 2026.5.0b1, or uncheck the pre-release box."
+              exit 1
+            fi
+          else
+            if [[ "$TAG" == *"b"* ]]; then
+              echo "::error::Pre-release checkbox is unset but tag '$TAG' contains a 'b' suffix."
+              echo "::error::Drop the b-suffix for a stable release, or check the pre-release box."
+              exit 1
+            fi
+          fi
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install build tooling
+        run: pip install build tomli tomli-w
+
+      - name: Stamp pyproject.toml with the release version
+        # ``pyproject.toml`` ships with ``version = "0.0.0"`` as a
+        # placeholder. Rewrite it from the tag so the built wheel
+        # advertises the right version.
+        shell: python
+        run: |-
+          import tomli
+          import tomli_w
+
+          with open("pyproject.toml", "rb") as f:
+              pyproject = tomli.load(f)
+          pyproject["project"]["version"] = "${{ steps.vars.outputs.tag }}"
+          with open("pyproject.toml", "wb") as f:
+              tomli_w.dump(pyproject, f)
+
+      - name: Build sdist + wheel
+        run: python -m build
+
+      - name: Attach artifacts to GitHub release
+        # Always runs, even when PyPI publishing is skipped — this is
+        # the install path users follow until PyPI creds are set up.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ steps.vars.outputs.tag }}" dist/*
+
+      - name: Publish to PyPI
+        if: ${{ env.PYPI_TOKEN != '' }}
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b  # release/v1
+        with:
+          user: __token__
+          password: ${{ env.PYPI_TOKEN }}
+        env:
+          # Only attempts to publish when the secret is set. Until
+          # then this step is a no-op and the release wheel attached
+          # above is the install path.
+          PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
+
+      - name: Note when PyPI publish is skipped
+        if: ${{ env.PYPI_TOKEN == '' }}
+        env:
+          PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
+        run: |
+          echo "::notice::PYPI_TOKEN secret is not configured — wheel attached to GitHub release only."
+          echo "::notice::Set the PYPI_TOKEN repo secret to enable PyPI publishing."

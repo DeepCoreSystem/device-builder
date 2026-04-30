@@ -9,6 +9,41 @@ A new dashboard for [ESPHome](https://github.com/esphome/esphome) that provides 
 
 This repository contains the **backend API server**. The frontend is a separate project: [esphome/device-builder-dashboard-frontend](https://github.com/esphome/device-builder-dashboard-frontend) but a prebuilt version is included into the release versions of this project.
 
+## Try it
+
+The dashboard isn't yet wired into the ESPHome container or the Home Assistant
+add-on as an opt-in preview — that's coming soon. In the meantime there are two
+ways to run a release locally:
+
+### Option A — install a prebuilt wheel from a GitHub release
+
+Each [release](https://github.com/esphome/device-builder-dashboard-backend/releases)
+ships an `.whl` artifact you can `pip install` straight into a fresh venv. Pre-releases
+(beta builds tagged like `2026.5.0b1`) are listed alongside the stable ones.
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+
+# Stable: copy the wheel URL from the latest release page
+pip install https://github.com/esphome/device-builder-dashboard-backend/releases/download/<TAG>/esphome_device_builder-<TAG>-py3-none-any.whl
+
+# Run it (point at any directory; it will be created on first use)
+esphome-device-builder ~/esphome-configs
+```
+
+Once PyPI publishing is enabled (see CI section below), you'll also be able to
+`pip install --pre esphome-device-builder` directly.
+
+### Option B — run from source
+
+See the **Development** section for the full setup.
+
+### Coming soon
+
+A beta toggle in the official ESPHome container and the Home Assistant
+ESPHome add-on will install and launch this dashboard automatically — no
+manual venv or wheel handling required.
+
 ## Development
 
 ### Setup
@@ -98,6 +133,37 @@ It is intended to move this board definitions into a dedicated repository later 
 ## Contributing
 
 Contributions welcome — especially board definitions (add a subfolder to `definitions/boards/`).
+
+Every PR needs **exactly one** of the following labels so it lands in the
+right release-notes section: `breaking-change`, `new-feature`, `enhancement`,
+`bugfix`, `refactor`, `docs`, `maintenance`, `ci`, `dependencies`. CI enforces
+this via [`.github/workflows/pr-labels.yaml`](.github/workflows/pr-labels.yaml).
+
+## Releasing (maintainer)
+
+A rolling draft release is maintained automatically — every merge to `main`
+appends a line under the matching label section, courtesy of
+[release-drafter](.github/workflows/release-drafter.yml).
+
+To ship a build:
+
+1. Open the [Releases page](https://github.com/esphome/device-builder-dashboard-backend/releases),
+   pick the existing draft, and edit it.
+2. Set the tag:
+   - **Stable** — `2026.5.0` (no `b` suffix). Leave "Set as a pre-release"
+     unchecked.
+   - **Beta** — `2026.5.0b1`. **Tick** "Set as a pre-release".
+3. Hit **Publish**.
+
+The [release workflow](.github/workflows/release.yml) then:
+- validates the tag matches the prerelease checkbox (fails fast if they
+  disagree),
+- stamps `pyproject.toml` with the tag,
+- builds the sdist + wheel,
+- attaches both to the GitHub release,
+- and publishes to PyPI when a `PYPI_TOKEN` repo secret is configured (no-op
+  otherwise — the wheel attached to the release is the install path until
+  PyPI is wired up).
 
 ## License
 
