@@ -190,6 +190,41 @@ _DEPRECATED_FIELDS: frozenset[tuple[str, str]] = frozenset(
     }
 )
 
+# Cross-cutting fields that only make sense when a specific component
+# is configured on the same device — qos / retain need an ``mqtt:``
+# block, ``zigbee_sensor`` needs a ``zigbee:`` hub, and the
+# web_server entity overrides need a ``web_server:`` block. The
+# schema lists them on every entity (because they're valid options)
+# but most users never configure mqtt/zigbee/web_server, so without
+# gating the form is full of fields that quietly do nothing. The
+# frontend reads ``depends_on_component`` and hides each entry
+# unless the named component appears in the device's YAML.
+#
+# Keep this list focused on cross-cutting infrastructure. Component-
+# specific gates (e.g. "this LED option requires this LED platform")
+# belong in the per-component schema via ``depends_on`` /
+# ``depends_on_value`` instead.
+_COMPONENT_GATED_KEYS: dict[str, str] = {
+    # MQTT entity options (apply to every entity when ``mqtt:`` is set)
+    "qos": "mqtt",
+    "retain": "mqtt",
+    "discovery": "mqtt",
+    "subscribe_qos": "mqtt",
+    "state_topic": "mqtt",
+    "command_topic": "mqtt",
+    "availability": "mqtt",
+    # Zigbee entity options
+    "zigbee_sensor": "zigbee",
+    "zigbee_binary_sensor": "zigbee",
+    "zigbee_switch": "zigbee",
+    "zigbee_number": "zigbee",
+    # Web server entity overrides
+    "web_server": "web_server",
+    "web_server_id": "web_server",
+    "web_server_base_id": "web_server",
+}
+
+
 # Per-(component, field) entry overrides for cases where the prebuilt
 # schema doesn't correctly capture the field's structure. Each value
 # is a partial ConfigEntry dict that overrides the schema-derived one.
@@ -1187,6 +1222,7 @@ def build_component_entry(
     introspection = introspect_component(stem if domain else top_key)
     _apply_platform_defaults(config_entries, introspection.get("platform_defaults") or {})
     _apply_refined_types(config_entries, introspection.get("refined_types") or {})
+    _apply_unit_of_measurement_options(config_entries)
 
     return {
         "id": component_id,
@@ -1242,12 +1278,27 @@ def _convert_config_vars(
     """Convert a ``schema`` node (config_vars + extends) to a list of entries."""
     config_vars = dict(schema_node.get("config_vars") or {})
 
-    # Inline ``extends`` references — fields from referenced base
-    # schemas appear before the local ones, then local ones override.
+    # Inline ``extends`` references and merge them with the local
+    # config_vars. The schema uses partial overrides — entity
+    # sub-readings like ``dht.sensor.humidity.device_class`` only
+    # specify ``{"default": "humidity"}`` and inherit the rest
+    # (``type: enum``, the 60-value list of accepted device classes,
+    # the docs string) from ``sensor._SENSOR_SCHEMA``. A flat
+    # ``{**extended, **local}`` would replace the whole field,
+    # silently dropping the values list. Deep-merge per-field so
+    # local entries override individual keys but inherited metadata
+    # survives.
     extended: dict[str, dict] = {}
     for ref in schema_node.get("extends") or []:
         extended.update(_resolve_extends(ref, schema_dir))
-    merged = {**extended, **config_vars}
+    merged: dict[str, dict] = {}
+    for key in {*extended, *config_vars}:
+        base = extended.get(key)
+        local = config_vars.get(key)
+        if isinstance(base, dict) and isinstance(local, dict):
+            merged[key] = {**base, **local}
+        else:
+            merged[key] = local if local is not None else base or {}
 
     out: list[dict] = []
     for key, raw in merged.items():
@@ -1265,6 +1316,12 @@ def _convert_config_vars(
         override = _FIELD_OVERRIDES.get((component_id, key))
         if override is not None:
             entry = {**entry, **override}
+        # Cross-cutting infrastructure fields are only meaningful when
+        # the named component is configured. Tag them so the frontend
+        # can hide them by default.
+        gate = _COMPONENT_GATED_KEYS.get(key)
+        if gate and not entry.get("depends_on_component"):
+            entry["depends_on_component"] = gate
         out.append(entry)
     return _sort_entries(out)
 
@@ -2253,6 +2310,63 @@ def _apply_refined_types(
                 walk(inner, sub_path)
 
     walk(entries, ())
+
+
+def _apply_unit_of_measurement_options(entries: list[dict]) -> None:
+    """Fill ``unit_of_measurement`` options from ``esphome.const.UNIT_*``.
+
+    The schema marks the field with ``data_type:
+    validate_unit_of_measurement`` and a custom validator function —
+    no enum values, even though ESPHome ships a curated set of common
+    units (``W``, ``V``, ``A``, ``°C``, ``%``, ...). Pull them from
+    ``esphome.const`` and surface as suggestions with
+    ``allow_custom_value=True`` so the frontend renders an
+    autocomplete combobox: pick a common unit or type a custom one.
+
+    Walks recursively so entity sub-readings (``sensor.dht.humidity``)
+    also get the suggestions.
+    """
+    options = _UNIT_OF_MEASUREMENT_OPTIONS
+    if not options:
+        return
+
+    def walk(items: list[dict]) -> None:
+        for entry in items:
+            if (
+                entry.get("key") == "unit_of_measurement"
+                and entry.get("type") == "string"
+                and not entry.get("options")
+            ):
+                entry["options"] = options
+                entry["allow_custom_value"] = True
+            inner = entry.get("config_entries")
+            if inner:
+                walk(inner)
+
+    walk(entries)
+
+
+def _load_unit_of_measurement_options() -> list[dict[str, str]]:
+    """Best-effort: read ``esphome.const`` for ``UNIT_*`` constants.
+
+    Returns a list of ``{label, value}`` dicts sorted alphabetically.
+    Empty list when esphome isn't importable.
+    """
+    try:
+        import esphome.const as const
+    except Exception:
+        return []
+    raw = sorted(
+        {
+            getattr(const, name)
+            for name in dir(const)
+            if name.startswith("UNIT_") and isinstance(getattr(const, name), str)
+        }
+    )
+    return [{"label": v, "value": v} for v in raw]
+
+
+_UNIT_OF_MEASUREMENT_OPTIONS: list[dict[str, str]] = _load_unit_of_measurement_options()
 
 
 def _apply_platform_defaults(
