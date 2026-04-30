@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ..helpers.api import api_command
 from ..models import (
@@ -19,6 +19,9 @@ from ..models import (
     PinMode,
 )
 
+if TYPE_CHECKING:
+    from ..device_builder import DeviceBuilder
+
 _LOGGER = logging.getLogger(__name__)
 
 _COMPONENTS_JSON = Path(__file__).resolve().parent.parent / "definitions" / "components.json"
@@ -27,7 +30,8 @@ _COMPONENTS_JSON = Path(__file__).resolve().parent.parent / "definitions" / "com
 class ComponentCatalog:
     """In-memory component catalog with search and pagination."""
 
-    def __init__(self) -> None:
+    def __init__(self, device_builder: DeviceBuilder | None = None) -> None:
+        self._db = device_builder
         self._components: list[ComponentCatalogEntry] = []
         self._by_id: dict[str, ComponentCatalogEntry] = {}
 
@@ -80,16 +84,19 @@ class ComponentCatalog:
         *,
         component_id: str,
         platform: str | None = None,
+        board_id: str | None = None,
         **kwargs: Any,
     ) -> ComponentCatalogEntry | None:
         """
         Get a single component by ID.
 
-        When ``platform`` is provided, ``platform_defaults`` are
-        resolved into ``default_value`` for the device's target
-        platform — frontend gets the right default without having to
-        know the cv.SplitDefault details.
+        When ``platform`` (or ``board_id``, which we resolve to a
+        platform) is provided, ``platform_defaults`` are resolved
+        into ``default_value`` for that target platform — frontend
+        gets the right default without having to know the
+        cv.SplitDefault details.
         """
+        platform = self._resolve_platform(platform, board_id)
         component = self._by_id.get(component_id)
         if component is None:
             return None
@@ -102,6 +109,7 @@ class ComponentCatalog:
         query: str | None = None,
         category: ComponentCategory | str | None = None,
         platform: str | None = None,
+        board_id: str | None = None,
         offset: int = 0,
         limit: int = 50,
         **kwargs: Any,
@@ -115,7 +123,12 @@ class ComponentCatalog:
         list are considered platform-agnostic and always included. When
         ``platform`` is set, each entry's ``platform_defaults`` map is
         also resolved into its ``default_value`` for that platform.
+
+        ``board_id`` is a convenience: the boards catalog is consulted
+        to derive the matching platform, so the frontend can pass
+        whichever it has handy. ``platform`` wins when both are set.
         """
+        platform = self._resolve_platform(platform, board_id)
         results = self._components
 
         if category:
@@ -145,6 +158,27 @@ class ComponentCatalog:
             limit=limit,
             categories=self.categories,
         )
+
+    def _resolve_platform(
+        self,
+        platform: str | None,
+        board_id: str | None,
+    ) -> str | None:
+        """Normalise ``platform`` / derive it from ``board_id`` if needed.
+
+        Lower-cases the platform string so frontend-supplied values
+        like ``"ESP32"`` still match the catalog's lower-case
+        ``supported_platforms`` entries. When only ``board_id`` is
+        provided, look up the board to find its platform.
+        """
+        if platform:
+            return platform.lower()
+        if not board_id or self._db is None or self._db.boards is None:
+            return None
+        board = self._db.boards.get_by_id(board_id)
+        if board is None or board.esphome.platform is None:
+            return None
+        return board.esphome.platform.value.lower()
 
 
 # ---------------------------------------------------------------------------

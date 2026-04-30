@@ -75,7 +75,7 @@ class DeviceBuilder:
         # Initialize controllers
         self.boards = BoardCatalog()
         self.boards.load()
-        self.components = ComponentCatalog()
+        self.components = ComponentCatalog(self)
         self.components.load()
         self.config = ConfigController(self)
         self.devices = DevicesController(self)

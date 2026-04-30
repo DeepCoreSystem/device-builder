@@ -89,6 +89,13 @@ class BoardCatalog:
         page = results[offset : offset + limit]
         return PagedBoardsResponse(boards=page, total=total, offset=offset, limit=limit)
 
+    def get_by_id(self, board_id: str) -> BoardCatalogEntry | None:
+        """Look up a board by id synchronously. Returns ``None`` when not found."""
+        for board in self._boards:
+            if board.id == board_id:
+                return board
+        return None
+
     def find_by_pio_board(self, pio_board: str, pio_variant: str = "") -> BoardCatalogEntry | None:
         """
         Find a board by its PlatformIO board id, preferring a matching variant.
