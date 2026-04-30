@@ -11,7 +11,14 @@ if TYPE_CHECKING:
 
 # Platform categories that use the list-under-platform YAML pattern
 # (`sensor: [- platform: ...]`) rather than a single top-level key.
+# Must include every ComponentCategory value whose components carry
+# `<domain>.<platform>` ids in the catalog — otherwise add_component
+# falls through to writing the qualified id literally as a top-level
+# YAML key (`time.homeassistant:`), which ESPHome rejects and our own
+# YAML parser can't handle either (the regex only accepts
+# `[a-zA-Z_][a-zA-Z0-9_]*:`, no dots).
 _ENTITY_CATEGORIES = {
+    # Home Assistant entity domains
     "sensor",
     "binary_sensor",
     "switch",
@@ -37,6 +44,20 @@ _ENTITY_CATEGORIES = {
     "event",
     "update",
     "alarm_control_panel",
+    # Other platform-pattern domains the sync script tags as their
+    # own categories. Each one shows up in YAML as `<domain>: [-
+    # platform: ...]` blocks.
+    "ota",
+    "time",
+    "audio_adc",
+    "audio_dac",
+    "canbus",
+    "infrared",
+    "media_source",
+    "one_wire",
+    "packet_transport",
+    "stepper",
+    "water_heater",
 }
 
 
