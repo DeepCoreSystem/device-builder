@@ -190,6 +190,39 @@ _DEPRECATED_FIELDS: frozenset[tuple[str, str]] = frozenset(
     }
 )
 
+# Per-(component, field) entry overrides for cases where the prebuilt
+# schema doesn't correctly capture the field's structure. Each value
+# is a partial ConfigEntry dict that overrides the schema-derived one.
+# Keep this list small and targeted — every entry is a workaround for
+# an upstream schema generator gap.
+_FIELD_OVERRIDES: dict[tuple[str, str], dict[str, Any]] = {
+    # ``api.encryption`` is validated by a custom function in ESPHome
+    # so the schema generator emits only ``{key: Optional, docs: ...}``
+    # — no inner schema, no type. The actual YAML shape is a small
+    # mapping with one optional ``key`` (the pre-shared encryption
+    # key). Render as a nested group on the main form so the user can
+    # toggle it on and (optionally) supply the key.
+    ("api", "encryption"): {
+        "type": "nested",
+        "advanced": False,
+        "config_entries": [
+            {
+                "key": "key",
+                "type": "secure_string",
+                "label": "Encryption key",
+                "description": (
+                    "Pre-shared base64-encoded key for encrypting API traffic. "
+                    "Leave empty to let ESPHome generate one — Home Assistant "
+                    "will read it back during pairing."
+                ),
+                "required": False,
+                "advanced": False,
+                "help_link": ("https://esphome.io/components/api#configuration-variables"),
+            },
+        ],
+    },
+}
+
 # Key-name prefixes for automation triggers (``on_press``, ``on_value``,
 # ``on_state_change``, ...). These are config-variables in YAML but the
 # frontend's form editor isn't where users wire automations — the
@@ -292,17 +325,19 @@ _IMPORTANT_KEY_ORDER: tuple[str, ...] = (
     "model",
     "variant",
     "inverted",
+    "level",  # logger.level — most users want to see/pick this
     # Common esphome-block metadata
     "area",
+    "areas",
+    "comment",
     # Important fields that stay flagged advanced — keep their sort
     # priority but render under the "Advanced" section.
     "id",
-    "comment",
 )
 _IMPORTANT_KEYS: frozenset[str] = frozenset(_IMPORTANT_KEY_ORDER)
 # Subset of important keys that stay flagged advanced (id keeps its
 # sort priority but always lives under the advanced section).
-_ADVANCED_IMPORTANT_KEYS: frozenset[str] = frozenset({"id", "comment"})
+_ADVANCED_IMPORTANT_KEYS: frozenset[str] = frozenset({"id"})
 
 # ---------------------------------------------------------------------------
 # CLI / main
@@ -669,16 +704,24 @@ def _apply_field_descriptions(
     field_descriptions: dict[str, str],
     *,
     docs_url: str,
+    _depth: int = 0,
 ) -> int:
     """Apply per-field descriptions to entries that lack them.
 
-    Walks recursively into nested entries. Also fills ``help_link``
-    when missing — pointing at the ``#configuration-variables`` anchor
-    of the component's docs page.
+    Only acts at the top level of the component's config — the MDX's
+    ``## Configuration variables`` bullet list is flat, so applying a
+    matching key inside a nested entry would mis-attribute prose
+    (e.g. ``esphome.name``'s description leaking onto
+    ``esphome.areas[].name``). Nested entries can still pick up
+    descriptions later via their own component's MDX page when
+    relevant (e.g. ``ota.esphome``'s fields), via the per-component
+    backfill loop in ``_backfill_descriptions_from_mdx``.
     """
     backfilled = 0
     fragment_url = f"{docs_url}#configuration-variables" if docs_url else ""
     for entry in config_entries:
+        if _depth > 0:
+            continue
         key = entry["key"]
         if not (entry.get("description") or "").strip():
             text = field_descriptions.get(key)
@@ -687,11 +730,11 @@ def _apply_field_descriptions(
                 backfilled += 1
                 if fragment_url and not entry.get("help_link"):
                     entry["help_link"] = fragment_url
-        # Recurse into nested config_entries — within a component the
-        # parent and child config-vars use distinct names.
         inner = entry.get("config_entries")
         if inner:
-            backfilled += _apply_field_descriptions(inner, field_descriptions, docs_url=docs_url)
+            backfilled += _apply_field_descriptions(
+                inner, field_descriptions, docs_url=docs_url, _depth=_depth + 1
+            )
     return backfilled
 
 
@@ -1217,6 +1260,11 @@ def _convert_config_vars(
         entry = _convert_field(key, raw or {}, schema_dir)
         if entry is None:
             continue
+        # Per-(component, field) overrides patch up entries the schema
+        # generator couldn't model (e.g. ``api.encryption``).
+        override = _FIELD_OVERRIDES.get((component_id, key))
+        if override is not None:
+            entry = {**entry, **override}
         out.append(entry)
     return _sort_entries(out)
 
