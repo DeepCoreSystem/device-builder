@@ -1,544 +1,256 @@
 #!/usr/bin/env python3
-"""Sync component definitions from ESPHome's installed package.
+"""
+Generate definitions/components.json from ESPHome's pre-built schema bundle.
 
-Introspects ESPHome's component modules and CONFIG_SCHEMAs to generate
-a structured component catalog at definitions/components.json.
+The schema repo (https://github.com/esphome/esphome-schema) publishes a
+schema.zip per ESPHome release containing one JSON file per component.
+That bundle drives VS Code's ESPHome extension and the official Builder
+editor — it's the authoritative description of what each component
+accepts in YAML. We use it as the primary source of structure, types,
+defaults, and field descriptions.
 
-Requires ESPHome to be installed in the active Python environment.
+A small amount of ESPHome introspection still happens for things the
+schema doesn't capture:
 
-Usage:
-    python script/sync_components.py [--dry-run]
+- ``platform_defaults`` (``cv.SplitDefault`` per-target-platform values
+  used by the backend to filter inapplicable fields)
+- ``multi_conf`` (whether a component can be added more than once)
+- ``supported_platforms`` (which target chips the component runs on)
+
+Image URLs come from the docs repo's index page (the only MDX scraping
+that survives the rewrite).
+
+Usage
+-----
+
+    python script/sync_components.py                # latest stable release
+    python script/sync_components.py --version 2026.4.3
+    python script/sync_components.py --include-prereleases
 """
 
 from __future__ import annotations
 
 import argparse
-import importlib
 import json
 import logging
-import os
-import re as re_module
+import re
+import shutil
 import sys
+import urllib.request
+import zipfile
+from collections.abc import Iterable
+from dataclasses import dataclass, field
+from io import BytesIO
 from pathlib import Path
 from typing import Any
-
-import voluptuous as vol
-
-# Set up ESPHome environment before imports
-os.environ.setdefault("ESPHOME_STORAGE_DIR", "/tmp/esphome_sync")
-
-from esphome import config_validation as cv
-from esphome import const
-from esphome.core import CORE
-from esphome.loader import get_component, get_platform
-
-# Initialize CORE with a dummy ESP32 target
-CORE.data = {const.KEY_CORE: {const.KEY_TARGET_PLATFORM: const.PLATFORM_ESP32}}
-
-logging.basicConfig(level=logging.WARNING)
-_LOGGER = logging.getLogger(__name__)
-
-OUTPUT_FILE = (
-    Path(__file__).resolve().parent.parent
-    / "esphome_device_builder"
-    / "definitions"
-    / "components.json"
-)
-
-# ---------------------------------------------------------------------------
-# Docs metadata fetching
-# ---------------------------------------------------------------------------
-
-_DOCS_CLONE_DIR = Path(__file__).resolve().parent.parent / ".cache" / "esphome-docs"
-
-
-def _parse_mdx_frontmatter(mdx_content: str) -> dict[str, str]:
-    """Extract title and description from MDX frontmatter."""
-    match = re_module.match(r"^---\s*\n(.*?)\n---", mdx_content, re_module.DOTALL)
-    if not match:
-        return {}
-    result = {}
-    for line in match.group(1).splitlines():
-        if ":" in line:
-            key, _, value = line.partition(":")
-            result[key.strip()] = value.strip().strip('"').strip("'")
-    return result
-
-
-# Markdown / MDX line patterns we strip during body extraction.
-_BODY_SKIP_LINE = re_module.compile(
-    r"^\s*("
-    r"import\s"  # ES module imports — `import { x } from`, `import x from`
-    r"|export\s"  # ES module re-exports
-    r"|<[A-Za-z]"  # MDX/HTML tags <Image .../>, <span ...>, <Figure ...>
-    r"|#{1,6}\s"  # markdown headings
-    r"|```"  # fenced code blocks
-    r"|:::"  # directive blocks (warning, info, ...)
-    r"|\$"  # dollar-style template lines
-    r")"
-)
-_MD_LINK = re_module.compile(r"\[([^\]]+)\]\([^)]+\)")
-_MD_INLINE_CODE = re_module.compile(r"`([^`]+)`")
-_MD_BOLD_ITALIC = re_module.compile(r"(\*\*|__|\*|_)([^*_\n]+)\1")
-_HTML_TAG = re_module.compile(r"<[^>]+>")
-
-
-def _build_doc_meta(mdx_file: Path, category: str) -> dict[str, Any]:
-    """
-    Read a single MDX file and produce its docs-metadata entry.
-
-    Combines frontmatter (title, description) with a body-prose
-    fallback when the frontmatter description is empty or just
-    boilerplate, and a ``field_descriptions`` map extracted from the
-    ``## Configuration variables`` section.
-    """
-    content = mdx_file.read_text(errors="ignore")
-    fm = _parse_mdx_frontmatter(content)
-    image = _parse_first_image(content) or ""
-
-    description = fm.get("description", "").strip()
-    body_intro = _extract_body_intro(content)
-    if not description or description.lower().startswith("instructions for "):
-        description = body_intro or description
-
-    return {
-        "title": fm.get("title", ""),
-        "description": description,
-        "image_file": image,
-        "category": category,
-        "field_descriptions": _extract_field_descriptions(content),
-    }
-
-
-_MAX_INTRO_CHARS = 400
-
-
-def _extract_body_intro(mdx_content: str) -> str:
-    """
-    Extract the first prose paragraph from an MDX file body.
-
-    Skips imports, MDX components, headings, code blocks and directive
-    blocks. Markdown links and emphasis are flattened. When the first
-    paragraph ends mid-sentence (typical when followed by a bullet
-    list) we concatenate subsequent prose paragraphs until a sentence
-    terminator is found or the result exceeds ~400 chars.
-
-    Returns an empty string when no prose paragraph is found.
-    """
-    body = re_module.sub(
-        r"^---\s*\n.*?\n---\s*\n", "", mdx_content, count=1, flags=re_module.DOTALL
-    )
-
-    paragraphs: list[list[str]] = [[]]
-    in_code = False
-    for line in body.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("```"):
-            in_code = not in_code
-            continue
-        if in_code:
-            continue
-        if not stripped:
-            if paragraphs[-1]:
-                paragraphs.append([])
-            continue
-        # Bullet list items break the paragraph but we don't include them
-        # in the prose — they typically enumerate supported parts/devices.
-        if stripped.startswith(("-", "*", "+")) and len(stripped) > 1 and stripped[1] == " ":
-            if paragraphs[-1]:
-                paragraphs.append([])
-            continue
-        if _BODY_SKIP_LINE.match(line):
-            continue
-        paragraphs[-1].append(stripped)
-
-    collected = ""
-    for lines in paragraphs:
-        if not lines:
-            continue
-        chunk = _flatten_markdown(" ".join(lines))
-        if not chunk:
-            continue
-        if not collected:
-            collected = chunk
-        else:
-            collected = f"{collected} {chunk}"
-        if len(collected) >= _MAX_INTRO_CHARS or collected.rstrip()[-1:] in ".!?":
-            break
-
-    if len(collected) >= 30:
-        return collected[:_MAX_INTRO_CHARS].rstrip()
-    return ""
-
-
-def _flatten_markdown(text: str) -> str:
-    """Strip markdown links / emphasis / inline code / HTML to plain prose."""
-    text = _MD_LINK.sub(r"\1", text)
-    text = _MD_INLINE_CODE.sub(r"\1", text)
-    text = _MD_BOLD_ITALIC.sub(r"\2", text)
-    text = _HTML_TAG.sub("", text)
-    return re_module.sub(r"\s+", " ", text).strip()
-
-
-# Top-level bullet introducing a config variable:
-#   - **field_name** (Required, type): Description goes here
-_CONFIG_VAR_LINE = re_module.compile(
-    r"^- \*\*(?P<name>[A-Za-z_][A-Za-z0-9_]*)\*\*[^:\n]*?:\s*(?P<desc>.*)$"
-)
-
-
-def _extract_field_descriptions(mdx_content: str) -> dict[str, str]:
-    """
-    Parse the ``## Configuration variables`` section into ``{key: description}``.
-
-    The section uses a markdown bullet list where each top-level
-    bullet starts with ``- **field_name** (...): description``. We
-    capture the description text — including continuation lines from
-    indented prose, but excluding nested sub-bullets (those describe
-    sub-fields and would clutter the tooltip).
-    """
-    body = re_module.sub(
-        r"^---\s*\n.*?\n---\s*\n", "", mdx_content, count=1, flags=re_module.DOTALL
-    )
-
-    # Two header styles in the wild:
-    #   - "## Configuration variables" (most component pages)
-    #   - "Configuration variables:" as plain prose (some base / platform pages)
-    section_re = re_module.compile(
-        r"^(?:##\s+Configuration variables\s*|Configuration variables:\s*)\n"
-        r"(.*?)(?=^##\s|\Z)",
-        re_module.MULTILINE | re_module.DOTALL,
-    )
-    match = section_re.search(body)
-    if not match:
-        return {}
-
-    descriptions: dict[str, str] = {}
-    current_key: str | None = None
-    current_parts: list[str] = []
-    section = match.group(1)
-
-    def _commit() -> None:
-        if current_key is None:
-            return
-        text = " ".join(p for p in current_parts if p)
-        text = _flatten_markdown(text).rstrip(" .,:") + (
-            "." if text and text[-1] not in ".!?" else ""
-        )
-        if text:
-            descriptions[current_key] = text
-
-    for raw_line in section.splitlines():
-        line = raw_line.rstrip()
-        # New top-level bullet → commit previous, start new
-        m = _CONFIG_VAR_LINE.match(line)
-        if m:
-            _commit()
-            current_key = m.group("name")
-            initial = m.group("desc").strip()
-            current_parts = [initial] if initial else []
-            continue
-        if current_key is None:
-            continue
-        stripped = line.strip()
-        # Block-quotes / GitHub alerts (`> [!NOTE]`, `> ...`) end the
-        # description for the current field — they're side notes, not
-        # part of the field's own help text.
-        if stripped.startswith(">"):
-            _commit()
-            current_key = None
-            current_parts = []
-            continue
-        # Markdown sub-headings (`### switch.toggle Action`, etc.) mark
-        # the end of the variable list within the section and the start
-        # of unrelated prose (action / trigger reference, etc.). Stop
-        # appending to the current field — without this, every line
-        # under the sub-heading would be glued onto the last field's
-        # description.
-        if stripped.startswith("#"):
-            _commit()
-            current_key = None
-            current_parts = []
-            continue
-        # Sub-bullets describe sub-fields and would clutter the tooltip.
-        if stripped.startswith(("- ", "* ", "+ ")):
-            continue
-        if stripped:
-            current_parts.append(stripped)
-
-    _commit()
-    return descriptions
-
-
-def _attach_description(entry: dict, field_descriptions: dict[str, str]) -> None:
-    """Set ``entry['description']`` from the docs map when the key is known."""
-    desc = field_descriptions.get(entry["key"])
-    if desc:
-        entry["description"] = desc
-
-
-def _merge_field_descriptions(
-    docs: dict[str, dict[str, Any]],
-    base_platform: str,
-    overrides: dict[str, str],
-) -> dict[str, str]:
-    """
-    Combine the base platform's field descriptions with platform-specific overrides.
-
-    ``sensor/index.mdx`` documents the common entity fields (name, id,
-    device_class, state_class, ...). Platform-specific docs typically
-    only re-document the platform's own fields. Merging the two means
-    a ``sensor.template`` form has tooltips for both ``name`` (from
-    sensor base) and the template-specific fields (from template).
-    Platform-specific entries win on conflict.
-    """
-    base_docs = docs.get(base_platform, {})
-    base_descriptions: dict[str, str] = base_docs.get("field_descriptions") or {}
-    merged = dict(base_descriptions)
-    merged.update(overrides)
-    return merged
-
-
-def _parse_first_image(mdx_content: str) -> str | None:
-    """Extract the first image filename from MDX content."""
-    # Pattern 1: ES module import — import x from './images/foo.jpg';
-    match = re_module.search(r"from\s+['\"]\.\/images\/([^'\"]+)['\"]", mdx_content)
-    if match:
-        return match.group(1)
-    # Pattern 2: inline reference — images/foo.jpg (markdown or JSX)
-    match = re_module.search(r"images/([a-zA-Z0-9_-]+\.\w+)", mdx_content)
-    if match:
-        return match.group(1)
-    return None
-
-
-def _ensure_docs_repo() -> Path | None:
-    """Clone the esphome-docs repo locally (shallow, once). Returns components dir."""
-    import subprocess
-
-    components_dir = _DOCS_CLONE_DIR / "src" / "content" / "docs" / "components"
-    if components_dir.exists():
-        print("Updating esphome-docs repo...")
-        subprocess.run(
-            ["git", "pull", "--ff-only"],
-            cwd=_DOCS_CLONE_DIR,
-            capture_output=True,
-            timeout=30,
-            check=False,
-        )
-        return components_dir
-
-    print("Cloning esphome-docs repo (first time)...")
-    _DOCS_CLONE_DIR.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        subprocess.run(
-            [
-                "git",
-                "clone",
-                "--depth=1",
-                "--single-branch",
-                "--branch=current",
-                "https://github.com/esphome/esphome-docs.git",
-                str(_DOCS_CLONE_DIR),
-            ],
-            capture_output=True,
-            timeout=120,
-            check=True,
-        )
-    except Exception as exc:
-        print(f"  WARNING: Could not clone docs repo: {exc}")
-        return None
-
-    return components_dir
-
-
-def fetch_docs_metadata() -> dict[str, dict[str, str]]:
-    """Parse metadata from ESPHome docs (cloned locally).
-
-    Returns {component_id: {title, description, image_file, category}}.
-    """
-    components_dir = _ensure_docs_repo()
-    if not components_dir or not components_dir.exists():
-        print("  WARNING: Docs repo not available — skipping enrichment")
-        return {}
-
-    print("Parsing component docs metadata...")
-    metadata: dict[str, dict[str, str]] = {}
-
-    # Top-level .mdx files (core components)
-    for mdx_file in components_dir.glob("*.mdx"):
-        metadata[mdx_file.stem] = _build_doc_meta(mdx_file, "")
-
-    # Pass 1: every `<dir>/index.mdx` documents the directory's own
-    # platform-component (sensor/index.mdx → "Sensor Component",
-    # ota/index.mdx → "Over-the-Air Updates"). These claim the
-    # unqualified key for their directory before any other per-category
-    # file gets a chance to.
-    for cat_dir in sorted(components_dir.iterdir()):
-        if not cat_dir.is_dir() or cat_dir.name == "images":
-            continue
-        index_mdx = cat_dir / "index.mdx"
-        if not index_mdx.exists():
-            continue
-        doc_meta = _build_doc_meta(index_mdx, cat_dir.name)
-        metadata[cat_dir.name] = doc_meta
-        metadata[f"{cat_dir.name}.{cat_dir.name}"] = doc_meta
-
-    # Pass 2: regular per-category .mdx files. Always store under the
-    # qualified key `<domain>.<id>` (so multi-platform components like
-    # ``template`` get distinct docs per domain). Also populate the
-    # unqualified key `<id>` for the FIRST encountered entry — for
-    # components that exist in only one domain the short key keeps
-    # lookups simple. Top-level docs and `<dir>/index.mdx` always win.
-    for cat_dir in sorted(components_dir.iterdir()):
-        if not cat_dir.is_dir() or cat_dir.name == "images":
-            continue
-        cat_name = cat_dir.name
-        mdx_files = [m for m in cat_dir.glob("*.mdx") if m.stem != "index"]
-        if mdx_files:
-            print(f"  {cat_name}: {len(mdx_files)} docs")
-        for mdx_file in mdx_files:
-            stem = mdx_file.stem
-            doc_meta = _build_doc_meta(mdx_file, cat_name)
-            qualified_key = f"{cat_name}.{stem}"
-            metadata[qualified_key] = doc_meta
-            if stem not in metadata:
-                metadata[stem] = doc_meta
-
-    print(f"  Total: {len(metadata)} component docs found")
-
-    # Also parse the index page for image mappings (most complete source)
-    index_file = components_dir / "index.mdx"
-    if index_file.exists():
-        index_content = index_file.read_text(errors="ignore")
-        # Match: ["Name", "/components/category/comp/", "image.ext", ...]
-        img_entries = re_module.findall(
-            r'\["([^"]+)",\s*"(/components/[^"]+)",\s*"([^"]+)"',
-            index_content,
-        )
-        enriched = 0
-        for entry_name, entry_path, entry_img in img_entries:
-            # Extract component ID from path: /components/sensor/dht/ -> dht
-            parts = entry_path.strip("/").split("/")
-            if len(parts) < 2:
-                continue
-            comp_id = parts[-1] if parts[-1] else parts[-2]
-            cat = parts[1] if len(parts) >= 3 else ""
-
-            if comp_id not in metadata:
-                metadata[comp_id] = {
-                    "title": "",
-                    "description": "",
-                    "image_file": "",
-                    "category": cat,
-                }
-            m = metadata[comp_id]
-            if not m.get("image_file"):
-                m["image_file"] = entry_img
-                enriched += 1
-            if not m.get("title") and entry_name:
-                m["title"] = entry_name
-            if not m.get("category") and cat:
-                m["category"] = cat
-        print(f"  Index page: {len(img_entries)} entries, {enriched} new images added")
-
-    return metadata
-
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-# Platform component types — these become categories, not catalog entries
-PLATFORM_TYPES: set[str] = set()
+_LOGGER = logging.getLogger("sync_components")
 
-# Category overrides for non-platform components
-CATEGORY_OVERRIDES: dict[str, str] = {
-    "esphome": "core",
-    "wifi": "core",
-    "api": "core",
-    "ota": "core",
-    "logger": "core",
-    "mqtt": "core",
-    "web_server": "core",
-    "captive_portal": "core",
-    "safe_mode": "core",
-    "time": "core",
-    "network": "core",
-    "i2c": "bus",
-    "spi": "bus",
-    "uart": "bus",
-    "one_wire": "bus",
-    "modbus": "bus",
-    "canbus": "bus",
-    "script": "automation",
-    "interval": "automation",
-    "globals": "automation",
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_OUTPUT_FILE = _REPO_ROOT / "esphome_device_builder" / "definitions" / "components.json"
+_CACHE_ROOT = _REPO_ROOT / ".cache"
+
+_RELEASES_API = "https://api.github.com/repos/esphome/esphome-schema/releases"
+_SCHEMA_URL_TEMPLATE = "https://schema.esphome.io/{version}/schema.zip"
+_DOCS_INDEX_URL = (
+    "https://raw.githubusercontent.com/esphome/esphome-docs/current/"
+    "src/content/docs/components/index.mdx"
+)
+_IMAGE_BASE_URL = "https://esphome.io/images/"
+
+# CDN at schema.esphome.io rejects requests without a recognisable
+# User-Agent. Use the project name + repo URL so any traffic is easy
+# for the ESPHome team to identify.
+_USER_AGENT = "esphome-device-builder-backend (https://github.com/esphome/device-builder-dashboard)"
+
+# Top-level platform domains in the schema (also keys in our category enum).
+# Components keyed as ``<id>.<domain>`` in the schema files — e.g.
+# ``dht.sensor`` lives in dht.json under the key ``dht.sensor``.
+_PLATFORM_DOMAINS: frozenset[str] = frozenset(
+    {
+        "sensor",
+        "binary_sensor",
+        "switch",
+        "light",
+        "fan",
+        "cover",
+        "climate",
+        "button",
+        "number",
+        "select",
+        "text",
+        "text_sensor",
+        "lock",
+        "valve",
+        "media_player",
+        "speaker",
+        "microphone",
+        "camera",
+        "display",
+        "touchscreen",
+        "output",
+        "datetime",
+        "event",
+        "update",
+        "alarm_control_panel",
+        "stepper",
+        "audio_adc",
+        "audio_dac",
+        "media_source",
+        "one_wire",
+        "canbus",
+        "infrared",
+        "time",
+        "water_heater",
+        "ota",
+        "packet_transport",
+    }
+)
+
+# Plain top-level keys we don't want to surface as user-facing components
+# (build-system internals, deprecated wrappers, etc.).
+_HIDDEN_TOP_LEVEL: frozenset[str] = frozenset({"core", "esphome.ota"})
+
+# Map prebuilt-schema ``type`` strings to our ConfigEntryType enum.
+# Things not in this table fall through to STRING.
+_TYPE_MAP: dict[str, str] = {
+    "boolean": "boolean",
+    "integer": "integer",
+    "string": "string",
+    "enum": "string",  # SELECT-style; the underlying value is a string
+    "pin": "pin",
+    "schema": "nested",
+    "trigger": "nested",
+    "use_id": "id",
 }
 
-# Schema keys that are pure plumbing — never user-facing.
-# Both ``mqtt_id`` and ``zigbee_id`` are auto-generated ids voluptuous
-# uses to bind an entity to its MQTT / Zigbee component instance.
-# The user can't and shouldn't set these.
-SKIP_KEYS: set[str] = {
-    "mqtt_id",
-    "zigbee_id",
+# ``data_type`` strings narrow the integer range or pick a different
+# concrete type. Subset that maps cleanly onto our enum.
+_DATA_TYPE_PRIMITIVE: dict[str, str] = {
+    "positive_int": "integer",
+    "positive_not_null_int": "integer",
+    "uint8_t": "integer",
+    "uint16_t": "integer",
+    "uint32_t": "integer",
+    "hex_uint8_t": "integer",
+    "positive_float": "float",
+    "port": "integer",
 }
 
-# Schema keys that are automation triggers (skip)
-AUTOMATION_KEY_PREFIXES = ("on_",)
-
-# Base entity / framework fields that are valid but rarely tweaked.
-# Surfaced in forms but collapsed under "Advanced" by default.
-ADVANCED_BASE_KEYS: set[str] = {
-    "internal",
-    "disabled_by_default",
-    "entity_category",
-    "state_class",
-    "accuracy_decimals",
-    "force_update",
-    "setup_priority",
-    "expire_after",
-    "filters",
-    "interlock",
-    "interlock_wait_time",
-    # MQTT entity options
-    "qos",
-    "retain",
-    "discovery",
-    "subscribe_qos",
-    "state_topic",
-    "command_topic",
-    "availability",
-    # Zigbee entity options
-    "zigbee_sensor",
-    "zigbee_switch",
-    "zigbee_binary_sensor",
-    "zigbee_button",
-    "zigbee_cover",
-    "zigbee_climate",
-    "zigbee_fan",
-    "zigbee_light",
-    "zigbee_lock",
-    "zigbee_number",
-    "zigbee_select",
-    "zigbee_text",
-    "zigbee_text_sensor",
+# Numeric bounds inferred from ``data_type``.
+_DATA_TYPE_RANGE: dict[str, tuple[int, int]] = {
+    "uint8_t": (0, 255),
+    "hex_uint8_t": (0, 255),
+    "uint16_t": (0, 65535),
+    "uint32_t": (0, 4294967295),
+    "port": (0, 65535),
 }
 
-# Order in which entries appear in the rendered form. Both the
-# non-advanced and advanced sections sort by this priority — the
-# bucket (advanced vs. not) is decided separately by
-# _classify_advanced. Earlier in this tuple = sorted earlier.
-IMPORTANT_KEY_ORDER: tuple[str, ...] = (
-    # Discriminators come first — they decide which other fields render.
+# ``use_id_type`` is shaped ``"<namespace>::<ClassName>"``. Map the
+# namespace to the catalog's component domain. ``switch_`` has a
+# trailing underscore (the C++ namespace can't be ``switch``); we strip
+# it. Everything else is identity.
+_USE_ID_NAMESPACE_OVERRIDES: dict[str, str] = {
+    "switch_": "switch",
+    "binary_sensor": "binary_sensor",
+    "text_sensor": "text_sensor",
+}
+
+# Fields whose key appears in this set get auto-detected as a secret
+# value (renders masked in the form). Same heuristic as the previous
+# sync — schema doesn't tag these explicitly.
+_SECRET_KEY_FRAGMENTS = ("password", "passcode", "secret", "token", "api_key", "apikey")
+
+# Schema-time keys we don't expose to the user (build-system / preload).
+_SKIP_KEYS: frozenset[str] = frozenset({"mqtt_id", "zigbee_id", "then"})
+
+# Key-name prefixes for automation triggers (``on_press``, ``on_value``,
+# ``on_state_change``, ...). These are config-variables in YAML but the
+# frontend's form editor isn't where users wire automations — the
+# automation editor is. Skip them.
+_AUTOMATION_KEY_PREFIXES: tuple[str, ...] = ("on_",)
+
+# Map from the ``**type**`` doc prefix marker to our ConfigEntryType.
+# The schema docs lead with bracketed type names (``**[Time](...)**:``)
+# or bold scalars (``**boolean**:``); we strip the markup and look up
+# the resulting key here.
+_DOC_PREFIX_TYPES: dict[str, str] = {
+    "Time": "time_period",
+    "Time Period": "time_period",
+    "MAC Address": "mac_address",
+    "MAC": "mac_address",
+    "Pin": "pin",
+    "Color": "color",
+    "Lambda": "lambda",
+    "Icon": "icon",
+    "boolean": "boolean",
+    "float": "float",
+    "string": "string",
+    "int": "integer",
+    "Action": "nested",
+    "Automation": "nested",
+}
+
+# Time-period default values are short strings like ``"60s"``,
+# ``"5min"``, ``"1h30s"``. This regex matches that shape.
+_TIME_PERIOD_DEFAULT = re.compile(r"^\d+(\.\d+)?\s*(ms|us|ns|s|min|h|d)(\d+\s*\w+)*$")
+
+# Base entity / framework fields that always render under "Advanced" by
+# default — valid but rarely tweaked. Same set as the previous sync.
+_ADVANCED_BASE_KEYS: frozenset[str] = frozenset(
+    {
+        "internal",
+        "disabled_by_default",
+        "entity_category",
+        "state_class",
+        "accuracy_decimals",
+        "force_update",
+        "setup_priority",
+        "expire_after",
+        "filters",
+        "interlock",
+        "interlock_wait_time",
+        # MQTT entity options
+        "qos",
+        "retain",
+        "discovery",
+        "subscribe_qos",
+        "state_topic",
+        "command_topic",
+        "availability",
+        # Zigbee entity options
+        "zigbee_sensor",
+        "zigbee_switch",
+        "zigbee_binary_sensor",
+        "zigbee_button",
+        "zigbee_cover",
+        "zigbee_climate",
+        "zigbee_fan",
+        "zigbee_light",
+        "zigbee_lock",
+        "zigbee_number",
+        "zigbee_select",
+        "zigbee_text",
+        "zigbee_text_sensor",
+    }
+)
+
+# Order in which entries appear in the rendered form. The advanced/
+# main-form split is decided separately — this just controls relative
+# rank within each section.
+_IMPORTANT_KEY_ORDER: tuple[str, ...] = (
+    # Discriminators first — they decide which other fields render.
     "platform",
     "type",
     # Identification
     "name",
     "friendly_name",
     "icon",
-    # Credentials / connection (Wi-Fi, MQTT, OTA, API, ...)
+    # Credentials / connection
     "ssid",
     "password",
     "broker",
@@ -559,1795 +271,1240 @@ IMPORTANT_KEY_ORDER: tuple[str, ...] = (
     "inverted",
     # Common esphome-block metadata
     "area",
-    # Important fields that stay flagged advanced — sort first within
-    # the advanced section. Listed at the end so they appear after the
-    # prominent fields above.
+    # Important fields that stay flagged advanced — keep their sort
+    # priority but render under the "Advanced" section.
     "id",
     "comment",
 )
-IMPORTANT_KEYS: set[str] = set(IMPORTANT_KEY_ORDER)
-
-# Subset of IMPORTANT_KEYS that stays flagged as advanced. They keep
-# their sort priority but render under the form's "Advanced" section.
-ADVANCED_IMPORTANT_KEYS: set[str] = {"id", "comment"}
-
-# Friendly names for well-known components
-COMPONENT_NAMES: dict[str, str] = {
-    "adc": "ADC Analog-to-Digital Converter",
-    "ags10": "AGS10 VOC Gas Sensor",
-    "bh1750": "BH1750 Ambient Light Sensor",
-    "bme280_i2c": "BME280 I2C Temperature/Humidity/Pressure Sensor",
-    "bme280_spi": "BME280 SPI Temperature/Humidity/Pressure Sensor",
-    "bme680_i2c": "BME680 I2C Environmental Sensor",
-    "bmp280_i2c": "BMP280 I2C Pressure/Temperature Sensor",
-    "bmp280_spi": "BMP280 SPI Pressure/Temperature Sensor",
-    "dallas_temp": "Dallas 1-Wire Temperature Sensor",
-    "dht": "DHT Temperature & Humidity Sensor",
-    "ds18b20": "DS18B20 1-Wire Temperature Sensor",
-    "gpio": "GPIO Pin",
-    "hdc1080": "HDC1080 Temperature & Humidity Sensor",
-    "hlw8012": "HLW8012 Power Sensor",
-    "htu21d": "HTU21D Temperature & Humidity Sensor",
-    "hx711": "HX711 Load Cell Amplifier",
-    "ina219": "INA219 Current/Power Sensor",
-    "ina226": "INA226 Current/Power Sensor",
-    "max6675": "MAX6675 Thermocouple Sensor",
-    "mhz19": "MH-Z19 CO2 Sensor",
-    "neopixelbus": "NeoPixel LED Strip",
-    "pca9685": "PCA9685 PWM Driver",
-    "pmsx003": "PMSX003 Particulate Matter Sensor",
-    "rotary_encoder": "Rotary Encoder",
-    "scd30": "SCD30 CO2 Sensor",
-    "scd4x": "SCD4x CO2 Sensor",
-    "sgp30": "SGP30 Air Quality Sensor",
-    "sht3xd": "SHT3x-D Temperature & Humidity Sensor",
-    "ssd1306_i2c": "SSD1306 I2C OLED Display",
-    "ssd1306_spi": "SSD1306 SPI OLED Display",
-    "template": "Template (Virtual)",
-    "tsl2561": "TSL2561 Light Sensor",
-    "ultrasonic": "Ultrasonic Distance Sensor",
-    "veml7700": "VEML7700 Ambient Light Sensor",
-    "vl53l0x": "VL53L0X Laser Distance Sensor",
-}
-
+_IMPORTANT_KEYS: frozenset[str] = frozenset(_IMPORTANT_KEY_ORDER)
+# Subset of important keys that stay flagged advanced (id keeps its
+# sort priority but always lives under the advanced section).
+_ADVANCED_IMPORTANT_KEYS: frozenset[str] = frozenset({"id", "comment"})
 
 # ---------------------------------------------------------------------------
-# Schema parsing
+# CLI / main
 # ---------------------------------------------------------------------------
 
 
-# Leading boilerplate phrases stripped from descriptions. These add no
-# value to a UI tooltip — the rest of the sentence is the actual content.
-_DESC_LEAD_PHRASES = (
-    "instructions for setting up the ",
-    "instructions for setting up ",
-    "instructions for using the ",
-    "instructions for using ",
-)
+def main() -> int:
+    """Entry point — parse args, fetch schema, generate JSON."""
+    logging.basicConfig(format="%(message)s", level=logging.INFO)
 
-# Phrases that signal the rest of the text is not user-facing prose
-# (config-variable lists, ref links, etc.). When found we cut here.
-_DESC_STOP_PHRASES = (
-    "configuration variables:",
-    "configuration variables ",
-    "see the configuration variables",
-    "see :ref:",
-)
+    parser = argparse.ArgumentParser(
+        description="Generate components.json from ESPHome's pre-built schema bundle.",
+    )
+    parser.add_argument(
+        "--version",
+        help="ESPHome release tag to use (e.g. '2026.4.3'). Defaults to the latest GitHub release.",
+    )
+    parser.add_argument(
+        "--include-prereleases",
+        action="store_true",
+        help="When auto-selecting the latest release, also consider prereleases.",
+    )
+    parser.add_argument(
+        "--clean",
+        action="store_true",
+        help="Wipe cached schemas before fetching.",
+    )
+    parser.add_argument(
+        "--limit-component",
+        action="append",
+        default=[],
+        help="If given, only emit catalog entries for the listed component "
+        "ids (e.g. ``--limit-component dht --limit-component wifi``). "
+        "For local debugging.",
+    )
+    args = parser.parse_args()
+
+    if args.clean and _CACHE_ROOT.exists():
+        for d in _CACHE_ROOT.glob("esphome-schema-*"):
+            shutil.rmtree(d)
+
+    version = args.version or resolve_latest_release(
+        include_prereleases=args.include_prereleases,
+    )
+    _LOGGER.info("Using ESPHome schema version: %s", version)
+
+    schema_dir = ensure_schema(version)
+    _LOGGER.info("Schema cached at: %s", schema_dir)
+
+    catalog = build_catalog(
+        schema_dir=schema_dir,
+        limit=set(args.limit_component) or None,
+    )
+    _LOGGER.info(
+        "Built catalog: %d components, %d with config entries",
+        len(catalog),
+        sum(1 for c in catalog if c.get("config_entries")),
+    )
+
+    payload = {
+        "esphome_schema_version": version,
+        "components": [_strip_defaults(c) for c in catalog],
+    }
+    _OUTPUT_FILE.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    _LOGGER.info("Wrote %s", _OUTPUT_FILE)
+    return 0
 
 
-def _clean_description(raw: str) -> str:
+# ---------------------------------------------------------------------------
+# Schema fetcher (versioned, cached)
+# ---------------------------------------------------------------------------
+
+
+def resolve_latest_release(*, include_prereleases: bool = False) -> str:
+    """Return the latest release tag from the esphome-schema repo."""
+    _LOGGER.info("Fetching latest release tag from GitHub...")
+    releases = json.loads(_http_get(_RELEASES_API))
+    for r in releases:
+        if r.get("draft"):
+            continue
+        if r.get("prerelease") and not include_prereleases:
+            continue
+        return r["tag_name"]
+    msg = "No suitable release found on esphome-schema repo"
+    raise RuntimeError(msg)
+
+
+def ensure_schema(version: str) -> Path:
+    """Download and unpack the schema bundle for *version* if not cached."""
+    cache_dir = _CACHE_ROOT / f"esphome-schema-{version}"
+    schema_dir = cache_dir / "schema"
+    if schema_dir.exists() and any(schema_dir.iterdir()):
+        return schema_dir
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    url = _SCHEMA_URL_TEMPLATE.format(version=version)
+    _LOGGER.info("Downloading %s", url)
+    data = _http_get(url, timeout=120)
+    with zipfile.ZipFile(BytesIO(data)) as zf:
+        zf.extractall(cache_dir)
+
+    if not schema_dir.exists():
+        msg = f"Schema bundle layout unexpected — missing {schema_dir}"
+        raise RuntimeError(msg)
+    return schema_dir
+
+
+def _http_get(url: str, *, timeout: int = 30) -> bytes:
+    """GET *url* with our identifying User-Agent and return raw bytes."""
+    req = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+# ---------------------------------------------------------------------------
+# Schema loader
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SchemaIndex:
+    """Pre-built docs index for every component in the schema bundle.
+
+    Three indexes feed this:
+
+    - ``esphome.json -> core.components[<id>]`` — non-platform components
+      (wifi, api, esp32_ble_tracker, ...) carrying ``docs`` and
+      ``dependencies`` lists.
+    - ``esphome.json -> core.platforms[<domain>]`` — the platform domain
+      entries themselves (sensor, switch, ...).
+    - ``<domain>.json -> <domain>.components[<id>]`` — every platform-
+      providing component (dht under sensor, gpio under switch, ...).
+      These carry only ``docs`` (no dependencies — derive from the
+      domain).
+
+    All three are merged under one key shape so callers don't need to
+    know which index a component lives in.
     """
-    Trim ESPHome doc descriptions to the user-facing intro paragraph.
 
-    Strips leading boilerplate ("Instructions for setting up the ...")
-    and capitalises the new first word so the sentence still reads
-    naturally. Any trailing config-variables list or sphinx :ref:
-    directive is cut.
-    """
-    if not raw:
-        return ""
-
-    cleaned = raw.strip()
-    lower = cleaned.lower()
-    for phrase in _DESC_LEAD_PHRASES:
-        if lower.startswith(phrase):
-            cleaned = cleaned[len(phrase) :]
-            cleaned = cleaned[:1].upper() + cleaned[1:] if cleaned else cleaned
-            lower = cleaned.lower()
-            break
-
-    cut = len(cleaned)
-    for phrase in _DESC_STOP_PHRASES:
-        idx = lower.find(phrase)
-        if idx != -1 and idx < cut:
-            cut = idx
-    cleaned = cleaned[:cut].strip().rstrip(".:- \n\t")
-    if cleaned and cleaned[-1] not in ".!?":
-        cleaned += "."
-    return cleaned
+    # Maps the catalog id (``<domain>.<stem>`` for platform-providing
+    # components, bare id otherwise) to its metadata block.
+    metadata: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
-def _key_name(key: Any) -> str:
-    """Extract the string name from a voluptuous key."""
-    if isinstance(key, str):
-        return key
-    if hasattr(key, "schema"):
-        return str(key.schema)
-    return str(key)
+def load_index(schema_dir: Path) -> SchemaIndex:
+    """Read every index in the bundle into one merged SchemaIndex."""
+    metadata: dict[str, dict[str, Any]] = {}
 
-
-def _key_to_label(key: str) -> str:
-    """Convert a config key to a human label."""
-    return key.replace("_", " ").title()
-
-
-# Keys flagged ``cv.Required`` in CONFIG_SCHEMA but whose value is
-# injected by ESPHome at preload time — the user is free to omit them
-# from YAML even though the schema says they're required. We don't
-# surface a required indicator on these.
-_PRELOAD_INJECTED_KEYS: frozenset[str] = frozenset({"build_path"})
-
-
-def _is_required(key: Any) -> bool:
-    """
-    Check if a voluptuous key is required from the user's perspective.
-
-    Voluptuous has "Required with default" keys that are technically
-    flagged Required but always satisfied by the default value — the
-    user doesn't need to set them. ``_PRELOAD_INJECTED_KEYS`` covers
-    a smaller set of fields that have no compile-time default but get
-    injected during ESPHome's preload pass. Treat both as optional so
-    the form doesn't push a red asterisk on a field whose absence is
-    fine.
-    """
-    if not isinstance(key, vol.Required):
-        return False
-    if _key_name(key) in _PRELOAD_INJECTED_KEYS:
-        return False
-    has_default = getattr(key, "default", vol.UNDEFINED) is not vol.UNDEFINED
-    return not has_default
-
-
-def _get_default(key: Any) -> Any:
-    """
-    Return the platform-agnostic default value of a voluptuous key.
-
-    Returns None when there is no default or accessing it raises. Some
-    ESPHome defaults are descriptors that look up CORE.data, which
-    isn't always populated during sync — KeyError is the common
-    failure mode there.
-
-    ``cv.SplitDefault`` keys explicitly return None here — their
-    per-platform map is surfaced separately by
-    :func:`_get_platform_defaults`. Frontend looks up the device's
-    target platform there and only falls back to ``default_value``
-    when the platform isn't listed.
-    """
-    if hasattr(key, "_defaults"):
-        return None
-
+    # 1. esphome.json — core.components and core.platforms.
     try:
-        default = getattr(key, "default", vol.UNDEFINED)
-    except Exception:
-        return None
-    if default is vol.UNDEFINED:
-        return None
-    if callable(default):
-        try:
-            default = default()
-        except Exception:
-            return None
-    return _normalise_time_value(default)
+        core = (json.loads((schema_dir / "esphome.json").read_text()) or {}).get("core") or {}
+    except FileNotFoundError:
+        core = {}
+    for cid, meta in (core.get("components") or {}).items():
+        metadata[cid] = meta or {}
+    for pid, meta in (core.get("platforms") or {}).items():
+        metadata[pid] = meta or {}
 
-
-def _get_platform_defaults(key: Any) -> dict[str, Any]:
-    """
-    Return ``{platform: default_value}`` for a ``cv.SplitDefault`` key.
-
-    Returns an empty dict for keys that aren't SplitDefault or whose
-    per-platform factories can't be invoked. Each factory is called
-    directly so we don't have to fully populate ESPHome's CORE state.
-    """
-    factories = getattr(key, "_defaults", None)
-    if not isinstance(factories, dict):
-        return {}
-    out: dict[str, Any] = {}
-    for platform, factory in factories.items():
-        try:
-            value = factory() if callable(factory) else factory
-        except Exception:  # noqa: S112 — defaults are user-controlled; skip ones we can't resolve
+    # 2. Each <domain>.json — domain.components map. Key under both the
+    # bare stem and the qualified ``<domain>.<stem>`` form so lookups
+    # work regardless of which the caller has on hand.
+    for domain in _PLATFORM_DOMAINS:
+        domain_file = schema_dir / f"{domain}.json"
+        if not domain_file.exists():
             continue
-        out[platform] = _normalise_time_value(value)
-    return out
+        try:
+            domain_raw = json.loads(domain_file.read_text())
+        except Exception:  # noqa: S112 — index-only file, broken JSON is non-fatal
+            continue
+        section = domain_raw.get(domain) or {}
+        for cid, meta in (section.get("components") or {}).items():
+            qualified = f"{domain}.{cid}"
+            metadata.setdefault(qualified, meta or {})
+            metadata.setdefault(cid, meta or {})
+
+    return SchemaIndex(metadata=metadata)
 
 
-def _normalise_time_value(value: Any) -> Any:
-    """Render TimePeriod-like objects as their YAML string form."""
-    if hasattr(value, "total_seconds"):
-        return f"{int(value.total_seconds())}s"
-    if hasattr(value, "total_milliseconds"):
-        return f"{int(value.total_milliseconds)}ms"
-    return value
+def iter_schema_files(schema_dir: Path) -> Iterable[Path]:
+    """Yield every <component>.json under *schema_dir*."""
+    yield from sorted(schema_dir.glob("*.json"))
 
 
-# Lambda-only validators captured once at module load — re-resolved every
-# call would be wasteful and `set` construction trips on unhashable items.
-_LAMBDA_VALIDATORS: tuple[Any, ...] = tuple(
-    v for v in (getattr(cv, n, None) for n in ("returning_lambda", "lambda_")) if v is not None
+# ---------------------------------------------------------------------------
+# Description cleaner
+# ---------------------------------------------------------------------------
+
+
+# Leading ``**type**:`` prefix pasted in front of every field doc.
+_DOCS_TYPE_PREFIX = re.compile(
+    r"^\*\*[^*]+\*\*\s*[:\-]\s*",
 )
 
-# Identity-mapping of cv-singletons to the type they represent. Tuples
-# group validators that share a type. Order doesn't matter — the first
-# match wins.
-_CV_TYPE_BY_IDENTITY: tuple[tuple[tuple[Any, ...], dict[str, Any]], ...] = tuple(
-    (tuple(filter(None, validators)), result)
-    for validators, result in (
-        ((getattr(cv, "boolean", None),), {"type": "boolean"}),
-        ((getattr(cv, "string", None), getattr(cv, "string_strict", None)), {"type": "string"}),
-        (
-            (
-                getattr(cv, "int_", None),
-                getattr(cv, "positive_int", None),
-                getattr(cv, "positive_not_null_int", None),
-            ),
-            {"type": "integer"},
-        ),
-        ((getattr(cv, "float_", None), getattr(cv, "positive_float", None)), {"type": "float"}),
-        ((getattr(cv, "icon", None),), {"type": "icon"}),
-        ((getattr(cv, "port", None),), {"type": "integer", "range_min": 1, "range_max": 65535}),
-        ((getattr(cv, "mac_address", None),), {"type": "mac_address"}),
-        ((getattr(cv, "hex_int", None),), {"type": "integer"}),
-    )
-)
-
-# Validator-name → type fallback table. Used after identity checks fail —
-# many ESPHome custom validators are recognisable by name alone.
-_NAME_TYPE_MAP: tuple[tuple[tuple[str, ...], dict[str, Any]], ...] = (
-    # Secure strings — passwords, encryption keys, OTA passwords
-    (("validate_password", "password", "passcode", "encryption_key"), {"type": "secure_string"}),
-    # Generic string-shaped validators
-    (
-        (
-            "ssid",
-            "domain_name",
-            "hostname",
-            "validate_area_config",
-            "validate_includes",
-            "include",
-            "string_strict",
-        ),
-        {"type": "string"},
-    ),
-    # Byte-count / numeric helpers
-    (("validate_bytes", "validate_buffer_size"), {"type": "integer"}),
-    (("frequency",), {"type": "float"}),
-    # Hardware references
-    (("use_id", "declare_id", "sub_device_id"), {"type": "id"}),
-    # Lambda variants
-    (("returning_lambda", "lambda_"), {"type": "lambda"}),
-    # Color helpers
-    (("rgb_color", "color"), {"type": "color"}),
+# Trailing ``*See also: [Name](url)*`` link — we extract the URL as
+# help_link / docs_url and then drop the footer from the description.
+_DOCS_SEE_ALSO = re.compile(
+    r"\s*\*See also:\s*\[([^\]]+)\]\(([^)]+)\)\*\s*$",
 )
 
 
-def _identify_validator(validator: Any) -> dict[str, Any]:
-    """
-    Map a voluptuous validator to a config-entry type description.
-
-    The returned dict always carries a ``type`` key plus optional
-    ``options``, ``range_min``, ``range_max`` and ``templatable``
-    keys. Falls back to ``{"type": "unknown"}`` when no rule matches.
-    """
-    name = getattr(validator, "__name__", "") or ""
-    qualname = getattr(validator, "__qualname__", "") or ""
-    name_lower = name.lower()
-    vmod = getattr(validator, "__module__", "") or ""
-
-    # cv.templatable wraps another validator and accepts !lambda OR a literal.
-    # The wrapped function is named `validator` but its qualname carries
-    # `templatable.<locals>.validator` — that's the reliable signature.
-    if "templatable" in qualname.lower() and getattr(validator, "__closure__", None):
-        return _unwrap_templatable(validator)
-
-    # cv.ensure_list(inner) accepts a single value or a list of them.
-    # The wrapper's qualname is `ensure_list.<locals>.validator` and
-    # the inner validator lives in its closure. Surface as multi_value
-    # so the frontend renders an add/remove list.
-    if qualname.startswith("ensure_list.") and getattr(validator, "__closure__", None):
-        return _unwrap_ensure_list(validator)
-
-    # cv.use_id(SomeClass) produces a wrapper whose qualname is
-    # `use_id.<locals>.validator` and whose closure carries a
-    # MockObjClass for the referenced ESPHome type. Extract the
-    # component domain (the C++ namespace) so the frontend can show
-    # a dropdown of matching components in the device.
-    if qualname.startswith("use_id.") and getattr(validator, "__closure__", None):
-        ref = _extract_use_id_reference(validator)
-        result: dict[str, Any] = {"type": "id"}
-        if ref:
-            result["references_component"] = ref
-        return result
-
-    # cv.declare_id(SomeClass) produces a wrapper whose qualname is
-    # `declare_id.<locals>.validator`. Used for the component's own
-    # id (auto-generated when omitted). Just mark as ID type.
-    if qualname.startswith("declare_id."):
-        return {"type": "id"}
-
-    if any(validator is v for v in _LAMBDA_VALIDATORS):
-        return {"type": "lambda"}
-
-    for validators, result in _CV_TYPE_BY_IDENTITY:
-        if any(validator is v for v in validators):
-            return dict(result)
-
-    # esphome.pins.<anything> validators all describe GPIO pins
-    if vmod == "esphome.pins" or ("pin" in name_lower and "spin" not in name_lower):
-        return {"type": "pin"}
-
-    # Time periods (cv.time_period_*, cv.update_interval, ...)
-    if "time_period" in name_lower or name == "update_interval":
-        return {"type": "time_period"}
-
-    # Name-based lookup table
-    for names, result in _NAME_TYPE_MAP:
-        if name_lower in names or name in names:
-            return dict(result)
-
-    # vol.Coerce(int|float)
-    if isinstance(validator, vol.Coerce):
-        if validator.type is int:
-            return {"type": "integer"}
-        if validator.type is float:
-            return {"type": "float"}
-
-    # vol.Range — bare range constraint, default to float
-    if isinstance(validator, vol.Range):
-        return {"type": "float", "range_min": validator.min, "range_max": validator.max}
-
-    # vol.Any — union of validators; first identifiable wins
-    if isinstance(validator, vol.Any):
-        for inner in validator.validators:
-            inner_result = _identify_validator(inner)
-            if inner_result["type"] != "unknown":
-                return inner_result
-
-    # vol.All — chained validation; gather range constraints and
-    # identify the primary type from inner validators (last to first).
-    if isinstance(validator, vol.All):
-        return _identify_vol_all(validator)
-
-    # Closure-based detection: enum mappings, int/float ranges
-    closure_result = _identify_from_closure(validator, name_lower)
-    if closure_result is not None:
-        return closure_result
-
-    # Sub-schemas (anything carrying a dict .schema attribute that doesn't
-    # look like a primitive) — caller decides whether to recurse into them.
-    if hasattr(validator, "schema") and isinstance(validator.schema, dict):
-        return {"type": "sub_schema", "schema": validator}
-
-    # Last-resort name hints for fields whose validator name still
-    # carries a type clue.
-    if "mac_address" in name_lower or "bind_key" in name_lower:
-        return {"type": "mac_address" if "mac" in name_lower else "string"}
-    if "string" in name_lower:
-        return {"type": "string"}
-    if "hex" in name_lower:
-        return {"type": "integer"}
-    if "address" in name_lower:
-        return {"type": "integer"}
-
-    # Late nested-schema check: some component-private wrappers (e.g.
-    # api._encryption_schema) are bare functions that delegate to a
-    # module-level Schema constant. _unwrap_schema follows that chain
-    # via _find_module_schema. If it resolves, mark as sub_schema so
-    # the caller emits it as a nested config group rather than letting
-    # the catch-all fallback below misclassify it as a string.
-    if callable(validator) and _unwrap_schema(validator) is not None:
-        return {"type": "sub_schema", "schema": validator}
-
-    # Fallback: any function defined in esphome.config_validation or
-    # esphome.components.* that we couldn't otherwise classify is
-    # overwhelmingly a string-shaped validator (custom string formats —
-    # domain names, area names, encryption keys, MAC addresses, ...).
-    # Component-private validators (validate_encryption_key,
-    # validate_password, ...) get picked up here too.
-    if callable(validator) and (
-        vmod == "esphome.config_validation" or vmod.startswith("esphome.components.")
-    ):
-        return {"type": "string"}
-
-    return {"type": "unknown"}
-
-
-def _unwrap_ensure_list(validator: Any) -> dict[str, Any]:
-    """
-    Identify a ``cv.ensure_list``-wrapped validator.
-
-    Returns the inner validator's identification with ``multi_value``
-    set to True. Falls back to a multi-value string when the inner
-    validator can't be identified.
-    """
-    for cell in validator.__closure__:
-        try:
-            inner = cell.cell_contents
-        except (ValueError, TypeError):
-            continue
-        if callable(inner) and inner is not validator:
-            inner_result = _identify_validator(inner)
-            if inner_result["type"] == "unknown":
-                continue
-            inner_result["multi_value"] = True
-            return inner_result
-    return {"type": "string", "multi_value": True}
-
-
-def _extract_use_id_reference(validator: Any) -> str | None:
-    """
-    Return the component domain a ``cv.use_id`` validator references.
-
-    ``cv.use_id(SomeClass)`` carries a ``MockObjClass`` in its closure
-    whose ``.base`` attribute holds the C++ qualified name like
-    ``"output::FloatOutput"``. The first segment is the ESPHome
-    component the referenced id must be declared in. Returns None
-    when the closure shape doesn't match.
-    """
-    closure = getattr(validator, "__closure__", None)
-    if not closure:
-        return None
-    for cell in closure:
-        try:
-            value = cell.cell_contents
-        except (ValueError, TypeError):
-            continue
-        base = getattr(value, "base", None)
-        if isinstance(base, str) and "::" in base:
-            return base.split("::", 1)[0]
-    return None
-
-
-def _unwrap_templatable(validator: Any) -> dict[str, Any]:
-    """
-    Identify a ``cv.templatable``-wrapped validator.
-
-    Returns the identified inner type with ``templatable=True`` attached.
-    Falls back to a templatable string if the inner validator can't be
-    identified.
-    """
-    for cell in validator.__closure__:
-        try:
-            inner = cell.cell_contents
-        except (ValueError, TypeError):
-            continue
-        if callable(inner) and inner is not validator:
-            inner_result = _identify_validator(inner)
-            inner_result["templatable"] = True
-            return inner_result
-    return {"type": "string", "templatable": True}
-
-
-def _identify_vol_all(validator: vol.All) -> dict[str, Any]:
-    """
-    Identify the effective type of a ``vol.All`` chain.
-
-    Range bounds from ``vol.Range`` are merged onto whichever inner
-    validator wins type identification. A nested-schema inner
-    validator takes precedence over a primitive one — chains like
-    ``vol.All(<dict schema>, validate_scan_parameters)`` should
-    surface as a nested config group, not as a string from the
-    cv-fallback that catches the trailing post-validator. When no
-    validator matches but a Range is present, the range alone is
-    returned.
-    """
-    range_info: dict[str, Any] = {}
-    for inner in validator.validators:
-        if isinstance(inner, vol.Range):
-            range_info = {"range_min": inner.min, "range_max": inner.max}
-        elif isinstance(inner, vol.Coerce):
-            if inner.type is int:
-                range_info.setdefault("type", "integer")
-            elif inner.type is float:
-                range_info.setdefault("type", "float")
-
-    sub_schema_result: dict[str, Any] | None = None
-    primitive_result: dict[str, Any] | None = None
-    for inner in reversed(validator.validators):
-        inner_result = _identify_validator(inner)
-        if inner_result["type"] == "unknown":
-            continue
-        if inner_result["type"] == "sub_schema":
-            sub_schema_result = inner_result
-        elif primitive_result is None:
-            primitive_result = inner_result
-
-    chosen = sub_schema_result or primitive_result
-    if chosen is not None:
-        chosen.update(
-            {k: v for k, v in range_info.items() if k not in chosen or k.startswith("range")}
-        )
-        return chosen
-
-    if range_info.get("type"):
-        return range_info
-    return {"type": "unknown"}
-
-
-def _identify_from_closure(validator: Any, name_lower: str) -> dict[str, Any] | None:
-    """
-    Identify a validator from its closure cells.
-
-    Looks for an enum dict (becomes ``options``) or a numeric range
-    (int_range / float_range). Returns None when the closure carries
-    no recognisable signal.
-    """
-    closure = getattr(validator, "__closure__", None)
-    if not closure:
-        return None
-
-    # Enum mapping {label: value} → drop-down with primitive value type.
-    # Always emit options as ConfigValueOption-shaped dicts so the
-    # JSON contract is uniform. Empty-string values get a friendly
-    # "(none)" label so the frontend doesn't render a blank row.
-    for cell in closure:
-        try:
-            val = cell.cell_contents
-        except (ValueError, TypeError):
-            continue
-        if isinstance(val, dict) and val and all(isinstance(k, str) for k in val):
-            return {"type": "string", "options": [_make_option(k) for k in val]}
-
-    # Numeric range
-    if "int_range" in name_lower or "float_range" in name_lower:
-        range_min = None
-        range_max = None
-        for cell in closure:
-            try:
-                val = cell.cell_contents
-            except (ValueError, TypeError):
-                continue
-            if isinstance(val, (int, float)):
-                if range_min is None:
-                    range_min = val
-                else:
-                    range_max = val
-        base_type = "integer" if "int" in name_lower else "float"
-        return {"type": base_type, "range_min": range_min, "range_max": range_max}
-
-    return None
-
-
-def _is_sub_entity_schema(validator: Any) -> bool:
-    """Check if a validator is a platform entity sub-schema (like sensor_schema)."""
-    if not hasattr(validator, "schema") or not isinstance(validator.schema, dict):
-        return False
-    # Sub-entity schemas have platform base keys like name, device_class, state_class
-    schema_keys = {_key_name(k) for k in validator.schema}
-    entity_keys = {
-        "name",
-        "device_class",
-        "state_class",
-        "unit_of_measurement",
-        "accuracy_decimals",
-    }
-    return len(schema_keys & entity_keys) >= 2
-
-
-# Key-name fragments that imply the value is sensitive — when the validator
-# resolves to a generic STRING we upgrade these to SECURE_STRING so the
-# frontend masks them.
-_SECRET_KEY_FRAGMENTS = ("password", "passcode", "secret", "token", "api_key", "apikey")
-
-# Inherited base-entity fields whose presence on the device only
-# matters when a specific transport / gateway component is also
-# configured. Frontend hides these unless the named component is
-# present in the device's YAML, so a switch on a Wi-Fi-only device
-# doesn't show qos/retain/state_topic etc. (which are MQTT-only).
-_FIELD_COMPONENT_DEPENDENCY: dict[str, str] = {
-    # MQTT entity options
-    "qos": "mqtt",
-    "retain": "mqtt",
-    "discovery": "mqtt",
-    "subscribe_qos": "mqtt",
-    "state_topic": "mqtt",
-    "command_topic": "mqtt",
-    "command_retain": "mqtt",
-    "availability": "mqtt",
-    # Zigbee entity options
-    "zigbee_sensor": "zigbee",
-    "zigbee_switch": "zigbee",
-    "zigbee_binary_sensor": "zigbee",
-    "zigbee_button": "zigbee",
-    "zigbee_cover": "zigbee",
-    "zigbee_climate": "zigbee",
-    "zigbee_fan": "zigbee",
-    "zigbee_light": "zigbee",
-    "zigbee_lock": "zigbee",
-    "zigbee_number": "zigbee",
-    "zigbee_select": "zigbee",
-    "zigbee_text": "zigbee",
-    "zigbee_text_sensor": "zigbee",
-}
-
-
-def _is_generate_id(key: Any) -> bool:
-    """
-    Detect a ``cv.GenerateID`` (or ``cv.declare_id``) voluptuous key.
-
-    Matches by class name to avoid importing the private symbol.
-    """
-    return type(key).__name__ in ("GenerateID", "DeclareID")
-
-
-def _build_id_entry(key_name: str, key: Any) -> dict:
-    """
-    Build the config entry for an auto-generated component ID.
-
-    Always flagged advanced — most users let ESPHome derive the id —
-    but sorted first within the advanced section so it's easy to find
-    when a user does want to set it explicitly.
-    """
-    return {
-        "key": key_name,
-        "type": "id",
-        "label": _key_to_label(key_name),
-        "required": False,
-        "default_value": None,
-        "options": None,
-        "range": None,
-        "advanced": True,
-        "translation_key": f"component.config.{key_name}",
-    }
-
-
-def _build_entry(key: Any, validator: Any) -> dict | None:
-    """
-    Build a single config-entry dict.
-
-    Returns None when the validator is unrecognised or describes a
-    nested schema — the caller decides how to handle those cases.
-    """
-    info = _identify_validator(validator)
-    if info["type"] in ("unknown", "sub_schema"):
-        return None
-
-    key_name = _key_name(key)
-    required = _is_required(key)
-    default = _get_default(key)
-
-    # Promote generic strings to secure_string for fields whose key
-    # name OR validator name implies credentials. Picks up cases like
-    # api.encryption.key (key is generic but the validator is
-    # ``validate_encryption_key``) and deprecated cv.invalid()
-    # wrappers where the YAML key alone (``password``) is the signal.
-    entry_type = info["type"]
-    validator_name = (getattr(validator, "__name__", "") or "").lower()
-    if entry_type == "string" and (
-        any(frag in key_name.lower() for frag in _SECRET_KEY_FRAGMENTS)
-        or any(frag in validator_name for frag in _SECRET_KEY_FRAGMENTS)
-        or "encryption_key" in validator_name
-    ):
-        entry_type = "secure_string"
-
-    range_val: list[Any] | None = None
-    if info.get("range_min") is not None or info.get("range_max") is not None:
-        range_val = [info.get("range_min"), info.get("range_max")]
-
-    references = info.get("references_component")
-    # Structural fields — wiring (use_id references) and hardware
-    # connections (PIN-typed entries) — are kept on the main form
-    # even when the schema marks them optional. Users almost always
-    # want to see what's wired where.
-    is_structural = bool(references) or info["type"] == "pin"
-    advanced = False if is_structural else _classify_advanced(key_name, required)
-
-    entry: dict[str, Any] = {
-        "key": key_name,
-        "type": entry_type,
-        "label": _key_to_label(key_name),
-        "required": required,
-        "default_value": default if not callable(default) else None,
-        "options": info.get("options"),
-        "range": range_val,
-        "advanced": advanced,
-        "translation_key": f"component.config.{key_name}",
-    }
-
-    platform_defaults = _get_platform_defaults(key)
-    if platform_defaults:
-        entry["platform_defaults"] = platform_defaults
-
-    if info.get("templatable"):
-        entry["templatable"] = True
-
-    if info.get("multi_value"):
-        entry["multi_value"] = True
-
-    component_dependency = _FIELD_COMPONENT_DEPENDENCY.get(key_name)
-    if component_dependency:
-        entry["depends_on_component"] = component_dependency
-
-    if references:
-        entry["references_component"] = references
-
-    return entry
-
-
-def _sort_entries(entries: list[dict]) -> list[dict]:
-    """
-    Sort config entries into a consistent display order.
-
-    The form should read:
-
-        1. Required fields (in priority order, then schema order)
-        2. Important optional fields (id, name, icon, device_class, ...)
-           in IMPORTANT_KEY_ORDER
-        3. Other non-advanced optional fields, in schema order
-        4. Advanced fields, in schema order
-
-    Schema order is preserved within each bucket via the original
-    index — meaning equally-ranked fields keep the order ESPHome's
-    voluptuous schema gave us.
-    """
-    important_rank = {key: i for i, key in enumerate(IMPORTANT_KEY_ORDER)}
-    not_important = len(IMPORTANT_KEY_ORDER)
-
-    def sort_key(item: tuple[int, dict]) -> tuple[int, int, int]:
-        idx, entry = item
-        key = entry["key"]
-        rank = important_rank.get(key, not_important)
-        if entry.get("advanced"):
-            bucket = 3
-        elif entry.get("required"):
-            bucket = 0
-        elif key in important_rank:
-            bucket = 1
-        else:
-            bucket = 2
-        return (bucket, rank, idx)
-
-    return [entry for _idx, entry in sorted(enumerate(entries), key=sort_key)]
-
-
-def _load_platform_enums() -> dict[str, dict[str, list[str]]]:
-    """
-    Load device_class / state_class enums from each ESPHome platform module.
-
-    Returns ``{platform: {"device_class": [...], "state_class": [...]}}``
-    so per-platform entries can populate the right options for their
-    domain. Platforms without these constants are simply absent from
-    the result.
-    """
-    out: dict[str, dict[str, list[str]]] = {}
-    components_dir = Path(const.__file__).parent / "components"
-    for d in sorted(components_dir.iterdir()):
-        if not d.is_dir() or d.name.startswith("_"):
-            continue
-        try:
-            module = importlib.import_module(f"esphome.components.{d.name}")
-        except Exception:  # noqa: S112 — missing optional deps are common
-            continue
-        enums: dict[str, list[str]] = {}
-        for src_attr, dst_key in (
-            ("DEVICE_CLASSES", "device_class"),
-            ("STATE_CLASSES", "state_class"),
-        ):
-            value = getattr(module, src_attr, None)
-            if value and hasattr(value, "__iter__"):
-                enums[dst_key] = [str(v) for v in value]
-        if enums:
-            out[d.name] = enums
-    return out
-
-
-def _load_entity_categories() -> list[str]:
-    """Load the universal ``entity_category`` options from cv."""
-    raw = getattr(cv, "ENTITY_CATEGORIES", None)
+@dataclass
+class CleanedDocs:
+    text: str
+    name: str | None = None  # extracted from "[Name](url)" link
+    url: str | None = None
+
+
+def clean_docs(raw: str | None) -> CleanedDocs:
+    """Strip type prefix and ``See also`` footer; surface both as fields."""
     if not raw:
-        return []
-    return list(raw.keys() if hasattr(raw, "keys") else raw)
+        return CleanedDocs("")
+    text = raw.strip()
+    name: str | None = None
+    url: str | None = None
+    m = _DOCS_SEE_ALSO.search(text)
+    if m:
+        name = m.group(1).strip()
+        url = m.group(2).strip()
+        text = text[: m.start()].rstrip()
+    text = _DOCS_TYPE_PREFIX.sub("", text)
+    return CleanedDocs(text=text.strip(), name=name, url=url)
 
 
-def _load_units_of_measurement() -> list[str]:
-    """
-    Load every ``UNIT_*`` constant from esphome.const.
-
-    These are suggestions rather than a strict closed set — ESPHome's
-    ``validate_unit_of_measurement`` accepts any string. Frontend can
-    render the list as autocomplete suggestions while still allowing
-    free-form input for custom units.
-    """
-    units: list[str] = []
-    for attr in dir(const):
-        if not attr.startswith("UNIT_"):
-            continue
-        value = getattr(const, attr, None)
-        if isinstance(value, str):
-            units.append(value)
-    # Stable order: empty first (the "no unit" option), then alphabetical
-    units = sorted(set(units), key=lambda v: (v != "", v))
-    return units
+# ---------------------------------------------------------------------------
+# Build catalog (top-level)
+# ---------------------------------------------------------------------------
 
 
-_PLATFORM_ENUMS: dict[str, dict[str, list[str]]] = _load_platform_enums()
-_ENTITY_CATEGORIES: list[str] = _load_entity_categories()
-_UNITS_OF_MEASUREMENT: list[str] = _load_units_of_measurement()
-
-
-# Fields where the injected ``options`` are autocomplete suggestions
-# rather than a closed enum — frontend should allow custom input.
-_SUGGESTION_FIELDS: frozenset[str] = frozenset({"unit_of_measurement"})
-
-
-def _apply_enum_options_recursive(entries: list[dict], platform: str | None) -> None:
-    """
-    Inject enum options for the entries and recurse into NESTED ones.
-
-    For an entity-typed nested entry (``platform_type`` set) we use
-    that as the platform context for the inner entries; for plain
-    nested groups we keep the outer platform.
-    """
-    _inject_enum_options(entries, platform)
-    for entry in entries:
-        nested = entry.get("config_entries")
-        if not nested:
-            continue
-        inner_platform = entry.get("platform_type") or platform
-        _apply_enum_options_recursive(nested, inner_platform)
-
-
-def _inject_enum_options(entries: list[dict], platform: str | None) -> None:
-    """
-    Populate ``options`` for entity-base fields that lack them.
-
-    ``device_class`` / ``state_class`` come from the platform's own
-    constants; ``entity_category`` is universal; ``unit_of_measurement``
-    is sourced from the ``UNIT_*`` constants in esphome.const (acting
-    as autocomplete suggestions — ESPHome itself accepts any string).
-    Fields listed in :data:`_SUGGESTION_FIELDS` get
-    ``allow_custom_value=True`` so the frontend renders a combobox
-    instead of a strict dropdown.
-
-    Only fills in options when the entry doesn't already have any —
-    domain-specific enums picked up by the schema introspection win.
-    """
-    platform_enums = _PLATFORM_ENUMS.get(platform, {}) if platform else {}
-    for entry in entries:
-        if entry.get("options"):
-            continue
-        key = entry["key"]
-        values: list[str] | None = None
-        if key in ("device_class", "state_class"):
-            values = platform_enums.get(key)
-        elif key == "entity_category":
-            values = _ENTITY_CATEGORIES
-        elif key == "unit_of_measurement":
-            values = _UNITS_OF_MEASUREMENT
-        if not values:
-            continue
-        entry["options"] = [_make_option(v) for v in values]
-        if key in _SUGGESTION_FIELDS:
-            entry["allow_custom_value"] = True
-
-
-def _make_option(value: str) -> dict[str, str]:
-    """
-    Build a ``ConfigValueOption``-shaped dict for a SELECT option.
-
-    Empty-string values get a ``"(none)"`` label so the frontend
-    renders a meaningful row; everything else uses the value as both
-    the label and the YAML-serialised value.
-    """
-    if value == "":
-        return {"label": "(none)", "value": ""}
-    return {"label": value, "value": value}
-
-
-def _classify_advanced(key_name: str, required: bool) -> bool:
-    """
-    Decide whether a config entry should be hidden under "Advanced".
-
-    Order of precedence:
-
-    1. Required fields are never advanced.
-    2. ADVANCED_IMPORTANT_KEYS (id, comment, area) are advanced even
-       though they're "important" — they keep their sort priority but
-       render under "Advanced".
-    3. IMPORTANT_KEYS are not advanced.
-    4. ADVANCED_BASE_KEYS are always advanced.
-    5. Anything else falls back to "advanced when optional".
-    """
-    if required:
-        return False
-    if key_name in ADVANCED_IMPORTANT_KEYS:
-        return True
-    if key_name in IMPORTANT_KEYS:
-        return False
-    if key_name in ADVANCED_BASE_KEYS:
-        return True
-    return True
-
-
-def _all_inner_advanced(inner_entries: list[dict]) -> bool:
-    """
-    Return True iff every inner entry is flagged advanced.
-
-    Used to propagate ``advanced`` up to a NESTED parent: when none of
-    the children would be visible on the main form anyway, there's no
-    reason to expose the collapsible group there either. Empty groups
-    return False so they don't get hidden by accident.
-    """
-    if not inner_entries:
-        return False
-    return all(e.get("advanced") for e in inner_entries)
-
-
-def _unwrap_schema(schema: Any) -> dict | None:
-    """
-    Find the dict schema buried inside vol.All / vol.Schema wrappers.
-
-    ESPHome wraps many CONFIG_SCHEMAs in ``cv.All(...)`` for chained
-    validation (version checks, post-processing). The actual
-    key-validator mapping lives inside one of the wrapped validators.
-
-    Some components also wrap nested schemas in tiny pre-validators
-    (``def _encryption_schema(config): ... return ENCRYPTION_SCHEMA(config)``).
-    Those are opaque functions, so we look up a matching ``*_SCHEMA``
-    constant in the function's module as a fallback.
-    """
-    if isinstance(schema, dict):
-        return schema
-    inner = getattr(schema, "schema", None)
-    if isinstance(inner, dict):
-        return inner
-    if isinstance(schema, vol.All):
-        for v in schema.validators:
-            unwrapped = _unwrap_schema(v)
-            if unwrapped is not None:
-                return unwrapped
-    if callable(schema):
-        related = _find_module_schema(schema)
-        if related is not None and related is not schema:
-            return _unwrap_schema(related)
-    return None
-
-
-def _find_module_schema(validator: Any) -> Any:
-    """
-    Look up a ``*_SCHEMA`` constant in the validator's module by name.
-
-    Handles wrappers like ``_encryption_schema`` → ``ENCRYPTION_SCHEMA``
-    and ``validate_foo`` → ``FOO_SCHEMA``. Returns the matching constant
-    or None when no candidate exists.
-    """
-    name = getattr(validator, "__name__", "") or ""
-    if not name:
-        return None
-    module = sys.modules.get(getattr(validator, "__module__", "") or "")
-    if module is None:
-        return None
-    base = name.lstrip("_")
-    if base.startswith("validate_"):
-        base = base[len("validate_") :]
-    if base.endswith("_schema"):
-        base = base[: -len("_schema")]
-    base = base.strip("_")
-    candidates = (
-        f"{base.upper()}_SCHEMA",
-        f"{name.upper().lstrip('_')}",
-        f"{base.upper()}",
-    )
-    for candidate in candidates:
-        related = getattr(module, candidate, None)
-        if related is None:
-            continue
-        if isinstance(related, dict) or hasattr(related, "schema") or isinstance(related, vol.All):
-            return related
-    return None
-
-
-def _unwrap_typed_schema(validator: Any) -> dict[str, Any] | None:
-    """
-    Find a ``cv.typed_schema`` dict inside *validator*.
-
-    Components like ``output.template``, ``datetime.template`` and many
-    BLE-client platforms use ``cv.typed_schema({type_value: sub_schema,
-    ...})`` to discriminate on a ``type:`` field. The wrapper function
-    has ``typed_schema`` in its ``__qualname__`` and stores the dict in
-    its closure. Returns the discriminator dict or None when not found.
-    """
-    candidates: list[Any] = []
-    if isinstance(validator, vol.All):
-        candidates.extend(validator.validators)
-    else:
-        candidates.append(validator)
-
-    for candidate in candidates:
-        qualname = getattr(candidate, "__qualname__", "") or ""
-        if "typed_schema" not in qualname:
-            continue
-        closure = getattr(candidate, "__closure__", None)
-        if not closure:
-            continue
-        for cell in closure:
-            try:
-                value = cell.cell_contents
-            except (ValueError, TypeError):
-                continue
-            if (
-                isinstance(value, dict)
-                and value
-                and all(_unwrap_schema(v) is not None for v in value.values())
-            ):
-                return value
-    return None
-
-
-def _parse_schema(
-    schema: Any,
-    component_id: str,
-    field_descriptions: dict[str, str] | None = None,
+def build_catalog(
+    *,
+    schema_dir: Path,
+    limit: set[str] | None = None,
 ) -> list[dict]:
-    """
-    Parse a CONFIG_SCHEMA into a flat list of config entries.
-
-    Nested schemas (entity sub-readings, plain config groups) become
-    NESTED ConfigEntry instances inline in the returned list, each
-    carrying their own ``config_entries``.
-
-    *field_descriptions* maps key-names to per-field help text pulled
-    from the component docs. When given, it populates the
-    ``description`` of each entry so the frontend can render an info
-    tooltip per field.
-    """
-    field_descriptions = field_descriptions or {}
-
-    typed_dict = _unwrap_typed_schema(schema)
-    if typed_dict is not None:
-        return _parse_typed_schema(typed_dict, component_id, field_descriptions)
-
-    entries: list[dict] = []
-
-    schema_dict = _unwrap_schema(schema)
-    if schema_dict is None:
-        return entries
-
-    for key, validator in schema_dict.items():
-        key_name = _key_name(key)
-
-        if key_name in SKIP_KEYS:
-            continue
-        if any(key_name.startswith(p) for p in AUTOMATION_KEY_PREFIXES):
-            continue
-
-        # Entity sub-entry (DHT's temperature/humidity readings) —
-        # emit as a NESTED ConfigEntry carrying platform_type.
-        if _is_sub_entity_schema(validator):
-            entries.append(_build_entity_nested_entry(key_name, validator, field_descriptions))
-            continue
-
-        entry = _build_entry(key, validator)
-        if _is_generate_id(key):
-            # GenerateID always means an ID field. If the validator
-            # wasn't recognised, build a minimal ID entry; if it was
-            # but produced a non-id type (e.g. component-private
-            # wrappers like uart's _uart_declare_type), force it.
-            if entry is None:
-                entry = _build_id_entry(key_name, key)
-            elif entry.get("type") != "id":
-                entry["type"] = "id"
-                entry["advanced"] = _classify_advanced(key_name, entry["required"])
-        if entry is not None:
-            _attach_description(entry, field_descriptions)
-            entries.append(entry)
-            continue
-
-        # Plain nested config group — a dict-shaped sub-schema that
-        # didn't resolve to a primitive type. Emit as a NESTED
-        # ConfigEntry without a platform_type (e.g.
-        # esp32_ble_tracker.scan_parameters, api.encryption).
-        nested = _unwrap_schema(validator)
-        if nested is not None:
-            entries.append(_build_plain_nested_entry(key_name, nested, field_descriptions))
-
-    return _sort_entries(entries)
-
-
-def _parse_typed_schema(
-    typed_dict: dict[str, Any],
-    component_id: str,
-    field_descriptions: dict[str, str],
-) -> list[dict]:
-    """
-    Expand a ``cv.typed_schema`` into a flat list with a ``type`` discriminator.
-
-    The first entry is a SELECT-style ``type`` field with one option
-    per type-key in the typed_schema. Fields shared across every
-    type-key are emitted unconditionally; type-specific fields are
-    gated with ``depends_on=type, depends_on_value=<key>``.
-    """
-    type_options = [_make_option(k) for k in sorted(typed_dict.keys())]
-    entries: list[dict] = [
-        {
-            "key": "type",
-            "type": "string",
-            "label": "Type",
-            "required": True,
-            "default_value": None,
-            "options": type_options,
-            "range": None,
-            "advanced": False,
-            "translation_key": "component.config.type",
-            "description": field_descriptions.get("type"),
-        }
-    ]
-
-    # Walk each sub-schema once, capturing key→entry per type
-    per_type: dict[str, dict[str, dict]] = {}
-    for type_value, sub_schema in typed_dict.items():
-        sub_dict = _unwrap_schema(sub_schema)
-        if sub_dict is None:
-            per_type[type_value] = {}
-            continue
-        per_type[type_value] = _parse_subdict_to_map(sub_dict)
-
-    # A field is "common" when present in every type with the same
-    # serialised representation — emit those unconditionally.
-    common: dict[str, dict] = {}
-    if per_type:
-        all_keys = (
-            set.intersection(*(set(m.keys()) for m in per_type.values())) if per_type else set()
-        )
-        for key_name in all_keys:
-            sample = next(iter(per_type.values()))[key_name]
-            if all(per_type[t].get(key_name) == sample for t in per_type):
-                common[key_name] = sample
-    for entry in common.values():
-        e = dict(entry)
-        _attach_description(e, field_descriptions)
-        entries.append(e)
-
-    # Type-specific fields gated by depends_on
-    for type_value, by_key in per_type.items():
-        for key_name, entry in by_key.items():
-            if key_name in common:
-                continue
-            e = dict(entry)
-            e["depends_on"] = "type"
-            e["depends_on_value"] = type_value
-            _attach_description(e, field_descriptions)
-            entries.append(e)
-
-    return _sort_entries(entries)
-
-
-def _parse_subdict_to_map(schema_dict: dict) -> dict[str, dict]:
-    """
-    Build a ``{key_name: entry_dict}`` map from a raw schema dict.
-
-    Used by typed-schema expansion to compare per-type field shapes.
-    Skipped keys / automation prefixes / unrecognised validators are
-    omitted so the comparison only sees real, surfaced fields.
-    """
-    result: dict[str, dict] = {}
-    for key, validator in schema_dict.items():
-        key_name = _key_name(key)
-        if key_name in SKIP_KEYS:
-            continue
-        if any(key_name.startswith(p) for p in AUTOMATION_KEY_PREFIXES):
-            continue
-        entry = _build_entry(key, validator)
-        if _is_generate_id(key):
-            if entry is None:
-                entry = _build_id_entry(key_name, key)
-            elif entry.get("type") != "id":
-                entry["type"] = "id"
-                entry["advanced"] = _classify_advanced(key_name, entry["required"])
-        if entry is not None:
-            result[key_name] = entry
-    return result
-
-
-def _build_entity_nested_entry(
-    key_name: str,
-    validator: Any,
-    field_descriptions: dict[str, str] | None = None,
-) -> dict:
-    """
-    Build a NESTED ConfigEntry for an entity sub-reading.
-
-    Used for fields like DHT.temperature / DHT.humidity where the
-    parent schema embeds an entity sub-schema (something with name +
-    device_class + state_class). The resulting entry carries
-    ``platform_type`` so the frontend applies platform-default fields
-    (name, icon, ...) on top of the inner config entries.
-    """
-    field_descriptions = field_descriptions or {}
-    schema_keys = {_key_name(k) for k in validator.schema}
-    platform_type = "sensor"
-    if "brightness" in schema_keys or "color_mode" in schema_keys:
-        platform_type = "light"
-    elif "device_class" in schema_keys:
-        vmod = getattr(validator, "__module__", "")
-        for pt in ("sensor", "binary_sensor", "text_sensor", "number", "switch"):
-            if pt in vmod:
-                platform_type = pt
-                break
-
-    inner = _build_inner_entries(validator.schema, field_descriptions)
-    return {
-        "key": key_name,
-        "type": "nested",
-        "label": _key_to_label(key_name),
-        "required": False,
-        "advanced": _all_inner_advanced(inner),
-        "translation_key": f"component.config.{key_name}",
-        "platform_type": platform_type,
-        "config_entries": _sort_entries(inner),
-    }
-
-
-def _build_plain_nested_entry(
-    key_name: str,
-    nested_schema: dict,
-    field_descriptions: dict[str, str] | None = None,
-) -> dict:
-    """
-    Build a NESTED ConfigEntry for a plain config-group dict.
-
-    Used for blocks like ``esp32_ble_tracker.scan_parameters`` and
-    ``api.encryption`` that bundle related settings without
-    representing entities. ``platform_type`` is omitted so the
-    frontend renders a plain collapsible nested form.
-    """
-    field_descriptions = field_descriptions or {}
-    inner = _build_inner_entries(nested_schema, field_descriptions)
-    return {
-        "key": key_name,
-        "type": "nested",
-        "label": _key_to_label(key_name),
-        "required": False,
-        "advanced": _all_inner_advanced(inner),
-        "translation_key": f"component.config.{key_name}",
-        "config_entries": _sort_entries(inner),
-    }
-
-
-def _build_inner_entries(
-    schema_dict: dict,
-    field_descriptions: dict[str, str],
-) -> list[dict]:
-    """Build the inner ConfigEntry list for a nested schema dict."""
+    """Walk every schema file and produce ConfigCatalogEntry-shaped dicts."""
+    index = load_index(schema_dir)
+    image_map = load_image_map()
     out: list[dict] = []
-    for sk, sv in schema_dict.items():
-        sk_name = _key_name(sk)
-        if sk_name in SKIP_KEYS:
+    for path in iter_schema_files(schema_dir):
+        if path.name == "esphome.json":
             continue
-        if any(sk_name.startswith(p) for p in AUTOMATION_KEY_PREFIXES):
+        try:
+            entries = build_entries_from_file(path, index, schema_dir, image_map)
+        except Exception:
+            _LOGGER.exception("Failed to build catalog entries from %s", path.name)
             continue
-        entry = _build_entry(sk, sv)
-        if _is_generate_id(sk):
-            if entry is None:
-                entry = _build_id_entry(sk_name, sk)
-            elif entry.get("type") != "id":
-                entry["type"] = "id"
-                entry["advanced"] = _classify_advanced(sk_name, entry["required"])
-        if entry is not None:
-            _attach_description(entry, field_descriptions)
+        for entry in entries:
+            if limit and entry["id"] not in limit:
+                continue
             out.append(entry)
     return out
 
 
-# ---------------------------------------------------------------------------
-# Component discovery
-# ---------------------------------------------------------------------------
+def load_image_map() -> dict[str, str]:
+    """Parse the docs ``components/index.mdx`` for image URLs.
 
+    The index page renders a tiled list of components where each entry
+    is a JSX-array literal:
 
-def _discover_platform_types() -> set[str]:
-    """Find all platform component types in ESPHome."""
-    components_dir = Path(const.__file__).parent / "components"
-    platform_types = set()
-    for comp_dir in components_dir.iterdir():
-        if not comp_dir.is_dir() or comp_dir.name.startswith("_"):
+        ["Name", "/components/<category>/<id>/", "<image>.svg", ...]
+
+    We match those rows and produce a ``component_id -> image_url`` map
+    where ``component_id`` matches our catalog ids (qualified with
+    ``<domain>.<id>`` for platform-providing components).
+
+    No ImagesMap if the docs file can't be fetched — image_url stays
+    empty for every component.
+    """
+    cache_file = _CACHE_ROOT / "esphome-docs-index.mdx"
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    if not cache_file.exists():
+        try:
+            cache_file.write_bytes(_http_get(_DOCS_INDEX_URL))
+        except Exception:
+            _LOGGER.warning(
+                "Could not fetch docs index page — image URLs will be empty",
+            )
+            return {}
+
+    text = cache_file.read_text(errors="ignore")
+    pattern = re.compile(
+        r'\["([^"]+)",\s*"(/components/[^"]+)",\s*"([^"]+)"',
+    )
+    out: dict[str, str] = {}
+    for _name, path, image in pattern.findall(text):
+        # Path examples:
+        #   /components/wifi/         -> "wifi"
+        #   /components/sensor/dht/   -> "sensor.dht"
+        #   /components/sensor/       -> "sensor" (the domain page itself)
+        parts = [p for p in path.strip("/").split("/")[1:] if p]
+        if not parts:
             continue
-        try:
-            manifest = get_component(comp_dir.name)
-            if manifest and manifest.is_platform_component:
-                platform_types.add(comp_dir.name)
-        except Exception:
-            pass
-    return platform_types
+        if len(parts) >= 2:
+            component_id = f"{parts[0]}.{parts[1]}"
+        else:
+            component_id = parts[0]
+        out.setdefault(component_id, _IMAGE_BASE_URL + image)
+        # Also store under the bare stem when only one platform exists,
+        # so lookups by either id work.
+        if len(parts) >= 2:
+            out.setdefault(parts[1], _IMAGE_BASE_URL + image)
+    _LOGGER.info("Image map built: %d components", len(out))
+    return out
 
 
-def _get_component_platforms(component_id: str, platform_types: set[str]) -> list[str]:
-    """Find which platform types a component provides."""
-    platforms = []
-    for pt in platform_types:
-        try:
-            manifest = get_platform(pt, component_id)
-            if manifest and manifest.config_schema:
-                platforms.append(pt)
-        except Exception:
-            pass
-    return platforms
+def build_entries_from_file(
+    path: Path,
+    index: SchemaIndex,
+    schema_dir: Path,
+    image_map: dict[str, str],
+) -> list[dict]:
+    """Build one or more catalog entries from a single schema JSON file."""
+    raw = json.loads(path.read_text())
+    out: list[dict] = []
+    for top_key, section in raw.items():
+        if top_key in _HIDDEN_TOP_LEVEL:
+            continue
+        if not isinstance(section, dict):
+            continue
+        entry = build_component_entry(top_key, section, index, schema_dir, image_map)
+        if entry is not None:
+            out.append(entry)
+    return out
 
 
-def _determine_category(component_id: str, platforms: list[str]) -> str:
-    """Determine the category for a component."""
-    if component_id in CATEGORY_OVERRIDES:
-        return CATEGORY_OVERRIDES[component_id]
-    if platforms:
-        # Prefer sensor > binary_sensor > others
-        for preferred in ("sensor", "binary_sensor", "switch", "light", "fan", "cover"):
-            if preferred in platforms:
-                return preferred
-        return platforms[0]
-    return "misc"
-
-
-def _generate_name(component_id: str, category: str, docs_meta: dict | None = None) -> str:
-    """Generate a human-readable name for a component."""
-    # Prefer docs title
-    if docs_meta and docs_meta.get("title"):
-        return docs_meta["title"]
-    if component_id in COMPONENT_NAMES:
-        return COMPONENT_NAMES[component_id]
-    name = component_id.replace("_", " ").replace("-", " ").title()
-    return name
-
-
-# Platform components whose sub-platforms should be folded into a single
-# multi-conf entry with a `platform` discriminator. The user-facing model
-# in YAML for these is `<id>: [- platform: X, ...]` — they belong together
-# in the catalog rather than being scattered across their providers.
-_UNIFIED_PLATFORM_COMPONENTS: tuple[str, ...] = ("ota", "time", "audio_dac", "audio_adc")
-
-
-def _build_unified_platform_component(
-    platform_id: str,
-    component_dirs: list[str],
-    docs_meta: dict[str, dict[str, str]] | None,
+def build_component_entry(
+    top_key: str,
+    section: dict,
+    index: SchemaIndex,
+    schema_dir: Path,
+    image_map: dict[str, str],
 ) -> dict | None:
+    """Convert one ``<id>.json`` top-level entry to our catalog shape.
+
+    The schema's qualifier order is ``<stem>.<domain>`` (e.g.
+    ``dht.sensor``). We surface ids as ``<domain>.<stem>`` to match the
+    rest of our codebase.
+
+    Returns None for entries that don't represent a user-facing
+    component: bare platform-domain headers (``sensor``, ``switch``)
+    and schema-only entries (``bme280_base``, ``as3935`` hub) without
+    their own ``CONFIG_SCHEMA``.
     """
-    Build a unified catalog entry for a platform component.
-
-    Discovers all components that register a sub-platform under
-    ``platform_id``, gathers each sub-platform's CONFIG_SCHEMA, and
-    folds them into a single entry with:
-
-      - a ``platform`` SELECT field listing every available sub-platform
-      - the parent's ``BASE_<ID>_SCHEMA`` fields (common to all platforms)
-      - per-platform fields gated by ``depends_on=platform`` so the form
-        only shows fields relevant to the chosen platform
-    """
-    providers: list[tuple[str, Any]] = []
-    for cid in component_dirs:
-        try:
-            pm = get_platform(platform_id, cid)
-        except Exception:  # noqa: S112 — many components don't provide this platform
-            continue
-        if pm and pm.config_schema:
-            providers.append((cid, pm.config_schema))
-
-    if not providers:
+    if not _has_config_schema(section):
         return None
 
-    # Common base schema (BASE_OTA_SCHEMA, BASE_TIME_SCHEMA, ...)
-    common_entries: list[dict] = []
-    seen_keys: set[str] = set()
-    try:
-        parent_module = importlib.import_module(f"esphome.components.{platform_id}")
-    except Exception:
-        parent_module = None
-    if parent_module is not None:
-        base_schema = getattr(parent_module, f"BASE_{platform_id.upper()}_SCHEMA", None)
-        if base_schema is not None:
-            base_dict = _unwrap_schema(base_schema)
-            if base_dict:
-                for key, validator in base_dict.items():
-                    key_name = _key_name(key)
-                    if key_name in SKIP_KEYS or any(
-                        key_name.startswith(p) for p in AUTOMATION_KEY_PREFIXES
-                    ):
-                        continue
-                    entry = _build_entry(key, validator)
-                    if _is_generate_id(key):
-                        if entry is None:
-                            entry = _build_id_entry(key_name, key)
-                        elif entry.get("type") != "id":
-                            entry["type"] = "id"
-                            entry["advanced"] = _classify_advanced(key_name, entry["required"])
-                    if entry is not None:
-                        common_entries.append(entry)
-                        seen_keys.add(key_name)
+    domain, stem = _split_qualified_key(top_key)
+    if domain in _PLATFORM_DOMAINS:
+        category = domain
+        component_id = f"{domain}.{stem}"
+    elif top_key in _PLATFORM_DOMAINS:
+        # The bare platform domain itself (sensor:, switch:, ...) — not
+        # a user-facing component. Skip.
+        return None
+    else:
+        category = _infer_misc_category(top_key)
+        component_id = top_key
 
-    platform_options = [_make_option(p) for p in sorted(p for p, _ in providers)]
-    config_entries: list[dict] = [
-        {
-            "key": "platform",
-            "type": "string",
-            "label": "Platform",
-            "required": True,
-            "default_value": None,
-            "options": platform_options,
-            "range": None,
-            "advanced": False,
-            "translation_key": "component.config.platform",
-        }
-    ]
-    config_entries.extend(common_entries)
+    config_entries = _extract_config_entries(section, schema_dir=schema_dir)
 
-    # Per-platform fields, gated by the discriminator
-    for platform_name, schema in providers:
-        platform_dict = _unwrap_schema(schema)
-        if not platform_dict:
-            continue
-        for key, validator in platform_dict.items():
-            key_name = _key_name(key)
-            if key_name in SKIP_KEYS or any(
-                key_name.startswith(p) for p in AUTOMATION_KEY_PREFIXES
-            ):
-                continue
-            if key_name in seen_keys:
-                continue  # already covered by base schema or platform itself
-            entry = _build_entry(key, validator)
-            if _is_generate_id(key):
-                if entry is None:
-                    entry = _build_id_entry(key_name, key)
-                elif entry.get("type") != "id":
-                    entry["type"] = "id"
-                    entry["advanced"] = _classify_advanced(key_name, entry["required"])
-            if entry is None:
-                continue
-            entry["depends_on"] = "platform"
-            entry["depends_on_value"] = platform_name
-            config_entries.append(entry)
+    meta = _lookup_index_meta(component_id, top_key, index)
+    docs = clean_docs(meta.get("docs"))
+    dependencies = list(meta.get("dependencies") or [])
 
-    docs = (docs_meta or {}).get(platform_id, {})
-    name = docs.get("title") or _generate_name(platform_id, "core", docs)
-    description = _clean_description(docs.get("description", ""))
-
-    return {
-        "id": platform_id,
-        "name": name,
-        "description": description,
-        "category": "core",
-        "docs_url": f"https://esphome.io/components/{platform_id}",
-        "image_url": "",
-        "dependencies": [],
-        "multi_conf": True,
-        "supported_platforms": [],
-        "config_entries": _sort_entries(config_entries),
-    }
-
-
-_TARGET_PLATFORMS = frozenset(
-    {"esp32", "esp8266", "rp2040", "bk72xx", "rtl87xx", "ln882x", "nrf52", "host"}
-)
-
-
-def _sync_component(
-    component_id: str,
-    platform_types: set[str],
-    docs_meta: dict[str, dict[str, str]] | None = None,
-) -> list[dict]:
-    """
-    Sync a single component directory.
-
-    Returns a list of catalog entries — most components produce a
-    single entry, but components that provide multiple platforms (like
-    ``template``, ``gpio``, ``ble_client``) yield one entry per
-    platform with a domain-qualified id (``<domain>.<component_id>``).
-    Hub-style components that ALSO have their own top-level schema
-    (``ble_client``, ``daly_bms``, ...) produce both the parent entry
-    and the per-platform entries.
-    """
-    try:
-        manifest = get_component(component_id)
-    except Exception as exc:
-        _LOGGER.warning("Failed to load component %s: %s", component_id, exc)
-        return []
-
-    if manifest is None or manifest.is_platform_component:
-        # Platform-component aggregators (sensor, binary_sensor, ...) are
-        # surfaced as unified entries elsewhere; target platforms
-        # (esp32, esp8266, ...) ARE included because users configure
-        # them directly and they pass the is_platform_component check.
-        return []
-
-    platforms = _get_component_platforms(component_id, platform_types)
-    docs = docs_meta or {}
-    dependencies = list(manifest.dependencies) if manifest.dependencies else []
-    supported = [d for d in dependencies if str(d) in _TARGET_PLATFORMS]
-    if manifest.is_target_platform:
-        supported = [component_id]
-
-    entries: list[dict] = []
-
-    # Hub / top-level entry under the unqualified id, only when the
-    # component itself has a top-level CONFIG_SCHEMA or doesn't
-    # provide any platforms at all. Examples:
-    #   - wifi / api / esphome — own schema, no platforms
-    #   - ble_client / daly_bms — own schema (the hub) AND platforms
-    #     (the sensor / switch / etc. providers)
-    # Pure platform providers (dht, ledc, status, adc, template, ...)
-    # have no own schema and skip this branch — they're emitted only
-    # under their qualified <domain>.<id> form below.
-    if manifest.config_schema is not None or not platforms:
-        entries.append(
-            _build_component_entry(
-                component_id=component_id,
-                manifest=manifest,
-                platforms=platforms,
-                schema=manifest.config_schema,
-                docs=docs,
-                dependencies=dependencies,
-                supported_platforms=supported,
-            )
-        )
-
-    # Per-platform entries — emitted for ANY platform-providing
-    # component (single or multi). The qualified form (<domain>.<id>)
-    # is consistent with how users think about platform configs in
-    # YAML: a "sensor" with `platform: dht`, an "output" with
-    # `platform: ledc`, etc.
-    if platforms:
-        for platform_name in platforms:
-            entry = _build_platform_entry(
-                component_id=component_id,
-                platform_name=platform_name,
-                manifest=manifest,
-                docs=docs,
-                dependencies=dependencies,
-                supported_platforms=supported,
-            )
-            if entry is not None:
-                entries.append(entry)
-
-    return entries
-
-
-def _build_component_entry(
-    *,
-    component_id: str,
-    manifest: Any,
-    platforms: list[str],
-    schema: Any,
-    docs: dict[str, dict[str, str]],
-    dependencies: list[str],
-    supported_platforms: list[str],
-) -> dict:
-    """Build the parent / hub entry for a component."""
-    category = _determine_category(component_id, platforms)
-    comp_docs = _resolve_docs(component_id, docs)
-    name = _generate_name(component_id, category, comp_docs)
-    description = _clean_description(comp_docs.get("description", ""))
-    field_descriptions = dict(comp_docs.get("field_descriptions") or {})
-
-    config_entries: list[dict] = []
-    primary: str | None = None
-    if schema is not None:
-        try:
-            config_entries = _parse_schema(schema, component_id, field_descriptions)
-        except Exception as exc:
-            _LOGGER.warning("Failed to parse schema for %s: %s", component_id, exc)
-    elif platforms:
-        # Single-platform component with no own schema — surface its
-        # platform schema under the short id (e.g. dht as `dht`).
-        primary = _primary_platform(platforms)
-        # Inherit base-platform field descriptions so common entity
-        # fields (name, id, device_class, ...) carry tooltips.
-        merged = _merge_field_descriptions(docs, primary, field_descriptions)
-        try:
-            platform_manifest = get_platform(primary, component_id)
-            if platform_manifest and platform_manifest.config_schema:
-                config_entries = _parse_schema(
-                    platform_manifest.config_schema, component_id, merged
-                )
-        except Exception as exc:
-            _LOGGER.warning("Failed to parse schema for %s/%s: %s", primary, component_id, exc)
-
-    _apply_enum_options_recursive(config_entries, primary)
+    # Narrow esphome introspection — adds multi_conf, platform_defaults
+    # and supported_platforms which the schema bundle doesn't surface.
+    # No-ops when esphome isn't importable.
+    introspection = introspect_component(stem if domain else top_key)
+    _apply_platform_defaults(config_entries, introspection.get("platform_defaults") or {})
 
     return {
         "id": component_id,
-        "name": name,
-        "description": description,
+        "name": _resolve_name(component_id, stem, docs.name),
+        "description": docs.text,
         "category": category,
-        "docs_url": _build_docs_url(component_id, category),
-        "image_url": _build_image_url(comp_docs, category),
+        "docs_url": _strip_anchor(docs.url or ""),
+        "image_url": image_map.get(component_id) or image_map.get(stem) or "",
         "dependencies": dependencies,
-        "multi_conf": bool(manifest.multi_conf),
-        "supported_platforms": supported_platforms,
+        "multi_conf": introspection.get("multi_conf", False),
+        "supported_platforms": _derive_supported_platforms(
+            stem if domain else top_key,
+            dependencies,
+            introspection,
+        ),
         "config_entries": config_entries,
     }
 
 
-def _build_platform_entry(
+# ---------------------------------------------------------------------------
+# Schema → ConfigEntry conversion
+# ---------------------------------------------------------------------------
+
+
+def _extract_config_entries(
+    section: dict,
     *,
-    component_id: str,
-    platform_name: str,
-    manifest: Any,
-    docs: dict[str, dict[str, str]],
-    dependencies: list[str],
-    supported_platforms: list[str],
-) -> dict | None:
-    """
-    Build a per-platform entry for a multi-platform component.
+    schema_dir: Path,
+) -> list[dict]:
+    """Walk ``schemas.CONFIG_SCHEMA`` and produce our ConfigEntry list.
 
-    Used when a single component implements several platforms — e.g.
-    ``template`` shows up as ``sensor.template``, ``switch.template``,
-    ``binary_sensor.template`` etc. Each entry uses the qualified id
-    so the catalog presents them as distinct user-facing options.
+    Resolves ``extends`` references inline so the entry list reflects
+    the merged schema the user will see (e.g. ``dht.sensor.humidity``
+    inherits the base ``sensor._SENSOR_SCHEMA`` fields).
     """
-    try:
-        platform_manifest = get_platform(platform_name, component_id)
-    except Exception:
-        return None
-    if platform_manifest is None or platform_manifest.config_schema is None:
-        return None
+    schemas = section.get("schemas") or {}
+    config_schema = schemas.get("CONFIG_SCHEMA") or {}
+    schema = config_schema.get("schema") or {}
+    if not schema:
+        return []
+    return _convert_config_vars(schema, schema_dir)
 
-    qualified_id = f"{platform_name}.{component_id}"
-    qualified_docs = docs.get(qualified_id) or _resolve_docs(component_id, docs)
-    field_descriptions = _merge_field_descriptions(
-        docs, platform_name, qualified_docs.get("field_descriptions") or {}
-    )
-    domain_label = platform_name.replace("_", " ").title()
-    title = qualified_docs.get("title", "")
-    if title:
-        name = title
+
+def _convert_config_vars(schema_node: dict, schema_dir: Path) -> list[dict]:
+    """Convert a ``schema`` node (config_vars + extends) to a list of entries."""
+    config_vars = dict(schema_node.get("config_vars") or {})
+
+    # Inline ``extends`` references — fields from referenced base
+    # schemas appear before the local ones, then local ones override.
+    extended: dict[str, dict] = {}
+    for ref in schema_node.get("extends") or []:
+        extended.update(_resolve_extends(ref, schema_dir))
+    merged = {**extended, **config_vars}
+
+    out: list[dict] = []
+    for key, raw in merged.items():
+        if key in _SKIP_KEYS:
+            continue
+        if any(key.startswith(p) for p in _AUTOMATION_KEY_PREFIXES):
+            continue
+        entry = _convert_field(key, raw or {}, schema_dir)
+        if entry is None:
+            continue
+        out.append(entry)
+    return _sort_entries(out)
+
+
+def _resolve_extends(ref: str, schema_dir: Path) -> dict[str, dict]:
+    """Look up an ``extends`` reference and return its config_vars.
+
+    *ref* is shaped ``<file>.<schema_name>`` — e.g.
+    ``sensor._SENSOR_SCHEMA``, ``core.positive_time_period_milliseconds``.
+    For schemas that themselves carry ``extends`` we recurse so the full
+    ancestry is flattened into one config_vars dict.
+    """
+    parts = ref.split(".")
+    if len(parts) < 2:
+        return {}
+    file_name = parts[0]
+    schema_name = ".".join(parts[1:])
+    path = schema_dir / f"{file_name}.json"
+    if not path.exists():
+        return {}
+    raw = json.loads(path.read_text())
+
+    # The schema may live under ``raw[file_name]`` (our usual case) or
+    # at deeper qualified keys. Search both layers.
+    candidates: list[dict] = []
+    for top_value in raw.values():
+        if not isinstance(top_value, dict):
+            continue
+        schemas = top_value.get("schemas") or {}
+        if schema_name in schemas:
+            candidates.append(schemas[schema_name])
+
+    if not candidates:
+        return {}
+    target = candidates[0]
+    schema_node = target.get("schema") or {}
+    inner = dict(schema_node.get("config_vars") or {})
+    # Recurse into nested extends so the merged map carries everything.
+    for sub in schema_node.get("extends") or []:
+        for k, v in _resolve_extends(sub, schema_dir).items():
+            inner.setdefault(k, v)
+    return inner
+
+
+def _convert_field(key: str, raw: dict, schema_dir: Path) -> dict | None:
+    """Build a single ConfigEntry dict from a schema's config_var entry."""
+    if not isinstance(raw, dict):
+        # Some schemas use bare ``{}``-shaped placeholders for fields
+        # whose details live in an extends-referenced base. Treat as
+        # plain string optional.
+        raw = {}
+
+    # Required vs Optional vs GeneratedID
+    schema_key = raw.get("key")
+    required = schema_key == "Required"
+    is_generated_id = schema_key == "GeneratedID"
+
+    schema_type = raw.get("type")
+    inner_schema = raw.get("schema")
+    data_type = raw.get("data_type")
+
+    # GeneratedID is always a (mostly-hidden) ID field.
+    if is_generated_id:
+        return _build_id_entry(key, raw)
+
+    # Resolve the entry type. Priority: explicit type → data_type
+    # → enum shape → extends → docs hints → default-value hints → string.
+    docs_text = raw.get("docs") or ""
+    extends = (inner_schema or {}).get("extends") if isinstance(inner_schema, dict) else None
+
+    entry_type = _TYPE_MAP.get(schema_type or "")
+    if entry_type is None and data_type in _DATA_TYPE_PRIMITIVE:
+        entry_type = _DATA_TYPE_PRIMITIVE[data_type]
+
+    # An ``enum`` whose values are ``true`` and ``false`` is really a
+    # boolean — the schema uses cv.boolean which produces this shape.
+    if (entry_type == "string" or entry_type is None) and _looks_like_boolean_enum(raw):
+        entry_type = "boolean"
+    elif entry_type is None and "values" in raw:
+        entry_type = "string"  # enum-shaped (options below)
+
+    # ``extends: ["core.positive_time_period_*"]`` collapses to time_period
+    # — even when the schema marked the entry as ``type: schema`` (most
+    # _SENSOR_SCHEMA fields like ``expire_after`` come through that way).
+    if extends and not (inner_schema or {}).get("config_vars"):
+        for ref in extends:
+            if "time_period" in ref:
+                entry_type = "time_period"
+                break
+            if ref.endswith(".positive_float") or ref.endswith(".float_"):
+                entry_type = "float"
+                break
+            if "positive_int" in ref or ref.endswith(".int_"):
+                entry_type = "integer"
+                break
+
+    # Docs-prefix hints — fields without explicit type lead with
+    # ``**type**:`` markers we can parse out.
+    if entry_type is None:
+        prefix = _docs_type_marker(docs_text)
+        entry_type = _DOC_PREFIX_TYPES.get(prefix)
+
+    # Default-value hints — bare time strings like ``"60s"``, ``"5min"``.
+    if entry_type is None and _looks_like_time_period_default(raw.get("default")):
+        entry_type = "time_period"
+
+    # Key-name fallback — ``icon`` / ``mac_address`` are usually
+    # untyped strings in the schema.
+    if entry_type is None:
+        if key == "icon":
+            entry_type = "icon"
+
+    if entry_type is None and inner_schema and inner_schema.get("config_vars"):
+        entry_type = "nested"
+    if entry_type is None:
+        entry_type = "string"
+
+    # Type promotion: schema-given ``string`` whose key/name implies a
+    # secret -> secure_string.
+    if entry_type == "string" and any(frag in key.lower() for frag in _SECRET_KEY_FRAGMENTS):
+        entry_type = "secure_string"
+
+    # Cleaned docs ⇒ description + help_link/docs_url candidate.
+    docs = clean_docs(raw.get("docs"))
+    references = _resolve_use_id_reference(raw)
+
+    # Structural fields (wiring + pin selection) are kept on the main
+    # form even when optional — users almost always want to see what's
+    # wired to what.
+    is_structural = entry_type == "pin" or bool(references)
+    advanced = _classify_advanced(key, required=required, is_structural=is_structural)
+
+    entry: dict[str, Any] = {
+        "key": key,
+        "type": entry_type,
+        "label": _key_to_label(key),
+        "description": docs.text or None,
+        "required": required,
+        "default_value": _coerce_default(raw.get("default")),
+        "options": _build_options(raw),
+        "allow_custom_value": False,
+        "range": list(_DATA_TYPE_RANGE[data_type]) if data_type in _DATA_TYPE_RANGE else None,
+        "multi_value": bool(raw.get("is_list")),
+        "templatable": bool(raw.get("templatable")),
+        "depends_on": None,
+        "depends_on_value": None,
+        "depends_on_value_not": None,
+        "depends_on_component": None,
+        "references_component": references,
+        "pin_features": _resolve_pin_features(raw) if entry_type == "pin" else [],
+        "pin_mode": None,
+        "advanced": advanced,
+        "hidden": False,
+        "help_link": docs.url,
+        "translation_key": None,
+        "translation_params": None,
+        "platform_type": None,
+    }
+
+    # Recurse into nested schemas for type=nested.
+    if entry_type == "nested" and isinstance(inner_schema, dict):
+        inner = _convert_config_vars(inner_schema, schema_dir)
+        entry["config_entries"] = inner or None
+        entry["platform_type"] = _detect_platform_type(inner_schema)
+        # Hide a NESTED parent under "Advanced" when every child would
+        # already be hidden — there's nothing user-facing to render.
+        if inner and _all_inner_advanced(inner):
+            entry["advanced"] = True
     else:
-        short_name = _generate_name(component_id, platform_name, qualified_docs)
-        name = f"{short_name} {domain_label}"
-    description = _clean_description(qualified_docs.get("description", ""))
+        entry["config_entries"] = None
 
-    try:
-        config_entries = _parse_schema(
-            platform_manifest.config_schema, component_id, field_descriptions
-        )
-    except Exception as exc:
-        _LOGGER.warning("Failed to parse %s.%s schema: %s", platform_name, component_id, exc)
+    return entry
+
+
+def _build_id_entry(key: str, raw: dict) -> dict:
+    """Build a ConfigEntry for a ``GeneratedID`` field.
+
+    These render as advanced ID inputs — most users let ESPHome derive
+    the id, but power-users want to set one for cross-references.
+    """
+    docs = clean_docs(raw.get("docs"))
+    return {
+        "key": key,
+        "type": "id",
+        "label": _key_to_label(key),
+        "description": docs.text or None,
+        "required": False,
+        "default_value": None,
+        "options": None,
+        "allow_custom_value": False,
+        "range": None,
+        "multi_value": False,
+        "templatable": False,
+        "depends_on": None,
+        "depends_on_value": None,
+        "depends_on_value_not": None,
+        "depends_on_component": None,
+        "references_component": None,
+        "pin_features": [],
+        "pin_mode": None,
+        "advanced": True,
+        "hidden": False,
+        "help_link": docs.url,
+        "translation_key": None,
+        "translation_params": None,
+        "config_entries": None,
+        "platform_type": None,
+    }
+
+
+def _build_options(raw: dict) -> list[dict] | None:
+    """Build a list of ``{label, value}`` dicts from a schema's enum values."""
+    values = raw.get("values")
+    if not isinstance(values, dict):
         return None
+    options: list[dict] = []
+    for value, info in values.items():
+        label = value if value else "(none)"
+        if isinstance(info, dict) and info.get("docs"):
+            label = info["docs"]
+        options.append({"label": label, "value": value})
+    return options or None
 
-    _apply_enum_options_recursive(config_entries, platform_name)
+
+def _coerce_default(value: Any) -> Any:
+    """Pass through scalar defaults; coerce schema-string trues/falses."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        if value.lower() == "true":
+            return True
+        if value.lower() == "false":
+            return False
+    return value
+
+
+def _resolve_use_id_reference(raw: dict) -> str | None:
+    """Map ``use_id_type: 'ns::Class'`` to a component domain.
+
+    Returns the namespace (with the ``switch_`` trailing-underscore
+    quirk patched), which matches the catalog's component domain ids.
+    """
+    namespace = None
+    use_id_type = raw.get("use_id_type")
+    if isinstance(use_id_type, str) and "::" in use_id_type:
+        namespace = use_id_type.split("::", 1)[0]
+    elif isinstance(raw.get("id_type"), dict):
+        cls = raw["id_type"].get("class") or ""
+        if "::" in cls:
+            namespace = cls.split("::", 1)[0]
+    if not namespace:
+        return None
+    return _USE_ID_NAMESPACE_OVERRIDES.get(namespace, namespace)
+
+
+def _resolve_pin_features(raw: dict) -> list[str]:
+    """Translate the schema's ``modes`` list into our PinFeature enum keys."""
+    modes = raw.get("modes") or []
+    out: list[str] = []
+    for m in modes:
+        # Schema uses ``input``/``output``/``pullup``/``pulldown`` etc.
+        # Our PinFeature enum tracks more capability tags (i2c_sda,
+        # spi_clk, ...) but those don't appear here — only directional
+        # / pull modes do. Pass them through; downstream code can drop
+        # unknown values via _safe_enum.
+        if isinstance(m, str):
+            out.append(m)
+    return out
+
+
+def _detect_platform_type(inner_schema: dict) -> str | None:
+    """Infer the platform_type for a NESTED entry from its extends list.
+
+    A nested entry like ``dht.humidity`` extends ``sensor._SENSOR_SCHEMA``
+    — that's the signal it represents an entity sub-reading. We surface
+    ``"sensor"`` here so the frontend renders it with the sensor base
+    fields (name, device_class, ...) on top.
+    """
+    for ref in inner_schema.get("extends") or []:
+        prefix = ref.split(".", 1)[0]
+        if prefix in _PLATFORM_DOMAINS:
+            return prefix
+    return None
+
+
+def _key_to_label(key: str) -> str:
+    """Turn a config-var key into a human-friendly label."""
+    return key.replace("_", " ").title()
+
+
+def _classify_advanced(key: str, *, required: bool, is_structural: bool) -> bool:
+    """Decide whether an entry hides behind the "Advanced" toggle.
+
+    Order of precedence:
+      1. Structural fields (pins, bus references) — never advanced.
+      2. Required fields — never advanced.
+      3. ADVANCED_IMPORTANT_KEYS (id, comment) — always advanced.
+      4. IMPORTANT_KEYS — never advanced.
+      5. ADVANCED_BASE_KEYS — always advanced.
+      6. Default: advanced when optional.
+    """
+    if is_structural:
+        return False
+    if required:
+        return False
+    if key in _ADVANCED_IMPORTANT_KEYS:
+        return True
+    if key in _IMPORTANT_KEYS:
+        return False
+    if key in _ADVANCED_BASE_KEYS:
+        return True
+    return True
+
+
+def _all_inner_advanced(inner: list[dict]) -> bool:
+    """Return True iff every inner entry is advanced (else False).
+
+    Empty groups return False so a NESTED parent isn't accidentally
+    hidden when its inner entries couldn't be resolved.
+    """
+    if not inner:
+        return False
+    return all(e.get("advanced") for e in inner)
+
+
+def _sort_entries(entries: list[dict]) -> list[dict]:
+    """Sort: not-advanced first, then within each group by IMPORTANT_KEY_ORDER."""
+    rank = {k: i for i, k in enumerate(_IMPORTANT_KEY_ORDER)}
+    fallback = len(_IMPORTANT_KEY_ORDER)
+
+    def sort_key(e: dict) -> tuple[int, int, str]:
+        return (
+            1 if e.get("advanced") else 0,
+            rank.get(e["key"], fallback),
+            e["key"],
+        )
+
+    return sorted(entries, key=sort_key)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _split_qualified_key(top_key: str) -> tuple[str, str]:
+    """Split a schema top-level key into ``(domain, stem)``.
+
+    Schema files key multi-platform components as ``<stem>.<domain>``
+    (e.g. ``dht.sensor`` — DHT as a sensor platform). For unqualified
+    keys we return ``("", top_key)``.
+    """
+    if "." in top_key:
+        stem, domain = top_key.split(".", 1)
+        return domain, stem
+    return "", top_key
+
+
+def _lookup_index_meta(component_id: str, top_key: str, index: SchemaIndex) -> dict:
+    """Find the merged-index metadata for a catalog entry.
+
+    Tries the catalog id first (``sensor.dht``, ``wifi``), then the bare
+    stem (``dht``). Returns an empty dict if neither matches.
+    """
+    return (
+        index.metadata.get(component_id)
+        or index.metadata.get(top_key)
+        or index.metadata.get(top_key.split(".", 1)[0])
+        or {}
+    )
+
+
+def _docs_type_marker(docs: str) -> str | None:
+    """Extract the ``**type**:`` marker from a docs string, if any.
+
+    Handles bare bold (``**boolean**:``) and bracketed-link forms
+    (``**[Time](...)**:``). Returns the inner text or None when no
+    marker is present.
+    """
+    if not docs:
+        return None
+    m = re.match(r"^\*\*\[?([^\]*]+)\]?(?:\([^)]+\))?\*\*\s*[:\-]", docs)
+    return m.group(1).strip() if m else None
+
+
+def _looks_like_boolean_enum(raw: dict) -> bool:
+    """Return True iff ``raw['values']`` is exactly ``{true, false}``."""
+    values = raw.get("values")
+    if not isinstance(values, dict):
+        return False
+    keys = {str(k).lower() for k in values}
+    return keys == {"true", "false"} or keys == {"true", "false", "yes", "no"}
+
+
+def _looks_like_time_period_default(value: Any) -> bool:
+    """Return True iff *value* is a string shaped like a time period."""
+    if not isinstance(value, str):
+        return False
+    return bool(_TIME_PERIOD_DEFAULT.match(value.strip().replace(" ", "")))
+
+
+def _has_config_schema(section: dict) -> bool:
+    """Check whether *section* exposes its own ``CONFIG_SCHEMA``."""
+    schemas = section.get("schemas")
+    return isinstance(schemas, dict) and "CONFIG_SCHEMA" in schemas
+
+
+def _strip_anchor(url: str) -> str:
+    """Drop ``#anchor`` from a URL to get the bare component-page link."""
+    if "#" in url:
+        return url.split("#", 1)[0]
+    return url
+
+
+# Hardware acronyms that should retain their canonical capitalisation
+# in derived component names. Applied AFTER the default ``str.title()``
+# (which gives e.g. "Rc522 Spi") to recover "RC522 SPI".
+_ACRONYM_NORMALISATIONS: dict[str, str] = {
+    "Adc": "ADC",
+    "Dac": "DAC",
+    "Bldc": "BLDC",
+    "Bme": "BME",
+    "I2C": "I²C",
+    "I2c": "I²C",
+    "Spi": "SPI",
+    "Uart": "UART",
+    "Ble": "BLE",
+    "Pwm": "PWM",
+    "Gpio": "GPIO",
+    "Rgb": "RGB",
+    "Rgbw": "RGBW",
+    "Rgbww": "RGBWW",
+    "Cwww": "CWWW",
+    "Led": "LED",
+    "Lcd": "LCD",
+    "Oled": "OLED",
+    "Tft": "TFT",
+    "Usb": "USB",
+    "Ota": "OTA",
+    "Mqtt": "MQTT",
+    "Wifi": "Wi-Fi",
+    "Tcp": "TCP",
+    "Udp": "UDP",
+    "Http": "HTTP",
+    "Https": "HTTPS",
+    "Url": "URL",
+    "Json": "JSON",
+    "Pcm": "PCM",
+    "Mac": "MAC",
+    "Pir": "PIR",
+    "Imu": "IMU",
+    "Nfc": "NFC",
+    "Rfid": "RFID",
+    "Pn532": "PN532",
+    "Rc522": "RC522",
+    "Esp32": "ESP32",
+    "Esp8266": "ESP8266",
+    "Rp2040": "RP2040",
+    "Esp32C3": "ESP32-C3",
+    "Esp32S2": "ESP32-S2",
+    "Esp32S3": "ESP32-S3",
+    "Esp32H2": "ESP32-H2",
+    "Esp32C5": "ESP32-C5",
+    "Esp32C6": "ESP32-C6",
+    "Esp32C61": "ESP32-C61",
+    "Esp32P4": "ESP32-P4",
+}
+
+
+def _resolve_name(component_id: str, stem: str, doc_name: str | None) -> str:
+    """Produce a human label for the component.
+
+    Preference order:
+      1. The link text from the ``See also`` footer (e.g.
+         "DHT Temperature+Humidity Sensor").
+      2. A title-cased version of the stem with hardware acronyms
+         normalised back to their canonical capitalisation.
+    """
+    if doc_name:
+        return doc_name
+    name = stem.replace("_", " ").title()
+    for k, v in _ACRONYM_NORMALISATIONS.items():
+        # Word-boundary replace so "Pwm" -> "PWM" but "Pwms" doesn't
+        # accidentally match.
+        name = re.sub(rf"\b{re.escape(k)}\b", v, name)
+    return name
+
+
+# Category overrides for non-platform components — matches the legacy
+# catalog so existing UI groupings stay stable.
+_CATEGORY_OVERRIDES: dict[str, str] = {
+    # Core ESPHome infrastructure
+    "esphome": "core",
+    "wifi": "core",
+    "api": "core",
+    "ota": "core",
+    "logger": "core",
+    "mqtt": "core",
+    "web_server": "core",
+    "captive_portal": "core",
+    "safe_mode": "core",
+    "time": "core",
+    "network": "core",
+    # Bus / transport components
+    "i2c": "bus",
+    "spi": "bus",
+    "uart": "bus",
+    "one_wire": "bus",
+    "modbus": "bus",
+    "canbus": "bus",
+    # Automation primitives
+    "script": "automation",
+    "interval": "automation",
+    "globals": "automation",
+}
+
+
+def _infer_misc_category(top_key: str) -> str:
+    """Best-effort category for non-platform components.
+
+    Looks up ``_CATEGORY_OVERRIDES`` first (curated list mirroring the
+    legacy catalog), falls through to ``misc`` for everything else.
+    """
+    return _CATEGORY_OVERRIDES.get(top_key, "misc")
+
+
+# ---------------------------------------------------------------------------
+# Narrow ESPHome introspection
+# ---------------------------------------------------------------------------
+#
+# The pre-built schema bundle doesn't surface three things we still want:
+#
+#   - multi_conf: whether a component can appear more than once in YAML
+#   - platform_defaults: per-target-platform default values (cv.SplitDefault)
+#   - supported_platforms: which target chips a component can be used on
+#
+# We pull these directly from the installed ``esphome`` package. When
+# ``esphome`` isn't available (CI without the dep), introspection is a
+# no-op and the catalog ships without those fields populated.
+
+# Target-platform component ids — components named after a chip family
+# that act as the "platform" entry in YAML.
+_TARGET_PLATFORMS: frozenset[str] = frozenset(
+    {
+        "esp32",
+        "esp8266",
+        "rp2040",
+        "bk72xx",
+        "rtl87xx",
+        "ln882x",
+        "nrf52",
+        "host",
+    }
+)
+
+
+def introspect_component(component_id: str) -> dict[str, Any]:
+    """Return ``{multi_conf, platform_defaults, supported_platforms}``.
+
+    Best-effort: returns an empty dict when ``esphome`` isn't importable
+    or the component module can't be loaded.
+    """
+    if not component_id:
+        return {}
+    loader = _get_esphome_loader()
+    if loader is None:
+        return {}
+    try:
+        manifest = loader.get_component(component_id)
+    except Exception:
+        return {}
+    if manifest is None:
+        return {}
 
     return {
-        "id": qualified_id,
-        "name": name,
-        "description": description,
-        "category": platform_name,
-        "docs_url": f"https://esphome.io/components/{platform_name}/{component_id}",
-        "image_url": _build_image_url(qualified_docs, platform_name),
-        "dependencies": dependencies,
-        "multi_conf": bool(manifest.multi_conf),
-        "supported_platforms": supported_platforms,
-        "config_entries": config_entries,
+        "multi_conf": bool(getattr(manifest, "multi_conf", False)),
+        "is_target_platform": bool(getattr(manifest, "is_target_platform", False)),
+        "platform_defaults": _collect_platform_defaults(manifest),
     }
 
 
-def _primary_platform(platforms: list[str]) -> str:
-    """Pick the primary platform for category / schema selection."""
-    for pref in ("sensor", "binary_sensor", "switch", "light", "fan", "cover"):
-        if pref in platforms:
-            return pref
-    return platforms[0]
+def _get_esphome_loader() -> Any:
+    """Lazy import ``esphome.loader``; cache the (success or failure) result."""
+    if _ESPHOME_LOADER_CACHE["resolved"]:
+        return _ESPHOME_LOADER_CACHE["module"]
+    _ESPHOME_LOADER_CACHE["resolved"] = True
+    try:
+        import esphome.loader as loader
 
-
-def _resolve_docs(component_id: str, docs: dict[str, dict[str, str]]) -> dict[str, str]:
-    """Find docs metadata for *component_id*, trying common bus suffixes."""
-    comp_docs = docs.get(component_id, {})
-    if comp_docs:
-        return comp_docs
-    for suffix in ("_i2c", "_spi", "_uart", "_base"):
-        if component_id.endswith(suffix):
-            base_id = component_id.removesuffix(suffix)
-            comp_docs = docs.get(base_id, {})
-            if comp_docs:
-                return comp_docs
-    return {}
-
-
-def _build_docs_url(component_id: str, category: str) -> str:
-    """Build the canonical esphome.io docs URL for a component."""
-    if category not in ("core", "bus", "automation", "misc"):
-        return f"https://esphome.io/components/{category}/{component_id}"
-    return f"https://esphome.io/components/{component_id}"
-
-
-def _build_image_url(comp_docs: dict[str, str], category: str) -> str:
-    """Build the docs-image URL for a component (empty when no image).
-
-    The esphome.io site (Astro-based since 2026) serves all component
-    images from a flat ``/images/`` directory, regardless of the source
-    docs category. The legacy ``-full`` suffix used by some Sphinx-era
-    images was also dropped.
-    """
-    image_file = comp_docs.get("image_file", "")
-    if not image_file:
-        return ""
-    # Strip the legacy "-full" suffix that no longer exists on the new site.
-    base, _, ext = image_file.rpartition(".")
-    if base.endswith("-full"):
-        image_file = f"{base[: -len('-full')]}.{ext}"
-    return f"https://esphome.io/images/{image_file}"
-
-
-def sync(dry_run: bool = False) -> None:
-    """Run the component sync."""
-    global PLATFORM_TYPES
-
-    # Fetch docs metadata first (titles, descriptions, images)
-    docs_meta = fetch_docs_metadata()
-
-    print("\nDiscovering platform types...")
-    PLATFORM_TYPES = _discover_platform_types()
-    print(
-        f"Found {len(PLATFORM_TYPES)} platform types: {', '.join(sorted(PLATFORM_TYPES)[:10])}..."
-    )
-
-    # List all component directories
-    components_dir = Path(const.__file__).parent / "components"
-    component_dirs = sorted(
-        d.name for d in components_dir.iterdir() if d.is_dir() and not d.name.startswith("_")
-    )
-    print(f"Found {len(component_dirs)} total component directories")
-
-    components: list[dict] = []
-    failed = 0
-
-    for comp_id in component_dirs:
-        components.extend(_sync_component(comp_id, PLATFORM_TYPES, docs_meta))
-
-    # Synthesize unified entries for platform components (OTA, time, ...)
-    # — these are aggregator components; the user-facing model is one
-    # entry with a `platform` discriminator rather than separate per-
-    # provider components.
-    for platform_id in _UNIFIED_PLATFORM_COMPONENTS:
-        if platform_id not in PLATFORM_TYPES:
-            continue
-        unified = _build_unified_platform_component(platform_id, component_dirs, docs_meta)
-        if unified is not None:
-            components.append(unified)
-
-    # Sort: components with config entries first, then alphabetical
-    components.sort(key=lambda c: (not c["config_entries"], c["name"].lower()))
-
-    catalog = {
-        "esphome_version": const.__version__,
-        "components": components,
-    }
-
-    if dry_run:
-        with_entries = sum(1 for c in components if c["config_entries"])
-        nested_total = sum(
-            1 for c in components for e in c["config_entries"] if e.get("type") == "nested"
+        _ESPHOME_LOADER_CACHE["module"] = loader
+        _LOGGER.info("esphome introspection enabled (esphome.loader importable)")
+    except Exception:
+        _ESPHOME_LOADER_CACHE["module"] = None
+        _LOGGER.warning(
+            "esphome.loader not importable — multi_conf, platform_defaults, "
+            "supported_platforms will be empty"
         )
-        total_entries = sum(len(c["config_entries"]) for c in components)
-        print(f"\n[dry-run] Would write {len(components)} components to {OUTPUT_FILE.name}")
-        print(f"  {with_entries} have config entries ({total_entries} top-level fields)")
-        print(f"  {nested_total} nested config entries")
-        print("\nSample (first 10):")
-        for c in components[:10]:
-            entries = [e["key"] for e in c["config_entries"]]
-            print(f"  {c['id']:30s} cat={c['category']:15s} fields={entries}")
-    else:
-        OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
-        OUTPUT_FILE.write_text(json.dumps(catalog, indent=2, default=str))
-        print(f"\nWritten {len(components)} components to {OUTPUT_FILE.name}")
-
-    with_entries = sum(1 for c in components if c["config_entries"])
-    print(
-        f"Total: {len(components)} components, {with_entries} with config entries, {failed} failed"
-    )
+    return _ESPHOME_LOADER_CACHE["module"]
 
 
-def main() -> None:
-    """Entry point."""
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dry-run", action="store_true")
-    args = parser.parse_args()
-    sync(dry_run=args.dry_run)
+_ESPHOME_LOADER_CACHE: dict[str, Any] = {"resolved": False, "module": None}
+
+
+def _is_json_safe(value: Any) -> bool:
+    """Return True iff *value* is a primitive JSON-encodable scalar."""
+    return isinstance(value, (str, int, float, bool)) or value is None
+
+
+# Default values for config-entry fields. Anything matching one of
+# these is stripped from the serialized JSON so the output stays close
+# to the size of the previous mashumaro-based catalog (which omitted
+# defaults via ``serialization_strategy``).
+_ENTRY_DEFAULTS: dict[str, Any] = {
+    "description": None,
+    "required": False,
+    "default_value": None,
+    "platform_defaults": None,
+    "options": None,
+    "allow_custom_value": False,
+    "range": None,
+    "multi_value": False,
+    "templatable": False,
+    "depends_on": None,
+    "depends_on_value": None,
+    "depends_on_value_not": None,
+    "depends_on_component": None,
+    "references_component": None,
+    "pin_features": [],
+    "pin_mode": None,
+    "advanced": False,
+    "hidden": False,
+    "help_link": None,
+    "translation_key": None,
+    "translation_params": None,
+    "config_entries": None,
+    "platform_type": None,
+}
+
+_COMPONENT_DEFAULTS: dict[str, Any] = {
+    "docs_url": "",
+    "image_url": "",
+    "dependencies": [],
+    "multi_conf": False,
+    "supported_platforms": [],
+    "config_entries": [],
+}
+
+
+def _strip_defaults(component: dict) -> dict:
+    """Drop fields equal to their dataclass default to slim the JSON."""
+    out: dict[str, Any] = {}
+    for k, v in component.items():
+        if k in _COMPONENT_DEFAULTS and v == _COMPONENT_DEFAULTS[k]:
+            continue
+        if k == "config_entries" and v:
+            out[k] = [_strip_entry_defaults(e) for e in v]
+            continue
+        out[k] = v
+    return out
+
+
+def _strip_entry_defaults(entry: dict) -> dict:
+    """Recursive variant of ``_strip_defaults`` for ConfigEntry dicts."""
+    out: dict[str, Any] = {}
+    for k, v in entry.items():
+        if k in _ENTRY_DEFAULTS and v == _ENTRY_DEFAULTS[k]:
+            continue
+        if k == "config_entries" and v:
+            out[k] = [_strip_entry_defaults(e) for e in v]
+            continue
+        out[k] = v
+    return out
+
+
+def _collect_platform_defaults(manifest: Any) -> dict[tuple[str, ...], dict[str, Any]]:
+    """Walk the live ``CONFIG_SCHEMA`` for ``cv.SplitDefault`` keys.
+
+    Returns ``{key_path: {platform: default_value}}`` keyed by tuple
+    paths so nested fields can be looked up unambiguously. When the
+    component has no schema (rare) or voluptuous isn't importable,
+    returns an empty dict.
+    """
+    schema = getattr(manifest, "config_schema", None)
+    if schema is None:
+        return {}
+    try:
+        import voluptuous as vol
+    except Exception:
+        return {}
+
+    out: dict[tuple[str, ...], dict[str, Any]] = {}
+    visited: set[int] = set()
+
+    def unwrap_to_dict(node: Any) -> dict | None:
+        """Best-effort: peel ``vol.Schema`` / ``vol.All`` until we hit a dict."""
+        for _ in range(8):
+            if isinstance(node, dict):
+                return node
+            if hasattr(node, "schema"):
+                node = node.schema
+                continue
+            inner = getattr(node, "validators", None)
+            if inner:
+                next_node = None
+                for v in inner:
+                    if isinstance(v, dict) or hasattr(v, "schema"):
+                        next_node = v
+                        break
+                if next_node is None:
+                    return None
+                node = next_node
+                continue
+            return None
+        return None
+
+    def walk(node: Any, path: tuple[str, ...], depth: int) -> None:
+        if depth > 6:
+            return
+        candidate = unwrap_to_dict(node)
+        if candidate is None:
+            return
+        if id(candidate) in visited:
+            return
+        visited.add(id(candidate))
+
+        for key, val in candidate.items():
+            key_name = key.schema if hasattr(key, "schema") else str(key)
+            sub_path = (*path, key_name)
+            if isinstance(key, vol.Optional):
+                factories = getattr(key, "_defaults", None)
+                if isinstance(factories, dict):
+                    per_platform: dict[str, Any] = {}
+                    for plat, factory in factories.items():
+                        try:
+                            value = factory() if callable(factory) else factory
+                        except Exception:  # noqa: S112 — best-effort default extraction
+                            continue
+                        if value is vol.UNDEFINED:
+                            continue
+                        if not _is_json_safe(value):
+                            continue
+                        per_platform[str(plat)] = value
+                    if per_platform:
+                        out[sub_path] = per_platform
+            walk(val, sub_path, depth + 1)
+
+    try:
+        walk(schema, (), 0)
+    except Exception:
+        return {}
+    return out
+
+
+def _apply_platform_defaults(
+    entries: list[dict],
+    platform_defaults: dict[tuple[str, ...], dict[str, Any]],
+) -> None:
+    """Layer ``platform_defaults`` from introspection onto matching entries."""
+    if not platform_defaults:
+        return
+
+    def walk(items: list[dict], path: tuple[str, ...]) -> None:
+        for entry in items:
+            sub_path = (*path, entry["key"])
+            pd = platform_defaults.get(sub_path)
+            if pd:
+                entry["platform_defaults"] = pd
+            inner = entry.get("config_entries")
+            if inner:
+                walk(inner, sub_path)
+
+    walk(entries, ())
+
+
+def _derive_supported_platforms(
+    component_id: str,
+    dependencies: list[str],
+    introspection: dict[str, Any],
+) -> list[str]:
+    """Return the list of target chips this component runs on.
+
+    Target-platform components (``esp32``, ``rp2040``, ...) report
+    themselves. Otherwise, dependencies that match ``_TARGET_PLATFORMS``
+    are surfaced — ``esp32_ble_tracker`` depends on ``esp32`` so we
+    return ``["esp32"]``; most components have no platform-specific
+    deps and return ``[]`` (treated as "all platforms").
+    """
+    if introspection.get("is_target_platform"):
+        return [component_id]
+    return [d for d in dependencies if d in _TARGET_PLATFORMS]
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
