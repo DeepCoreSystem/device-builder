@@ -60,6 +60,9 @@ _DOCS_INDEX_URL = (
     "https://raw.githubusercontent.com/esphome/esphome-docs/current/"
     "src/content/docs/components/index.mdx"
 )
+_DOCS_REPO_URL = "https://github.com/esphome/esphome-docs.git"
+_DOCS_REPO_BRANCH = "current"
+_DOCS_CLONE_DIR = "esphome-docs"
 _IMAGE_BASE_URL = "https://esphome.io/images/"
 
 # CDN at schema.esphome.io rejects requests without a recognisable
@@ -530,7 +533,215 @@ def build_catalog(
             if limit and entry["id"] not in limit:
                 continue
             out.append(entry)
+
+    # Layer MDX-frontmatter descriptions onto components whose
+    # schema-supplied description is empty. This patches the upstream
+    # gap where the prebuilt schema's component index lists per-platform
+    # components with only ``dependencies`` (e.g. ``ota.esphome``,
+    # ``ota.http_request``).
+    _backfill_descriptions_from_mdx(out)
+
     return out
+
+
+def _backfill_descriptions_from_mdx(entries: list[dict]) -> None:
+    """Fill empty descriptions from the docs MDX frontmatter, in place.
+
+    The prebuilt schema's component index sometimes only lists
+    ``dependencies`` for a platform-providing component, leaving the
+    description blank. The MDX docs page for the same component
+    *does* carry a ``description:`` frontmatter field (and a curated
+    intro paragraph). Pull from there as a one-time enrichment.
+
+    Silently skipped when the docs repo can't be cloned/fetched.
+    """
+    missing = [e for e in entries if not (e.get("description") or "").strip()]
+    if not missing:
+        return
+    descriptions = _load_mdx_descriptions()
+    if not descriptions:
+        return
+    backfilled = 0
+    for entry in missing:
+        cid = entry["id"]
+        text = descriptions.get(cid)
+        if not text:
+            # Try the bare stem as a last resort (e.g. for hub-style
+            # components whose docs file isn't under <domain>/).
+            stem = cid.split(".", 1)[-1]
+            text = descriptions.get(stem)
+        if text:
+            entry["description"] = text
+            backfilled += 1
+    if backfilled:
+        _LOGGER.info("Backfilled %d descriptions from docs MDX", backfilled)
+
+
+def _load_mdx_descriptions() -> dict[str, str]:
+    """Walk the cached docs repo, return ``{component_id: description}``.
+
+    Each per-component MDX page lives under
+    ``src/content/docs/components/<domain>/<stem>.mdx`` (platform-
+    providing components) or ``src/content/docs/components/<bare>.mdx``
+    (everything else). The frontmatter ``description:`` field is the
+    primary source — short, curated, written for catalog/preview use.
+    Falls back to the first prose paragraph when the frontmatter
+    description is missing.
+
+    Caches the cloned docs repo in ``.cache/esphome-docs/`` so re-runs
+    don't refetch.
+    """
+    docs_dir = _ensure_docs_repo()
+    if docs_dir is None:
+        return {}
+
+    out: dict[str, str] = {}
+    components_root = docs_dir / "src" / "content" / "docs" / "components"
+    if not components_root.exists():
+        return {}
+
+    for mdx_path in components_root.rglob("*.mdx"):
+        rel = mdx_path.relative_to(components_root)
+        parts = rel.with_suffix("").parts
+        if not parts or parts[-1] == "index":
+            continue
+        if len(parts) == 1:
+            component_id = parts[0]
+        elif len(parts) == 2:
+            component_id = f"{parts[0]}.{parts[1]}"
+        else:
+            continue  # Deeper nesting isn't a per-component page.
+
+        text = _extract_mdx_description(mdx_path.read_text(encoding="utf-8"))
+        if text:
+            out[component_id] = text
+            # Also index under the bare stem if it's not already taken,
+            # so e.g. ``ota.esphome`` falls back to ``esphome.mdx`` if
+            # ever needed (rare, but cheap to support).
+            stem = parts[-1]
+            out.setdefault(stem, text)
+    return out
+
+
+def _ensure_docs_repo() -> Path | None:
+    """Clone or update the esphome-docs repo (shallow). Returns its path."""
+    import subprocess
+
+    target = _CACHE_ROOT / _DOCS_CLONE_DIR
+    if (target / ".git").exists():
+        # Refresh in-place. ``-q`` and ``--ff-only`` keep it quiet and
+        # safe; failure here just means we keep using the existing
+        # snapshot.
+        subprocess.run(
+            ["git", "-C", str(target), "pull", "-q", "--ff-only"],
+            check=False,
+            timeout=60,
+        )
+        return target
+    if target.exists():
+        # Pre-existing non-git directory — leave alone, use as-is.
+        return target
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    _LOGGER.info("Cloning esphome-docs (shallow) to %s", target)
+    try:
+        subprocess.run(
+            [
+                "git",
+                "clone",
+                "-q",
+                "--depth=1",
+                "--single-branch",
+                f"--branch={_DOCS_REPO_BRANCH}",
+                _DOCS_REPO_URL,
+                str(target),
+            ],
+            check=True,
+            timeout=120,
+        )
+    except Exception:
+        _LOGGER.warning("Could not clone esphome-docs — descriptions stay empty")
+        return None
+    return target
+
+
+# Frontmatter description matcher — captures the value of the
+# ``description:`` field at the start of the file. Handles both quoted
+# and bare values.
+_FRONTMATTER_DESCRIPTION = re.compile(
+    r'^description:\s*"([^"]+)"|^description:\s*\'([^\']+)\'|^description:\s*([^\n]+)$',
+    re.MULTILINE,
+)
+
+
+def _extract_mdx_description(text: str) -> str:
+    """Return the curated description for a component MDX file.
+
+    Tries the frontmatter ``description:`` field first; falls back to
+    the first prose paragraph (after frontmatter, skipping JSX imports
+    and HTML anchors) if frontmatter has no description.
+    """
+    front_end = text.find("---", 4) if text.startswith("---") else -1
+    front = text[:front_end] if front_end > 0 else ""
+    body = text[front_end + 3 :] if front_end > 0 else text
+
+    m = _FRONTMATTER_DESCRIPTION.search(front)
+    if m:
+        value = next(g for g in m.groups() if g)
+        cleaned = _clean_description_text(value.strip())
+        if cleaned:
+            return cleaned
+
+    # Fall back to the first prose paragraph.
+    paragraphs: list[str] = []
+    current: list[str] = []
+    for raw_line in body.splitlines():
+        line = raw_line.strip()
+        if not line:
+            if current:
+                paragraphs.append(" ".join(current))
+                current = []
+            continue
+        if line.startswith(("import ", "<", ":::", "#", "```", "{")):
+            if current:
+                paragraphs.append(" ".join(current))
+                current = []
+            continue
+        current.append(line)
+    if current:
+        paragraphs.append(" ".join(current))
+
+    for p in paragraphs:
+        cleaned = _clean_description_text(p)
+        if cleaned:
+            return cleaned
+    return ""
+
+
+# Markdown link / inline-code stripping for description text.
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+_MD_INLINE_CODE_RE = re.compile(r"`([^`]+)`")
+_MD_BOLD_ITALIC_RE = re.compile(r"\*{1,3}([^*]+)\*{1,3}")
+
+
+def _clean_description_text(text: str) -> str:
+    """Flatten markdown markup so descriptions read as plain prose."""
+    text = _MD_LINK_RE.sub(r"\1", text)
+    text = _MD_INLINE_CODE_RE.sub(r"\1", text)
+    text = _MD_BOLD_ITALIC_RE.sub(r"\1", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    # ESPHome docs use a few stock leading phrases that don't add info.
+    for phrase in (
+        "Instructions for setting up the ",
+        "Instructions for setting up ",
+        "Instructions for using the ",
+        "Instructions for using ",
+    ):
+        if text.lower().startswith(phrase.lower()):
+            text = text[len(phrase) :]
+            text = text[:1].upper() + text[1:] if text else text
+            break
+    return text
 
 
 def load_image_map() -> dict[str, str]:
