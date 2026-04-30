@@ -565,27 +565,42 @@ def build_catalog(
 
 
 def _backfill_descriptions_from_mdx(entries: list[dict]) -> None:
-    """Fill empty descriptions and field docs from the docs MDX, in place.
+    """Fill empty names, descriptions and field docs from the docs MDX.
 
     The prebuilt schema's index sometimes only lists ``dependencies``
     for a component, and the per-field schema entries often omit the
     ``docs`` field entirely (notably the OTA platforms). The MDX docs
-    page carries both a curated component-level description and a
-    ``## Configuration variables`` bullet list with one description
-    per field. Pull from both as a one-time enrichment.
+    page carries:
+
+    - a curated frontmatter ``title:`` (e.g. "ESPHome OTA Updates" for
+      ota.esphome — preferred over the stem-derived "ESPHome" we'd
+      otherwise produce when the schema has no See-also link)
+    - a frontmatter / intro ``description:``
+    - a ``## Configuration variables`` bullet list of per-field docs
 
     Silently skipped when the docs repo can't be cloned/fetched.
     """
     descriptions = _load_mdx_descriptions()
     field_descriptions = _load_mdx_field_descriptions()
-    if not descriptions and not field_descriptions:
+    titles = _load_mdx_titles()
+    if not descriptions and not field_descriptions and not titles:
         return
 
     backfilled_components = 0
+    backfilled_names = 0
     backfilled_fields = 0
     for entry in entries:
         cid = entry["id"]
         stem = cid.split(".", 1)[-1]
+
+        # Name: when the schema had no See-also link, ``_resolve_name``
+        # fell back to a title-cased stem (e.g. "ESPHome" for
+        # ``ota.esphome``). The MDX title is more informative.
+        if entry.get("name") == _stem_to_label(stem):
+            mdx_title = titles.get(cid) or titles.get(stem)
+            if mdx_title:
+                entry["name"] = mdx_title
+                backfilled_names += 1
 
         # Component-level description.
         if not (entry.get("description") or "").strip():
@@ -610,12 +625,26 @@ def _backfill_descriptions_from_mdx(entries: list[dict]) -> None:
                 docs_url=entry.get("docs_url") or "",
             )
 
-    if backfilled_components or backfilled_fields:
+    if backfilled_components or backfilled_fields or backfilled_names:
         _LOGGER.info(
-            "Backfilled from docs MDX: %d components, %d fields",
+            "Backfilled from docs MDX: %d names, %d descriptions, %d fields",
+            backfilled_names,
             backfilled_components,
             backfilled_fields,
         )
+
+
+def _stem_to_label(stem: str) -> str:
+    """Recompute ``_resolve_name``'s fallback label for *stem*.
+
+    Used to detect entries whose ``name`` came from the stem rather
+    than a curated source — those are the ones we want to override
+    with MDX titles.
+    """
+    name = stem.replace("_", " ").title()
+    for k, v in _ACRONYM_NORMALISATIONS.items():
+        name = re.sub(rf"\b{re.escape(k)}\b", v, name)
+    return name
 
 
 def _derive_docs_url(component_id: str) -> str:
@@ -710,6 +739,59 @@ def _load_mdx_descriptions() -> dict[str, str]:
             stem = parts[-1]
             out.setdefault(stem, text)
     return out
+
+
+def _load_mdx_titles() -> dict[str, str]:
+    """Walk the cached docs repo, return ``{component_id: title}``.
+
+    Each MDX page has a ``title:`` field in its frontmatter (e.g.
+    "ESPHome OTA Updates"). Indexed by both the catalog id
+    (``ota.esphome``) and the bare stem (``esphome``).
+    """
+    docs_dir = _ensure_docs_repo()
+    if docs_dir is None:
+        return {}
+
+    out: dict[str, str] = {}
+    components_root = docs_dir / "src" / "content" / "docs" / "components"
+    if not components_root.exists():
+        return {}
+
+    for mdx_path in components_root.rglob("*.mdx"):
+        rel = mdx_path.relative_to(components_root)
+        parts = rel.with_suffix("").parts
+        if not parts or parts[-1] == "index":
+            continue
+        if len(parts) == 1:
+            component_id = parts[0]
+        elif len(parts) == 2:
+            component_id = f"{parts[0]}.{parts[1]}"
+        else:
+            continue
+
+        title = _extract_mdx_title(mdx_path.read_text(encoding="utf-8"))
+        if title:
+            out[component_id] = title
+            stem = parts[-1]
+            out.setdefault(stem, title)
+    return out
+
+
+# Frontmatter title matcher — same shape as the description matcher.
+_FRONTMATTER_TITLE = re.compile(
+    r'^title:\s*"([^"]+)"|^title:\s*\'([^\']+)\'|^title:\s*([^\n]+)$',
+    re.MULTILINE,
+)
+
+
+def _extract_mdx_title(text: str) -> str:
+    """Return the curated ``title:`` from an MDX frontmatter block."""
+    front_end = text.find("---", 4) if text.startswith("---") else -1
+    front = text[:front_end] if front_end > 0 else ""
+    m = _FRONTMATTER_TITLE.search(front)
+    if not m:
+        return ""
+    return next(g for g in m.groups() if g).strip()
 
 
 def _load_mdx_field_descriptions() -> dict[str, dict[str, str]]:
