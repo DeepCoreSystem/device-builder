@@ -107,8 +107,8 @@ class ComponentCatalog:
         self,
         *,
         query: str | None = None,
-        category: ComponentCategory | str | None = None,
-        exclude_category: ComponentCategory | str | None = None,
+        category: ComponentCategory | str | list[str] | None = None,
+        exclude_category: ComponentCategory | str | list[str] | None = None,
         platform: str | None = None,
         board_id: str | None = None,
         offset: int = 0,
@@ -129,19 +129,24 @@ class ComponentCatalog:
         to derive the matching platform, so the frontend can pass
         whichever it has handy. ``platform`` wins when both are set.
 
-        ``exclude_category`` is the inverse of ``category`` — used by
-        the regular component selector to hide ``core`` entries (those
-        belong to the dedicated "Add core configuration" dialog
-        instead). Both filters can be combined though that's unusual.
+        ``category`` and ``exclude_category`` accept either a single
+        category or a list. ``exclude_category`` is the inverse used by
+        the regular component selector to hide entries belonging to
+        the dedicated "Add core configuration" dialog (``core``,
+        plus the platform-domain umbrellas ``ota`` / ``time`` /
+        ``update``). Both filters can be combined though that's
+        unusual.
         """
         platform = self._resolve_platform(platform, board_id)
         results = self._components
 
         if category:
-            results = [c for c in results if c.category == category]
+            include_set = _as_category_set(category)
+            results = [c for c in results if c.category in include_set]
 
         if exclude_category:
-            results = [c for c in results if c.category != exclude_category]
+            exclude_set = _as_category_set(exclude_category)
+            results = [c for c in results if c.category not in exclude_set]
 
         if platform:
             results = [
@@ -193,6 +198,18 @@ class ComponentCatalog:
 # ---------------------------------------------------------------------------
 # API helpers
 # ---------------------------------------------------------------------------
+
+
+def _as_category_set(value: ComponentCategory | str | list[str]) -> set[str]:
+    """Normalise a category filter into a set of plain strings.
+
+    Accepts a single ``ComponentCategory`` / string or a list of
+    strings — returns the set of raw category names used by
+    ``ComponentCatalogEntry.category`` for membership tests.
+    """
+    if isinstance(value, list):
+        return {str(v) for v in value}
+    return {str(value)}
 
 
 def _materialise(

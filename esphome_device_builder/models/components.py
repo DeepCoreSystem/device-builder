@@ -12,7 +12,12 @@ from .common import ConfigEntry, PagedResponse
 
 
 class ComponentCategory(StrEnum):
-    """Component categories (ESPHome platform types + infrastructure)."""
+    """Component categories (ESPHome platform types + infrastructure).
+
+    Values must mirror the strings written by the sync script — anything
+    missing here gets coerced to ``MISC`` at load time, which would
+    silently break the category filter for that domain.
+    """
 
     SENSOR = "sensor"
     BINARY_SENSOR = "binary_sensor"
@@ -42,6 +47,24 @@ class ComponentCategory(StrEnum):
     CORE = "core"
     BUS = "bus"
     AUTOMATION = "automation"
+    # Platform-domain umbrellas surfaced as their own categories by
+    # the sync script. ``ota.*``/``time.*`` components live under
+    # these and the regular component selector hides them since the
+    # OTA / time blocks belong in the core dialog.
+    OTA = "ota"
+    TIME = "time"
+    # Other platform domains the sync script tags from the schema —
+    # listed explicitly so loading doesn't silently coerce them to
+    # MISC.
+    AUDIO_ADC = "audio_adc"
+    AUDIO_DAC = "audio_dac"
+    CANBUS = "canbus"
+    INFRARED = "infrared"
+    MEDIA_SOURCE = "media_source"
+    ONE_WIRE = "one_wire"
+    PACKET_TRANSPORT = "packet_transport"
+    STEPPER = "stepper"
+    WATER_HEATER = "water_heater"
     MISC = "misc"
 
 
