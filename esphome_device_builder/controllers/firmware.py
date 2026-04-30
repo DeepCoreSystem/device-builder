@@ -8,6 +8,7 @@ import gzip
 import importlib
 import logging
 import os
+import re
 import subprocess
 import sys
 from datetime import UTC, datetime
@@ -38,6 +39,20 @@ _ERROR_PATTERNS = [
     "command not found",
 ]
 
+# Progress markers in PlatformIO / esptool output. Both phases emit
+# integer percentages we can latch onto:
+#   - PIO compile:  ``[ 17%] Compiling ...``
+#   - esptool:      ``Writing at 0x... (45 %)\r``
+# We accept either form (with or without the space before ``%``) and
+# pull the first match per line.
+_PROGRESS_PATTERN = re.compile(r"\[?\s*(\d{1,3})\s*%\]?")
+
+# How long to wait for a SIGTERM'd subprocess to exit before we
+# escalate to SIGKILL. ESPHome / PlatformIO usually clean up promptly;
+# the longer floor protects against esptool mid-flash where USB I/O
+# can stall the process briefly.
+_TERMINATE_GRACE_SECONDS = 3.0
+
 
 def _find_esphome_cmd() -> list[str]:
     """Locate the ``esphome`` CLI, preferring the same interpreter as ours.
@@ -64,6 +79,22 @@ def _find_esphome_cmd() -> list[str]:
         return [str(sibling_esphome)]
 
     return [python, "-m", "esphome"]
+
+
+def _parse_progress(line: str) -> int | None:
+    """Extract a 0-100 progress percentage from a build/flash output line.
+
+    Returns ``None`` when the line carries no recognisable percentage.
+    Out-of-range values (a stray "999%" in a log message) are
+    discarded so the field stays a clean 0-100.
+    """
+    match = _PROGRESS_PATTERN.search(line)
+    if match is None:
+        return None
+    value = int(match.group(1))
+    if 0 <= value <= 100:
+        return value
+    return None
 
 
 def _verify_esphome_importable(cmd: list[str]) -> tuple[bool, str]:
@@ -108,6 +139,10 @@ class FirmwareController:
         self._current_process: asyncio.subprocess.Process | None = None
         self._runner_task: asyncio.Task | None = None
         self._esphome_cmd: list[str] = []
+        # Job ids the user asked to cancel. Consulted by the runner
+        # when the subprocess exits so we can mark the job CANCELLED
+        # rather than the default FAILED-on-non-zero-exit.
+        self._cancel_requested: set[str] = set()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -284,19 +319,119 @@ class FirmwareController:
             unsub_completed()
             unsub_failed()
 
+    @api_command("firmware/follow_jobs")
+    async def follow_jobs(
+        self,
+        *,
+        client: Any = None,
+        message_id: str = "",
+        snapshot: bool = True,
+        **kwargs: Any,
+    ) -> None:
+        """Stream every job's lifecycle events to one client connection.
+
+        Designed for a "manage compile tasks" panel: subscribe once
+        and the frontend sees every queued / started / progress /
+        completed / failed / cancelled event for every job, plus
+        live ``output`` lines tagged with their ``job_id``.
+
+        When ``snapshot`` is True (default), the current set of
+        non-terminal jobs is replayed first so the panel paints
+        immediately even after a page refresh. Each event keeps the
+        same ``job`` payload shape as the bus, so the frontend can
+        update its in-memory map by ``job_id`` without extra queries.
+
+        Runs until the client disconnects (which surfaces here as a
+        ``CancelledError`` from ``send_event``).
+        """
+        if client is None:
+            return
+
+        if snapshot:
+            for job in sorted(self._jobs.values(), key=lambda j: j.created_at):
+                if job.status in (
+                    JobStatus.COMPLETED,
+                    JobStatus.FAILED,
+                    JobStatus.CANCELLED,
+                ):
+                    continue
+                await client.send_event(message_id, "snapshot", job.to_dict())
+
+        pending_tasks: set[asyncio.Task] = set()
+
+        def _forward(event_name: str, payload: Any) -> None:
+            task = asyncio.create_task(client.send_event(message_id, event_name, payload))
+            pending_tasks.add(task)
+            task.add_done_callback(pending_tasks.discard)
+
+        def _on_lifecycle(event: Any) -> None:
+            job = event.data.get("job")
+            if job is None:
+                return
+            payload = job.to_dict() if hasattr(job, "to_dict") else job
+            _forward(event.event_type.value, payload)
+
+        def _on_output(event: Any) -> None:
+            _forward("job_output", event.data)
+
+        def _on_progress(event: Any) -> None:
+            _forward("job_progress", event.data)
+
+        unsub: list[Any] = [
+            self._db.bus.add_listener(EventType.JOB_QUEUED, _on_lifecycle),
+            self._db.bus.add_listener(EventType.JOB_STARTED, _on_lifecycle),
+            self._db.bus.add_listener(EventType.JOB_COMPLETED, _on_lifecycle),
+            self._db.bus.add_listener(EventType.JOB_FAILED, _on_lifecycle),
+            self._db.bus.add_listener(EventType.JOB_CANCELLED, _on_lifecycle),
+            self._db.bus.add_listener(EventType.JOB_OUTPUT, _on_output),
+            self._db.bus.add_listener(EventType.JOB_PROGRESS, _on_progress),
+        ]
+
+        try:
+            # Park forever — the connection lifecycle (cancellation
+            # of this coroutine when the WS closes) is what ends the
+            # subscription.
+            await asyncio.Event().wait()
+        finally:
+            for u in unsub:
+                u()
+
     @api_command("firmware/cancel")
     async def cancel(self, *, job_id: str, **kwargs: Any) -> None:
-        """Cancel a queued job. Running jobs cannot be cancelled."""
+        """Cancel a queued or running job.
+
+        Queued jobs are flipped to ``CANCELLED`` immediately. Running
+        jobs receive a SIGTERM and are escalated to SIGKILL after a
+        short grace period — the runner loop sees the dead process and
+        finalises the job with status ``CANCELLED`` (instead of the
+        usual ``FAILED`` for non-zero exits) thanks to the
+        ``_cancel_requested`` flag set here.
+
+        Either path fires ``JOB_CANCELLED`` on the bus so frontends
+        following all-jobs streams stay consistent.
+        """
         job = self._jobs.get(job_id)
         if not job:
             msg = f"Job not found: {job_id}"
             raise ValueError(msg)
-        if job.status != JobStatus.QUEUED:
-            msg = f"Can only cancel queued jobs, job is {job.status}"
-            raise ValueError(msg)
-        job.status = JobStatus.CANCELLED
-        job.completed_at = datetime.now(UTC).isoformat()
-        await self._persist_jobs()
+
+        if job.status == JobStatus.QUEUED:
+            job.status = JobStatus.CANCELLED
+            job.completed_at = datetime.now(UTC).isoformat()
+            await self._persist_jobs()
+            self._db.bus.fire(EventType.JOB_CANCELLED, {"job": job})
+            return
+
+        if job.status == JobStatus.RUNNING:
+            if self._current_job is None or self._current_job.job_id != job_id:
+                msg = "Running job is not the active subprocess (state out of sync)"
+                raise RuntimeError(msg)
+            self._cancel_requested.add(job_id)
+            await self._terminate_current_process()
+            return
+
+        msg = f"Cannot cancel a {job.status.value} job"
+        raise ValueError(msg)
 
     @api_command("firmware/clear")
     async def clear(self, *, status: JobStatus | str | None = None, **kwargs: Any) -> None:
@@ -472,6 +607,22 @@ class FirmwareController:
                         has_error_in_output = True
                         return
 
+            def _check_progress(text: str) -> None:
+                progress = _parse_progress(text)
+                if progress is None:
+                    return
+                # Monotonic clamp — output sometimes flips between
+                # phases (compile reports "100%", then flash starts at
+                # "0%"). For a single coarse bar we want the highest
+                # so far so the frontend doesn't appear to regress.
+                current = job.progress or 0
+                if progress > current:
+                    job.progress = progress
+                    self._db.bus.fire(
+                        EventType.JOB_PROGRESS,
+                        {"job_id": job.job_id, "progress": progress},
+                    )
+
             # Stream stdout in chunks delimited by `\n` _or_ `\r` so
             # carriage-return-based in-place updates (esptool's
             # `Writing at 0x... (5%)\r`, PlatformIO's progress bars)
@@ -493,6 +644,7 @@ class FirmwareController:
                             {"job_id": job.job_id, "line": line},
                         )
                         _check_error(line)
+                        _check_progress(line)
                         buf = b""
                     break
                 buf += data
@@ -516,42 +668,54 @@ class FirmwareController:
                         {"job_id": job.job_id, "line": line},
                     )
                     _check_error(line)
+                    _check_progress(line)
 
             exit_code = await proc.wait()
             job.exit_code = exit_code
-
-            success = exit_code == 0 and not has_error_in_output
-            job.status = JobStatus.COMPLETED if success else JobStatus.FAILED
             job.completed_at = datetime.now(UTC).isoformat()
 
-            if has_error_in_output and exit_code == 0:
-                full_output = "".join(job.output)
-                if "No module named esphome" in full_output:
-                    job.error = (
-                        "esphome is not importable from the dashboard's Python "
-                        f"environment ({sys.executable}). Install it with "
-                        "``pip install -e '.[esphome]'`` (or ``pip install esphome``) "
-                        "in the same venv and restart the dashboard."
-                    )
-                else:
-                    job.error = "Process exited 0 but output contains errors"
-                _LOGGER.warning("Job %s: %s", job.job_id, job.error)
+            # If the user cancelled this job mid-run, the subprocess
+            # exits non-zero (terminated by signal). Honour that
+            # intent rather than reporting it as a generic failure.
+            if job.job_id in self._cancel_requested:
+                self._cancel_requested.discard(job.job_id)
+                job.status = JobStatus.CANCELLED
+                self._db.bus.fire(EventType.JOB_CANCELLED, {"job": job})
+                _LOGGER.info("Job %s cancelled mid-run (exit %s)", job.job_id, exit_code)
+            else:
+                success = exit_code == 0 and not has_error_in_output
+                job.status = JobStatus.COMPLETED if success else JobStatus.FAILED
+                if has_error_in_output and exit_code == 0:
+                    full_output = "".join(job.output)
+                    if "No module named esphome" in full_output:
+                        job.error = (
+                            "esphome is not importable from the dashboard's Python "
+                            f"environment ({sys.executable}). Install it with "
+                            "``pip install -e '.[esphome]'`` "
+                            "(or ``pip install esphome``) "
+                            "in the same venv and restart the dashboard."
+                        )
+                    else:
+                        job.error = "Process exited 0 but output contains errors"
+                    _LOGGER.warning("Job %s: %s", job.job_id, job.error)
 
-            event = EventType.JOB_COMPLETED if success else EventType.JOB_FAILED
-            self._db.bus.fire(event, {"job": job})
-            _LOGGER.info(
-                "Job %s %s (exit code %s)",
-                job.job_id,
-                job.status,
-                exit_code,
-            )
+                event = EventType.JOB_COMPLETED if success else EventType.JOB_FAILED
+                self._db.bus.fire(event, {"job": job})
+                _LOGGER.info(
+                    "Job %s %s (exit code %s)",
+                    job.job_id,
+                    job.status,
+                    exit_code,
+                )
 
         except asyncio.CancelledError:
             if self._current_process:
                 self._current_process.terminate()
             job.status = JobStatus.CANCELLED
             job.completed_at = datetime.now(UTC).isoformat()
-            _LOGGER.info("Job %s cancelled", job.job_id)
+            self._cancel_requested.discard(job.job_id)
+            self._db.bus.fire(EventType.JOB_CANCELLED, {"job": job})
+            _LOGGER.info("Job %s cancelled (runner shutdown)", job.job_id)
             raise
         except Exception as exc:
             job.status = JobStatus.FAILED
@@ -563,6 +727,33 @@ class FirmwareController:
             self._current_job = None
             self._current_process = None
             await self._persist_jobs()
+
+    async def _terminate_current_process(self) -> None:
+        """Send SIGTERM to the running subprocess; escalate if it lingers.
+
+        The runner loop is the one that actually finalises the
+        ``FirmwareJob`` on exit (so we don't double-write status from
+        two coroutines). We only nudge the process here.
+        """
+        proc = self._current_process
+        if proc is None or proc.returncode is not None:
+            return
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            return
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=_TERMINATE_GRACE_SECONDS)
+        except TimeoutError:
+            _LOGGER.warning(
+                "Subprocess for job %s ignored SIGTERM after %.1fs — sending SIGKILL",
+                self._current_job.job_id if self._current_job else "?",
+                _TERMINATE_GRACE_SECONDS,
+            )
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
 
     async def _verify_chip(self, job: FirmwareJob) -> None:
         """

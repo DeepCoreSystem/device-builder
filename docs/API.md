@@ -4,7 +4,7 @@ Base URL: `http://localhost:6052`
 
 ## WebSocket API (`/ws`)
 
-The primary API. A single multiplexed WebSocket handles all 43 commands.
+The primary API. A single multiplexed WebSocket handles all 44 commands.
 
 ### Protocol
 
@@ -83,7 +83,7 @@ On connect, the server sends a [`ServerInfoMessage`](../esphome_device_builder/m
 `Device.has_pending_changes`: `true` = config changed since last compile, `false` = up to date, `null` = never compiled.
 `Device.update_available`: `true` = device was compiled with a different ESPHome version than the server.
 
-### Firmware (13 commands)
+### Firmware (14 commands)
 
 > Models: [`FirmwareJob`](../esphome_device_builder/models/firmware.py), [`JobStatus`](../esphome_device_builder/models/firmware.py), [`JobType`](../esphome_device_builder/models/firmware.py)
 >
@@ -99,16 +99,31 @@ On connect, the server sends a [`ServerInfoMessage`](../esphome_device_builder/m
 | `firmware/install_bulk` | `{configurations: string[], port?: "OTA"}` | `[FirmwareJob]` | Queue multiple installs |
 | `firmware/get_jobs` | `{status?, configuration?}` | `[FirmwareJob]` | List jobs with filters |
 | `firmware/get_job` | `{job_id}` | `FirmwareJob` | Get job with full output |
-| `firmware/follow_job` | `{job_id}` | Streaming | Historical output + live stream |
+| `firmware/follow_job` | `{job_id}` | Streaming | Historical output + live stream for one job |
+| `firmware/follow_jobs` | `{snapshot?: true}` | Streaming | All jobs' lifecycle + output + progress |
 | `firmware/get_binaries` | `{configuration}` | `[{title, file}]` | List compiled firmware files |
 | `firmware/download` | `{configuration, file, compressed?}` | `{filename, data, size}` | Download binary (base64) |
-| `firmware/cancel` | `{job_id}` | — | Cancel queued job |
+| `firmware/cancel` | `{job_id}` | — | Cancel queued or running job |
 | `firmware/clear` | `{status?}` | — | Remove finished jobs |
 
 **Job queue**: one job runs at a time, others wait. Jobs persist across server restarts. Output buffered in `FirmwareJob.output` — clients can reconnect via `firmware/follow_job`.
 
+**Cancel semantics**:
+- Queued jobs flip to `cancelled` immediately.
+- Running jobs receive SIGTERM, with SIGKILL escalation after a 3 s grace period. The job's status becomes `cancelled` (not `failed`) and `JOB_CANCELLED` fires.
+
+**Progress**: `FirmwareJob.progress` is an `int | null` 0–100 latched from the highest percentage seen in `[ 17%] Compiling …` (PlatformIO) or `Writing at 0x… (45 %)` (esptool) lines. `null` means the tooling hasn't emitted a percentage yet — most early compile output is opaque. The value is monotonically non-decreasing within a job so the UI doesn't appear to regress between phases.
+
 **Job events** (broadcast to all subscribed clients):
-- `job_queued`, `job_started`, `job_output`, `job_completed`, `job_failed`
+- `job_queued`, `job_started`, `job_output`, `job_progress`, `job_completed`, `job_failed`, `job_cancelled`
+
+**`firmware/follow_jobs` stream events** (per WebSocket subscription):
+- `snapshot` — initial replay of every non-terminal job (one event per job, payload is the full `FirmwareJob`). Skipped when `snapshot: false`.
+- `job_queued` / `job_started` / `job_completed` / `job_failed` / `job_cancelled` — full `FirmwareJob` payload.
+- `job_output` — `{job_id, line}` (line keeps its `\n` or `\r` terminator).
+- `job_progress` — `{job_id, progress}` (0–100 integer).
+
+The subscription stays open for the connection's lifetime; closing the WebSocket cancels the stream.
 
 ### Boards (3 commands)
 

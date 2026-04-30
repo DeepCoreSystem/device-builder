@@ -52,8 +52,10 @@ class EventType(StrEnum):
     JOB_QUEUED = "job_queued"
     JOB_STARTED = "job_started"
     JOB_OUTPUT = "job_output"
+    JOB_PROGRESS = "job_progress"
     JOB_COMPLETED = "job_completed"
     JOB_FAILED = "job_failed"
+    JOB_CANCELLED = "job_cancelled"
 
 
 # ---------------------------------------------------------------------------

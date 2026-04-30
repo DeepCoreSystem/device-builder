@@ -47,3 +47,9 @@ class FirmwareJob(DataClassORJSONMixin):
     output: list[str] = field(default_factory=list)
     error: str | None = None
     port: str = ""  # for upload jobs
+    # Coarse progress estimate parsed from PlatformIO/esptool output
+    # (0-100, monotonically non-decreasing while the job runs).
+    # ``None`` when the underlying tooling hasn't emitted a percentage
+    # yet -- most compile output is opaque, but the heavy phases (PIO
+    # build, esptool flash) do emit percentages we can latch onto.
+    progress: int | None = None
