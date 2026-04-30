@@ -1840,6 +1840,16 @@ _CATEGORY_OVERRIDES: dict[str, str] = {
     "improv_serial": "core",
     "debug": "core",
     "preferences": "core",
+    # Networking / web infrastructure that's auto-pulled by other
+    # core components (ota.http_request → http_request,
+    # web_server → web_server_base, etc.). Keeping them tagged
+    # `core` lets the dependency-satisfaction filter on the core
+    # dialog pass the parent OTA / web entries that depend on them.
+    "http_request": "core",
+    "web_server_base": "core",
+    "web_server_idf": "core",
+    "socket": "core",
+    "async_tcp": "core",
     # Target platform components (esp32, esp8266, ...) — these are
     # also tagged via `is_target_platform` introspection, but listing
     # them explicitly here makes the override authoritative.
