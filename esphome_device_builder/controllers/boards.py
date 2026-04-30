@@ -104,3 +104,38 @@ class BoardCatalog:
                 if b.esphome.variant and b.esphome.variant.value == pio_variant:
                     return b
         return matches[0]
+
+    def find_by_platform_variant(
+        self,
+        platform: str,
+        variant: str = "",
+    ) -> BoardCatalogEntry | None:
+        """
+        Find a board by ``platform`` (and optional ``variant``).
+
+        Used as a final fallback when a YAML config names only the
+        platform — common for users configuring a generic ``esp32:``
+        block without a specific PlatformIO ``board:`` field. Generic
+        catalog entries (``is_generic=true``) are preferred so the
+        dashboard surfaces the right "Generic ESP32-C3" rather than a
+        random vendor board that happens to share the same variant.
+        """
+        if not platform:
+            return None
+        matches = [
+            b for b in self._boards if b.esphome.platform and b.esphome.platform.value == platform
+        ]
+        if not matches:
+            return None
+        if variant:
+            variant_matches = [
+                b for b in matches if b.esphome.variant and b.esphome.variant.value == variant
+            ]
+            if variant_matches:
+                matches = variant_matches
+        # Prefer the generic fallback so the dashboard tags untracked
+        # YAML configs with a stable, well-known board.
+        for b in matches:
+            if b.is_generic:
+                return b
+        return matches[0]

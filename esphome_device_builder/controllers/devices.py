@@ -184,15 +184,21 @@ class DevicesController:
         else:
             yaml_content = f"esphome:\n  name: {name}\n  friendly_name: {friendly}\n\n"
 
-        # Derive board_id from YAML when not explicitly provided
+        # Derive board_id from YAML when not explicitly provided.
+        # Mirrors the scanner's resolution chain: pio_board match first,
+        # then platform+variant fallback for generic ``esp32:``-style
+        # configs without a specific PlatformIO board id.
         parsed_platform = ""
         if not board_id and self._db.boards:
             parsed_platform, pio_board, variant = parse_platform_from_yaml(yaml_content)
+            matched = None
             if pio_board:
                 matched = self._db.boards.find_by_pio_board(pio_board, variant)
-                if matched:
-                    board = matched
-                    board_id = matched.id
+            if matched is None and parsed_platform:
+                matched = self._db.boards.find_by_platform_variant(parsed_platform, variant)
+            if matched:
+                board = matched
+                board_id = matched.id
 
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, config_path.write_text, yaml_content, "utf-8")
@@ -485,10 +491,18 @@ class DevicesController:
           1. ``metadata.json`` — set explicitly when the user picks a
              board through the UI, or backfilled by a previous scan.
           2. Parse the YAML's ``esphome.platform`` / ``board`` /
-             ``variant`` and match against the board catalog. If a match
-             is found we persist it to metadata so subsequent scans are
-             metadata-only — important so manual YAML edits that switch
-             boards are reflected without losing user-explicit picks.
+             ``variant`` and match by PlatformIO board id
+             (``find_by_pio_board``).
+          3. Same YAML — match by platform + variant
+             (``find_by_platform_variant``). Picks up generic
+             ``esp32: { variant: esp32c3 }``-style configs that don't
+             name a specific PlatformIO ``board:``. Generic catalog
+             entries are preferred so the dashboard tags these with
+             the matching ``generic-esp32-c3`` rather than a random
+             vendor board that shares the variant.
+
+        On any successful YAML-derived match we persist the result to
+        metadata so subsequent scans skip the YAML parse.
         """
         bid = get_board_id(config_dir, filename)
         if bid:
@@ -500,12 +514,16 @@ class DevicesController:
             yaml_content = yaml_path.read_text(encoding="utf-8")
         except OSError:
             return ""
-        _, pio_board, variant = parse_platform_from_yaml(yaml_content)
-        if not pio_board:
-            return ""
-        matched = self._db.boards.find_by_pio_board(pio_board, variant)
+        platform, pio_board, variant = parse_platform_from_yaml(yaml_content)
+
+        matched = None
+        if pio_board:
+            matched = self._db.boards.find_by_pio_board(pio_board, variant)
+        if matched is None and platform:
+            matched = self._db.boards.find_by_platform_variant(platform, variant)
         if matched is None:
             return ""
+
         # Backfill metadata so future scans skip the YAML parse.
         try:
             set_device_metadata(config_dir, filename, board_id=matched.id)
