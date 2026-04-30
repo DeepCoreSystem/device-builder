@@ -565,36 +565,105 @@ def build_catalog(
 
 
 def _backfill_descriptions_from_mdx(entries: list[dict]) -> None:
-    """Fill empty descriptions from the docs MDX frontmatter, in place.
+    """Fill empty descriptions and field docs from the docs MDX, in place.
 
-    The prebuilt schema's component index sometimes only lists
-    ``dependencies`` for a platform-providing component, leaving the
-    description blank. The MDX docs page for the same component
-    *does* carry a ``description:`` frontmatter field (and a curated
-    intro paragraph). Pull from there as a one-time enrichment.
+    The prebuilt schema's index sometimes only lists ``dependencies``
+    for a component, and the per-field schema entries often omit the
+    ``docs`` field entirely (notably the OTA platforms). The MDX docs
+    page carries both a curated component-level description and a
+    ``## Configuration variables`` bullet list with one description
+    per field. Pull from both as a one-time enrichment.
 
     Silently skipped when the docs repo can't be cloned/fetched.
     """
-    missing = [e for e in entries if not (e.get("description") or "").strip()]
-    if not missing:
-        return
     descriptions = _load_mdx_descriptions()
-    if not descriptions:
+    field_descriptions = _load_mdx_field_descriptions()
+    if not descriptions and not field_descriptions:
         return
-    backfilled = 0
-    for entry in missing:
+
+    backfilled_components = 0
+    backfilled_fields = 0
+    for entry in entries:
         cid = entry["id"]
-        text = descriptions.get(cid)
-        if not text:
-            # Try the bare stem as a last resort (e.g. for hub-style
-            # components whose docs file isn't under <domain>/).
-            stem = cid.split(".", 1)[-1]
-            text = descriptions.get(stem)
-        if text:
-            entry["description"] = text
-            backfilled += 1
-    if backfilled:
-        _LOGGER.info("Backfilled %d descriptions from docs MDX", backfilled)
+        stem = cid.split(".", 1)[-1]
+
+        # Component-level description.
+        if not (entry.get("description") or "").strip():
+            text = descriptions.get(cid) or descriptions.get(stem)
+            if text:
+                entry["description"] = text
+                backfilled_components += 1
+
+        # docs_url: when the schema's See-also link is missing, derive
+        # from the catalog id (matches the docs site's URL convention
+        # ``/components/<domain>/<stem>/`` for platform-providing
+        # components, ``/components/<bare>/`` for non-platform).
+        if not entry.get("docs_url"):
+            entry["docs_url"] = _derive_docs_url(cid)
+
+        # Per-field descriptions inside config_entries.
+        field_map = field_descriptions.get(cid) or field_descriptions.get(stem) or {}
+        if field_map:
+            backfilled_fields += _apply_field_descriptions(
+                entry.get("config_entries") or [],
+                field_map,
+                docs_url=entry.get("docs_url") or "",
+            )
+
+    if backfilled_components or backfilled_fields:
+        _LOGGER.info(
+            "Backfilled from docs MDX: %d components, %d fields",
+            backfilled_components,
+            backfilled_fields,
+        )
+
+
+def _derive_docs_url(component_id: str) -> str:
+    """Build the docs site URL for *component_id* using the canonical pattern.
+
+    ESPHome's docs site mirrors the source repo layout:
+
+        ``<domain>.<stem>`` → /components/<domain>/<stem>/
+        ``<bare>``          → /components/<bare>/
+
+    Used as a fallback when the schema's per-component ``docs`` field
+    has no ``See also`` link (notably the OTA platforms).
+    """
+    if "." in component_id:
+        domain, stem = component_id.split(".", 1)
+        return f"https://esphome.io/components/{domain}/{stem}"
+    return f"https://esphome.io/components/{component_id}"
+
+
+def _apply_field_descriptions(
+    config_entries: list[dict],
+    field_descriptions: dict[str, str],
+    *,
+    docs_url: str,
+) -> int:
+    """Apply per-field descriptions to entries that lack them.
+
+    Walks recursively into nested entries. Also fills ``help_link``
+    when missing — pointing at the ``#configuration-variables`` anchor
+    of the component's docs page.
+    """
+    backfilled = 0
+    fragment_url = f"{docs_url}#configuration-variables" if docs_url else ""
+    for entry in config_entries:
+        key = entry["key"]
+        if not (entry.get("description") or "").strip():
+            text = field_descriptions.get(key)
+            if text:
+                entry["description"] = text
+                backfilled += 1
+                if fragment_url and not entry.get("help_link"):
+                    entry["help_link"] = fragment_url
+        # Recurse into nested config_entries — within a component the
+        # parent and child config-vars use distinct names.
+        inner = entry.get("config_entries")
+        if inner:
+            backfilled += _apply_field_descriptions(inner, field_descriptions, docs_url=docs_url)
+    return backfilled
 
 
 def _load_mdx_descriptions() -> dict[str, str]:
@@ -641,6 +710,113 @@ def _load_mdx_descriptions() -> dict[str, str]:
             stem = parts[-1]
             out.setdefault(stem, text)
     return out
+
+
+def _load_mdx_field_descriptions() -> dict[str, dict[str, str]]:
+    """Walk the cached docs repo, return ``{component_id: {field: desc}}``.
+
+    Same lookup convention as ``_load_mdx_descriptions`` — keyed by
+    catalog id (``ota.esphome``) and bare stem (``esphome``). The
+    inner map is ``{field_key: cleaned_description}``.
+
+    Used to fill in per-field descriptions for components whose schema
+    entries lack a ``docs`` field — most visibly the OTA platforms.
+    """
+    docs_dir = _ensure_docs_repo()
+    if docs_dir is None:
+        return {}
+
+    out: dict[str, dict[str, str]] = {}
+    components_root = docs_dir / "src" / "content" / "docs" / "components"
+    if not components_root.exists():
+        return {}
+
+    for mdx_path in components_root.rglob("*.mdx"):
+        rel = mdx_path.relative_to(components_root)
+        parts = rel.with_suffix("").parts
+        if not parts or parts[-1] == "index":
+            continue
+        if len(parts) == 1:
+            component_id = parts[0]
+        elif len(parts) == 2:
+            component_id = f"{parts[0]}.{parts[1]}"
+        else:
+            continue
+
+        fields = _extract_mdx_field_descriptions(mdx_path.read_text(encoding="utf-8"))
+        if fields:
+            out[component_id] = fields
+            stem = parts[-1]
+            out.setdefault(stem, fields)
+    return out
+
+
+# Top-level config-variable bullet line:
+#   - **field_name** (*Optional*, type): Description text.
+_CONFIG_VAR_LINE = re.compile(
+    r"^- \*\*(?P<name>[A-Za-z_][A-Za-z0-9_]*)\*\*[^:\n]*?:\s*(?P<desc>.*)$",
+)
+
+
+def _extract_mdx_field_descriptions(text: str) -> dict[str, str]:
+    """Parse the ``## Configuration variables`` section into a field map.
+
+    Captures one description per top-level bullet — including
+    continuation lines from indented prose, but excluding nested
+    sub-bullets and stopping at sub-headings (``###`` action /
+    trigger sections).
+    """
+    body = re.sub(r"^---\s*\n.*?\n---\s*\n", "", text, count=1, flags=re.DOTALL)
+
+    section_re = re.compile(
+        r"^(?:##\s+Configuration variables\s*|Configuration variables:\s*)\n"
+        r"(.*?)(?=^##\s|\Z)",
+        re.MULTILINE | re.DOTALL,
+    )
+    match = section_re.search(body)
+    if not match:
+        return {}
+
+    descriptions: dict[str, str] = {}
+    current_key: str | None = None
+    current_parts: list[str] = []
+
+    def commit() -> None:
+        nonlocal current_key
+        if current_key is None:
+            return
+        joined = " ".join(p for p in current_parts if p)
+        cleaned = _clean_description_text(joined).rstrip(" .,:")
+        if cleaned and cleaned[-1] not in ".!?":
+            cleaned += "."
+        if cleaned:
+            descriptions[current_key] = cleaned
+
+    for raw_line in match.group(1).splitlines():
+        line = raw_line.rstrip()
+        m = _CONFIG_VAR_LINE.match(line)
+        if m:
+            commit()
+            current_key = m.group("name")
+            current_parts = [m.group("desc").strip()] if m.group("desc").strip() else []
+            continue
+        if current_key is None:
+            continue
+        stripped = line.strip()
+        # Block-quotes / GitHub alerts and sub-headings end the field.
+        if stripped.startswith((">", "#")):
+            commit()
+            current_key = None
+            current_parts = []
+            continue
+        # Sub-bullets describe sub-fields — skip.
+        if stripped.startswith(("- ", "* ", "+ ")):
+            continue
+        if stripped:
+            current_parts.append(stripped)
+
+    commit()
+    return descriptions
 
 
 def _ensure_docs_repo() -> Path | None:
