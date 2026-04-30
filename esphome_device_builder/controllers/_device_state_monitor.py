@@ -28,11 +28,16 @@ _LOGGER = logging.getLogger(__name__)
 _ESPHOME_SERVICE_TYPE = "_esphomelib._tcp.local."
 _PING_INTERVAL = 60  # seconds between ping sweeps
 _PING_BATCH_SIZE = 10
+_MDNS_RESOLVE_TIMEOUT_MS = 2000
 
 # Callback signature used by DeviceStateMonitor to push state changes
 # back to its owner. The owner decides what to do with the new state
 # (e.g. fire a bus event, mutate the device model).
 StateChangeCallback = Callable[[str, DeviceState, str], None]
+
+# Callback fired when mDNS resolves (or clears) a device's IP address.
+# Empty string signals the device went offline / was removed from mDNS.
+IPChangeCallback = Callable[[str, str], None]
 
 
 class DeviceStateMonitor:
@@ -49,10 +54,13 @@ class DeviceStateMonitor:
         self,
         get_devices: Callable[[], list[Device]],
         on_state_change: StateChangeCallback,
+        on_ip_change: IPChangeCallback,
     ) -> None:
         self._get_devices = get_devices
         self._on_state_change = on_state_change
+        self._on_ip_change = on_ip_change
         self._state_source: dict[str, str] = {}  # device name → "mdns" | "ping"
+        self._device_ips: dict[str, str] = {}  # device name → last known IP
         self._zeroconf: AsyncEsphomeZeroconf | None = None
         self._mdns_browser: Any = None
         self._ping_task: asyncio.Task | None = None
@@ -109,6 +117,25 @@ class DeviceStateMonitor:
         self._on_state_change(name, state, source)
         return True
 
+    def apply_ip(self, name: str, ip: str) -> bool:
+        """
+        Record an IP observation. Empty string clears the stored IP.
+
+        Returns True when the IP actually changed and the change was
+        forwarded to the callback.
+        """
+        if self._find_device_by_name(name) is None:
+            return False
+        prev = self._device_ips.get(name, "")
+        if prev == ip:
+            return False
+        if ip:
+            self._device_ips[name] = ip
+        else:
+            self._device_ips.pop(name, None)
+        self._on_ip_change(name, ip)
+        return True
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
@@ -145,12 +172,18 @@ class DeviceStateMonitor:
             device_name = name.split(".")[0].replace("-", "_")
             _LOGGER.debug("mDNS: %s %s (raw: %s)", state_change, device_name, name)
 
-            # zeroconf callbacks fire on a different thread — bounce the
-            # state update back to the asyncio loop.
+            # zeroconf callbacks fire on a different thread — bounce work
+            # back to the asyncio loop. Added/Updated trigger an async
+            # resolve so we can report the IP alongside the state change;
+            # Removed clears state immediately.
             if state_change in (ServiceStateChange.Added, ServiceStateChange.Updated):
-                loop.call_soon_threadsafe(self.apply, device_name, DeviceState.ONLINE, "mdns")
+                asyncio.run_coroutine_threadsafe(
+                    self._resolve_and_apply(zeroconf, service_type, name, device_name),
+                    loop,
+                )
             elif state_change == ServiceStateChange.Removed:
                 loop.call_soon_threadsafe(self.apply, device_name, DeviceState.OFFLINE, "mdns")
+                loop.call_soon_threadsafe(self.apply_ip, device_name, "")
                 self._state_source.pop(device_name, None)
 
         try:
@@ -162,6 +195,33 @@ class DeviceStateMonitor:
             _LOGGER.info("mDNS browser started for %s", _ESPHOME_SERVICE_TYPE)
         except Exception:
             _LOGGER.exception("Could not start mDNS browser — device discovery limited to ping")
+
+    async def _resolve_and_apply(
+        self, zeroconf: Any, service_type: str, name: str, device_name: str
+    ) -> None:
+        """Mark the device online and try to resolve its IPv4 address from mDNS."""
+        # State first — even if the resolve fails or times out, we know the device is online.
+        self.apply(device_name, DeviceState.ONLINE, "mdns")
+
+        try:
+            from zeroconf import IPVersion
+            from zeroconf.asyncio import AsyncServiceInfo
+        except ImportError:
+            return
+
+        try:
+            info = AsyncServiceInfo(service_type, name)
+            if not await info.async_request(zeroconf, timeout=_MDNS_RESOLVE_TIMEOUT_MS):
+                return
+            addresses = info.parsed_scoped_addresses(
+                IPVersion.V4Only
+            ) or info.parsed_scoped_addresses(IPVersion.V6Only)
+            if addresses:
+                # Strip any zone suffix (e.g. "fe80::1%en0") for display purposes.
+                ip = addresses[0].split("%", 1)[0]
+                self.apply_ip(device_name, ip)
+        except Exception:
+            _LOGGER.debug("mDNS resolve failed for %s", device_name, exc_info=True)
 
     async def _ping_loop(self) -> None:
         try:

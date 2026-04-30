@@ -68,6 +68,7 @@ class DevicesController:
         self._state_monitor = DeviceStateMonitor(
             get_devices=self._get_devices,
             on_state_change=self._on_state_change,
+            on_ip_change=self._on_ip_change,
         )
 
     # ------------------------------------------------------------------
@@ -549,6 +550,17 @@ class DevicesController:
         device.state = state
         _LOGGER.info("Device %s: %s → %s (via %s)", name, old_state, state, source)
         self._db.bus.fire(EventType.DEVICE_STATE_CHANGED, {"device": device})
+
+    def _on_ip_change(self, name: str, ip: str) -> None:
+        """Forward mDNS-resolved IP updates onto the event bus."""
+        device = next((d for d in self._scanner.devices if d.name == name), None)
+        if device is None:
+            return
+        if device.ip == ip:
+            return
+        device.ip = ip
+        _LOGGER.debug("Device %s IP: %s", name, ip or "(cleared)")
+        self._db.bus.fire(EventType.DEVICE_UPDATED, {"device": device})
 
     def _load_ignored_devices(self) -> None:
         storage_path = ignored_devices_storage_path()

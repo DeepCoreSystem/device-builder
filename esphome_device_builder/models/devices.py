@@ -26,7 +26,10 @@ class Device(DataClassORJSONMixin):
     comment: str | None = None
     board_id: str = ""
     target_platform: str = ""
-    address: str = ""
+    address: str = ""  # mDNS hostname from StorageJSON (e.g. "my_device.local")
+    ip: str = (
+        ""  # Resolved IPv4 address from mDNS discovery — empty until the device is seen online
+    )
     web_port: int | None = None
     current_version: str = ""
     deployed_version: str = ""
