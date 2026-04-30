@@ -1814,7 +1814,14 @@ def _resolve_name(component_id: str, stem: str, doc_name: str | None) -> str:
 
 
 # Category overrides for non-platform components — matches the legacy
-# catalog so existing UI groupings stay stable.
+# catalog so existing UI groupings stay stable. The "core" group is
+# the union of (a) ESPHome's own infrastructure (api, wifi, logger,
+# ...), (b) target-platform components (esp32, esp8266, ...), and
+# (c) device-wide config keys that aren't really components but show
+# up as top-level YAML blocks (substitutions, packages, globals,
+# external_components, ...). The frontend's "Add core configuration"
+# dialog is a thin filter on category=core, so this list defines what
+# the user sees there.
 _CATEGORY_OVERRIDES: dict[str, str] = {
     # Core ESPHome infrastructure
     "esphome": "core",
@@ -1828,6 +1835,30 @@ _CATEGORY_OVERRIDES: dict[str, str] = {
     "safe_mode": "core",
     "time": "core",
     "network": "core",
+    "ethernet": "core",
+    "mdns": "core",
+    "improv_serial": "core",
+    "debug": "core",
+    "preferences": "core",
+    # Target platform components (esp32, esp8266, ...) — these are
+    # also tagged via `is_target_platform` introspection, but listing
+    # them explicitly here makes the override authoritative.
+    "esp32": "core",
+    "esp8266": "core",
+    "rp2040": "core",
+    "bk72xx": "core",
+    "rtl87xx": "core",
+    "ln882x": "core",
+    "nrf52": "core",
+    "host": "core",
+    # Device-wide config keys (not really "components" — they don't
+    # have C++ implementations — but they live at the top level of
+    # YAML alongside real components).
+    "substitutions": "core",
+    "packages": "core",
+    "external_components": "core",
+    "dashboard_import": "core",
+    "globals": "core",
     # Bus / transport components
     "i2c": "bus",
     "spi": "bus",
@@ -1838,7 +1869,6 @@ _CATEGORY_OVERRIDES: dict[str, str] = {
     # Automation primitives
     "script": "automation",
     "interval": "automation",
-    "globals": "automation",
 }
 
 

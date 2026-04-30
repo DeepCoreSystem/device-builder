@@ -108,6 +108,7 @@ class ComponentCatalog:
         *,
         query: str | None = None,
         category: ComponentCategory | str | None = None,
+        exclude_category: ComponentCategory | str | None = None,
         platform: str | None = None,
         board_id: str | None = None,
         offset: int = 0,
@@ -127,12 +128,20 @@ class ComponentCatalog:
         ``board_id`` is a convenience: the boards catalog is consulted
         to derive the matching platform, so the frontend can pass
         whichever it has handy. ``platform`` wins when both are set.
+
+        ``exclude_category`` is the inverse of ``category`` — used by
+        the regular component selector to hide ``core`` entries (those
+        belong to the dedicated "Add core configuration" dialog
+        instead). Both filters can be combined though that's unusual.
         """
         platform = self._resolve_platform(platform, board_id)
         results = self._components
 
         if category:
             results = [c for c in results if c.category == category]
+
+        if exclude_category:
+            results = [c for c in results if c.category != exclude_category]
 
         if platform:
             results = [
