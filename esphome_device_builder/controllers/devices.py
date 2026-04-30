@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from esphome import const
@@ -61,7 +62,7 @@ class DevicesController:
 
         self._scanner = DeviceScanner(
             config_dir=self._db.settings.config_dir,
-            get_board_id=get_board_id,
+            get_board_id=self._resolve_board_id,
             on_change=self._on_scan_change,
         )
         self._state_monitor = DeviceStateMonitor(
@@ -476,6 +477,41 @@ class DevicesController:
     def _get_devices(self) -> list[Device]:
         """Bridge for the state monitor (``self._scanner.devices`` is a property)."""
         return self._scanner.devices
+
+    def _resolve_board_id(self, config_dir: Path, filename: str) -> str:
+        """Resolve a device's board_id from metadata, falling back to YAML.
+
+        Priority:
+          1. ``metadata.json`` — set explicitly when the user picks a
+             board through the UI, or backfilled by a previous scan.
+          2. Parse the YAML's ``esphome.platform`` / ``board`` /
+             ``variant`` and match against the board catalog. If a match
+             is found we persist it to metadata so subsequent scans are
+             metadata-only — important so manual YAML edits that switch
+             boards are reflected without losing user-explicit picks.
+        """
+        bid = get_board_id(config_dir, filename)
+        if bid:
+            return bid
+        if self._db.boards is None:
+            return ""
+        yaml_path = config_dir / filename
+        try:
+            yaml_content = yaml_path.read_text(encoding="utf-8")
+        except OSError:
+            return ""
+        _, pio_board, variant = parse_platform_from_yaml(yaml_content)
+        if not pio_board:
+            return ""
+        matched = self._db.boards.find_by_pio_board(pio_board, variant)
+        if matched is None:
+            return ""
+        # Backfill metadata so future scans skip the YAML parse.
+        try:
+            set_device_metadata(config_dir, filename, board_id=matched.id)
+        except Exception:
+            _LOGGER.warning("Could not persist derived board_id for %s", filename)
+        return matched.id
 
     def _on_scan_change(self, kind: ScanChange, device: Device) -> None:
         """Forward scanner changes onto the event bus."""
