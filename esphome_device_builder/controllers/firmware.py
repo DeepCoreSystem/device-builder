@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import sys
+from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -1014,11 +1015,42 @@ class FirmwareController:
         return job
 
     async def _enqueue(self, job: FirmwareJob) -> FirmwareJob:
-        """Enqueue a job, persist, and fire JOB_QUEUED."""
+        """
+        Enqueue a job, persist, and fire JOB_QUEUED.
+
+        Cancels any queued or running job for the same device so the
+        manage-tasks panel only shows one active job per device — a
+        fresh compile/upload/install/clean request makes earlier
+        in-flight work irrelevant. We fire ``JOB_QUEUED`` for the
+        new job *before* cancelling the predecessor so frontends can
+        recognise the resulting ``JOB_CANCELLED`` as a supersede
+        (already-present successor for the same configuration) and
+        drop the old entry silently rather than parking it in the
+        "Recent" history. Reset jobs (empty configuration) skip the
+        supersede.
+        """
         await self._queue.put(job)
         self._db.bus.fire(EventType.JOB_QUEUED, {"job": job})
+        if job.configuration:
+            await self._supersede_active_jobs(job.configuration, exclude_job_id=job.job_id)
         await self._persist_jobs()
         return job
+
+    async def _supersede_active_jobs(self, configuration: str, *, exclude_job_id: str) -> None:
+        """Cancel queued/running jobs for ``configuration``."""
+        to_cancel = [
+            j.job_id
+            for j in self._jobs.values()
+            if j.job_id != exclude_job_id
+            and j.configuration == configuration
+            and j.status in (JobStatus.QUEUED, JobStatus.RUNNING)
+        ]
+        for job_id in to_cancel:
+            # Status may flip under us if the runner finalises the
+            # job mid-iteration; cancel() raises in that window and
+            # we don't care.
+            with suppress(ValueError, RuntimeError):
+                await self.cancel(job_id=job_id)
 
     def _prune_history(self) -> None:
         """
