@@ -40,6 +40,7 @@ import urllib.request
 import zipfile
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from functools import cache
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -1215,6 +1216,12 @@ def build_component_entry(
     docs = clean_docs(meta.get("docs"))
     dependencies = list(meta.get("dependencies") or [])
 
+    # Drop deps the chosen networking transport will auto-load. See
+    # ``_implicit_dependencies``.
+    implicit = _implicit_dependencies()
+    if implicit:
+        dependencies = [d for d in dependencies if d not in implicit]
+
     # Narrow esphome introspection — adds multi_conf, platform_defaults,
     # supported_platforms, and refined types (boolean/float/...) the
     # schema bundle doesn't surface. No-ops when esphome isn't
@@ -1977,12 +1984,25 @@ _TARGET_PLATFORMS: frozenset[str] = frozenset(
     }
 )
 
+# Network-transport components — every device picks exactly one. Their
+# combined ``AUTO_LOAD`` closure (see ``_implicit_dependencies``)
+# determines which "interface" components ESPHome will resolve
+# automatically regardless of which transport the user picked.
+_NETWORK_TRANSPORTS: frozenset[str] = frozenset({"wifi", "ethernet", "openthread", "host"})
+
 
 def introspect_component(component_id: str) -> dict[str, Any]:
-    """Return ``{multi_conf, platform_defaults, supported_platforms, refined_types}``.
+    """
+    Return ``{multi_conf, is_target_platform, platform_defaults, refined_types, auto_load}``.
 
     Best-effort: returns an empty dict when ``esphome`` isn't importable
     or the component module can't be loaded.
+
+    ``auto_load`` is ESPHome's static list of components pulled in
+    whenever this one is configured. When the upstream declaration is
+    a callable (config-dependent), we can't resolve it without a
+    config and surface an empty list — callers should treat that as
+    "unknown" and stay conservative.
     """
     if not component_id:
         return {}
@@ -1996,11 +2016,15 @@ def introspect_component(component_id: str) -> dict[str, Any]:
     if manifest is None:
         return {}
 
+    raw_auto_load = manifest.auto_load
+    auto_load: list[str] = list(raw_auto_load) if isinstance(raw_auto_load, list) else []
+
     return {
         "multi_conf": bool(getattr(manifest, "multi_conf", False)),
         "is_target_platform": bool(getattr(manifest, "is_target_platform", False)),
         "platform_defaults": _collect_platform_defaults(manifest),
         "refined_types": _collect_refined_types(manifest),
+        "auto_load": auto_load,
     }
 
 
@@ -2406,6 +2430,44 @@ def _derive_supported_platforms(
     if introspection.get("is_target_platform"):
         return [component_id]
     return [d for d in dependencies if d in _TARGET_PLATFORMS]
+
+
+def _auto_load_closure(component_id: str) -> set[str]:
+    """Walk ``AUTO_LOAD`` chains starting from *component_id*."""
+    seen: set[str] = set()
+    queue = [component_id]
+    while queue:
+        cid = queue.pop()
+        for item in introspect_component(cid).get("auto_load") or []:
+            if item not in seen:
+                seen.add(item)
+                queue.append(item)
+    return seen
+
+
+@cache
+def _implicit_dependencies() -> frozenset[str]:
+    """
+    Return components implicitly satisfied by configuring any transport.
+
+    A device must declare exactly one networking transport (wifi /
+    ethernet / openthread / host) and ESPHome auto-loads ``network``
+    (plus its own ``AUTO_LOAD`` chain) from whichever transport the
+    user picks. Components in the *intersection* of every transport's
+    closure are guaranteed to be resolved no matter which one was
+    chosen, so we drop them from each component's surface
+    ``dependencies``. Without this filter the catalog would prompt
+    the frontend to warn about a missing ``network:`` block even
+    when ``wifi:`` is already configured.
+    """
+    if not _NETWORK_TRANSPORTS:
+        return frozenset()
+    closures = [_auto_load_closure(t) for t in _NETWORK_TRANSPORTS]
+    if not all(closures):
+        # Introspection failed for at least one transport — fall back
+        # to no filtering rather than risk dropping real deps.
+        return frozenset()
+    return frozenset(set.intersection(*closures))
 
 
 if __name__ == "__main__":
