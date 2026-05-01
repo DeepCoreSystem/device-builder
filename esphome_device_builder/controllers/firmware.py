@@ -401,18 +401,21 @@ class FirmwareController:
         snapshot: bool = True,
         **kwargs: Any,
     ) -> None:
-        """Stream every job's lifecycle events to one client connection.
+        """
+        Stream every job's lifecycle events to one client connection.
 
         Designed for a "manage compile tasks" panel: subscribe once
         and the frontend sees every queued / started / progress /
         completed / failed / cancelled event for every job, plus
         live ``output`` lines tagged with their ``job_id``.
 
-        When ``snapshot`` is True (default), the current set of
-        non-terminal jobs is replayed first so the panel paints
-        immediately even after a page refresh. Each event keeps the
-        same ``job`` payload shape as the bus, so the frontend can
-        update its in-memory map by ``job_id`` without extra queries.
+        When ``snapshot`` is True (default), the controller's full
+        retained set of jobs — both active and the trimmed terminal
+        history — is replayed first so the panel paints the complete
+        picture immediately after a page refresh, with no extra round
+        trip to ``firmware/get_jobs``. Each event keeps the same
+        ``job`` payload shape as the bus, so the frontend can update
+        its in-memory map by ``job_id`` without extra queries.
 
         Runs until the client disconnects (which surfaces here as a
         ``CancelledError`` from ``send_event``).
@@ -422,12 +425,6 @@ class FirmwareController:
 
         if snapshot:
             for job in sorted(self._jobs.values(), key=lambda j: j.created_at):
-                if job.status in (
-                    JobStatus.COMPLETED,
-                    JobStatus.FAILED,
-                    JobStatus.CANCELLED,
-                ):
-                    continue
                 await client.send_event(message_id, "snapshot", job.to_dict())
 
         pending_tasks: set[asyncio.Task] = set()

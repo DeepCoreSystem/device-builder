@@ -123,7 +123,7 @@ On connect, the server sends a [`ServerInfoMessage`](../esphome_device_builder/m
 - `job_queued`, `job_started`, `job_output`, `job_progress`, `job_completed`, `job_failed`, `job_cancelled`
 
 **`firmware/follow_jobs` stream events** (per WebSocket subscription):
-- `snapshot` — initial replay of every non-terminal job (one event per job, payload is the full `FirmwareJob`). Skipped when `snapshot: false`.
+- `snapshot` — initial replay of every retained job (one event per job, payload is the full `FirmwareJob`). Includes both active and the trimmed terminal history, so a client gets the complete picture from a single subscription with no extra `firmware/get_jobs` call. Skipped when `snapshot: false`.
 - `job_queued` / `job_started` / `job_completed` / `job_failed` / `job_cancelled` — full `FirmwareJob` payload.
 - `job_output` — `{job_id, line}` (line keeps its `\n` or `\r` terminator).
 - `job_progress` — `{job_id, progress}` (0–100 integer).
