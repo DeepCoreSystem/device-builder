@@ -15,7 +15,7 @@ import secrets
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from esphome import const
+from esphome import const, yaml_util
 from esphome.storage_json import StorageJSON, ext_storage_path
 
 from ..models import Device, DeviceState
@@ -171,12 +171,16 @@ def detect_platform_from_yaml(path: Path) -> str:
         return ""
 
 
-def device_uses_mqtt(yaml_content: str) -> bool:
-    """
-    Return True when the device YAML declares a top-level ``mqtt:`` block.
+def yaml_has_top_level_block(yaml_content: str, key: str) -> bool:
+    """Return True when the raw YAML literally declares a top-level *key*: block.
 
-    The check is line-based so it handles invalid drafts and partially
-    edited configs gracefully — no full YAML parse required.
+    Cheap line-scan that survives invalid drafts and partially edited
+    configs — no full parse required. Misses configs that pull the
+    block in via ``!include`` or packages, which is why scan-time
+    flags prefer :func:`config_has_top_level_block` over the resolved
+    config; this helper is the fallback for when YAML parsing fails
+    (mid-edit drafts, missing secrets) so the indicator doesn't
+    silently flip off while the user is typing.
     """
     for line in yaml_content.splitlines():
         if not line or line[0].isspace():
@@ -184,9 +188,51 @@ def device_uses_mqtt(yaml_content: str) -> bool:
         stripped = line.strip()
         if stripped.startswith("#") or ":" not in stripped:
             continue
-        if stripped.split(":", 1)[0].strip() == "mqtt":
+        if stripped.split(":", 1)[0].strip() == key:
             return True
     return False
+
+
+def device_uses_mqtt(yaml_content: str) -> bool:
+    """Return True when the raw YAML literally declares a top-level ``mqtt:`` block."""
+    return yaml_has_top_level_block(yaml_content, "mqtt")
+
+
+_RAW_API_ENCRYPTION_RE = re.compile(
+    # Matches an ``encryption:`` line that's indented under ``api:``
+    # (any depth ≥ 1 space). Used as a draft-time heuristic — once
+    # ``load_device_yaml`` succeeds, the resolved-config check wins.
+    #
+    # The two body alternatives are exclusive: ``[ \t][^\n]*\n`` matches
+    # an indented (non-blank) line; ``\n`` alone matches a literal blank
+    # line. No overlap, so the engine can't backtrack between them on a
+    # long run of newlines (the previous ``\s*\n`` alternative could
+    # also consume a bare ``\n``, which CodeQL flagged as exponential).
+    r"^api:[^\n]*\n(?:[ \t][^\n]*\n|\n)*[ \t]+encryption:(?:\s|$)",
+    re.MULTILINE,
+)
+
+
+def yaml_has_api_encryption(yaml_content: str) -> bool:
+    """Heuristic: True when raw YAML appears to declare ``api: encryption:``.
+
+    Used during mid-edit drafts when the full resolver fails so the
+    encryption-indicator doesn't blink off the moment the user types
+    a syntax error. The resolved-config check is preferred whenever
+    available (catches ``!include`` / packages this regex can't see).
+    """
+    return bool(_RAW_API_ENCRYPTION_RE.search(yaml_content))
+
+
+def config_has_top_level_block(config: dict | None, key: str) -> bool:
+    """Return True when *config* (a resolved device YAML) defines top-level *key*.
+
+    Catches configs that split the block across ``!include`` / packages,
+    which a raw-text scan misses. Treats the block as "present" when
+    the key exists even with a ``None`` / empty value (e.g. a bare
+    ``api:`` line is still an opt-in to the Native API).
+    """
+    return isinstance(config, dict) and key in config
 
 
 def parse_esphome_meta(  # noqa: PLR0912
@@ -296,6 +342,12 @@ def load_device_from_storage(
     except OSError:
         yaml_content = ""
     yaml_name, yaml_friendly, yaml_comment = parse_esphome_meta(yaml_content)
+    # Full resolved config (``!include`` / packages / ``!secret``
+    # expanded) drives the api-encryption flag — a bare regex on raw
+    # YAML would miss configs that pull the api block in via include
+    # or split it across packages. ``None`` on parse failure is fine;
+    # ``api_encrypted`` falls back to False.
+    resolved_config = load_device_yaml(path)
 
     fallback_name = filename.removesuffix(".yml").removesuffix(".yaml")
     storage_name = storage.name if storage else None
@@ -331,6 +383,27 @@ def load_device_from_storage(
     else:
         target_platform = detect_platform_from_yaml(path)
 
+    loaded_integrations = sorted(storage.loaded_integrations) if storage else []
+    # ``api_enabled`` / ``api_encrypted`` get the union of every signal
+    # we have:
+    #   1. Resolved YAML config — catches local ``api:`` blocks pulled
+    #      in via ``!include`` / local packages.
+    #   2. Raw-text scan — keeps the indicator stable mid-edit when
+    #      ``yaml_util.load_yaml`` fails on an invalid draft.
+    #   3. ``StorageJSON.loaded_integrations`` — the compile-time
+    #      ground truth. Required for configs that pull the api block
+    #      in from a remote ``dashboard_import`` package (Apollo, etc.):
+    #      ``yaml_util.load_yaml`` doesn't fetch URLs so the resolved
+    #      config has no ``api:`` at the top level, but the compiled
+    #      device still loads it.
+    api_enabled = (
+        ("api" in loaded_integrations)
+        or config_has_top_level_block(resolved_config, "api")
+        or yaml_has_top_level_block(yaml_content, "api")
+    )
+    api_encrypted = get_api_encryption_block(
+        resolved_config
+    ) is not None or yaml_has_api_encryption(yaml_content)
     return Device(
         name=name,
         friendly_name=friendly_name,
@@ -345,11 +418,21 @@ def load_device_from_storage(
         deployed_version=deployed,
         expected_config_hash=expected_config_hash,
         deployed_config_hash=deployed_config_hash,
-        loaded_integrations=sorted(storage.loaded_integrations) if storage else [],
+        loaded_integrations=loaded_integrations,
         state=state,
         has_pending_changes=has_pending,
         update_available=update_available,
-        uses_mqtt=device_uses_mqtt(yaml_content),
+        # ``uses_mqtt`` keeps its prior shape — the resolved config
+        # wins, raw-text fills in mid-edit, and we don't have a
+        # ``loaded_integrations`` entry that maps cleanly to "uses
+        # mqtt for dashboard discovery" the way ``"api"`` does.
+        uses_mqtt=(
+            config_has_top_level_block(resolved_config, "mqtt")
+            if resolved_config is not None
+            else yaml_has_top_level_block(yaml_content, "mqtt")
+        ),
+        api_enabled=api_enabled,
+        api_encrypted=api_encrypted,
     )
 
 
@@ -407,6 +490,53 @@ def _parse_inline_value(raw: str) -> str:
     ):
         value = value[1:-1]
     return value
+
+
+def load_device_yaml(path: Path) -> dict | None:
+    """Load *path* with ESPHome's YAML loader; return the top-level mapping.
+
+    Resolves ``!secret`` / ``!include`` / etc. like a real compile, and
+    returns ``None`` when the file isn't a mapping or fails to parse.
+    Centralised so callers that need a parsed config — API-key
+    extraction, encryption-status checks, future config inspection —
+    share one entry point with the same error handling.
+    """
+    try:
+        # ``yaml_util.load_yaml`` calls ``.open()`` on its argument, so
+        # pass the ``Path`` directly — handing it a stringified path
+        # raises ``AttributeError`` deep inside the loader.
+        config = yaml_util.load_yaml(path)
+    except Exception:
+        return None
+    return config if isinstance(config, dict) else None
+
+
+def get_api_encryption_block(config: dict | None) -> dict | None:
+    """
+    Return the ``api.encryption`` mapping from a parsed device config.
+
+    ``None`` when the config is missing, has no ``api:`` block, or the
+    ``api:`` block has no ``encryption:`` sub-mapping. Useful for both
+    the "is encrypted?" boolean and the "show me the key" string —
+    they share the same lookup, the only thing that differs is what
+    they pull off the result.
+    """
+    if not isinstance(config, dict):
+        return None
+    api_block = config.get("api")
+    if not isinstance(api_block, dict):
+        return None
+    encryption = api_block.get("encryption")
+    return encryption if isinstance(encryption, dict) else None
+
+
+def get_api_encryption_key(config: dict | None) -> str:
+    """Return the resolved Native API encryption key, or empty string."""
+    encryption = get_api_encryption_block(config)
+    if encryption is None:
+        return ""
+    key = encryption.get("key")
+    return key if isinstance(key, str) else ""
 
 
 def _resolve_substitutions(value: str | None, subs: dict[str, str]) -> str | None:
