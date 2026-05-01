@@ -524,6 +524,26 @@ class DevicesController:
             cmd.extend(["--device", port])
         await self._stream_subprocess(cmd, client, message_id)
 
+    @api_command("devices/stop_stream")
+    async def stop_stream(
+        self,
+        *,
+        stream_id: str,
+        client: Any = None,
+        **kwargs: Any,
+    ) -> dict:
+        """
+        Cancel a streaming command (``devices/logs`` or ``devices/validate``) on this connection.
+
+        ``stream_id`` is the ``message_id`` returned when the streaming
+        command was issued. Returns ``{"cancelled": True}`` if a matching
+        in-flight stream was found; ``{"cancelled": False}`` otherwise
+        (already finished, never registered, or no client context).
+        """
+        if client is None:
+            return {"cancelled": False}
+        return {"cancelled": client.cancel_stream(stream_id)}
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
@@ -870,21 +890,54 @@ class DevicesController:
         await loop.run_in_executor(None, _delete_all)
 
     async def _stream_subprocess(self, cmd: list[str], client: Any, message_id: str) -> None:
-        """Run a CLI subprocess and stream its merged stdout/stderr to a single client."""
+        """Run a CLI subprocess and stream its merged stdout/stderr to a single client.
+
+        Registers the running task with the client so a peer ``devices/stop_stream``
+        command (or a WS disconnect) can cancel it; cancellation kills the
+        subprocess so it doesn't keep running detached.
+        """
+        # Register before the first await so an early ``stop_stream`` (during
+        # subprocess spawn) still finds and cancels this task.
+        task = asyncio.current_task()
+        assert task is not None  # always running inside a Task
+        client.register_stream(message_id, task)
+
         env = {**os.environ, "PLATFORMIO_FORCE_ANSI": "true"}
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            env=env,
-        )
+        proc: asyncio.subprocess.Process | None = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env=env,
+            )
+            assert proc.stdout is not None
+            async for line_bytes in proc.stdout:
+                line = line_bytes.decode("utf-8", errors="replace").rstrip("\n\r")
+                await client.send_event(message_id, "output", line)
+            exit_code = await proc.wait()
+        except asyncio.CancelledError:
+            # Synchronous kill only — no awaits in the cancel path. The
+            # ``finally`` block reaps the process and ``devices/stop_stream``
+            # is what tells the frontend the cancel succeeded. ``proc`` may
+            # be ``None`` if cancellation arrived before spawn returned.
+            if proc is not None and proc.returncode is None:
+                proc.kill()
+            # Honour the cancellation contract — only swallow if no
+            # outstanding cancel requests remain on this task.
+            if (current := asyncio.current_task()) and current.cancelling():
+                raise
+            return
+        finally:
+            client.unregister_stream(message_id)
+            if proc is not None and proc.returncode is None:
+                # Reap so the transport closes cleanly; shielded so an
+                # additional cancellation doesn't strand the subprocess.
+                try:
+                    await asyncio.shield(proc.wait())
+                except asyncio.CancelledError:
+                    pass
 
-        assert proc.stdout is not None  # type narrowing
-        async for line_bytes in proc.stdout:
-            line = line_bytes.decode("utf-8", errors="replace").rstrip("\n\r")
-            await client.send_event(message_id, "output", line)
-
-        exit_code = await proc.wait()
         await client.send_event(
             message_id, "result", {"success": exit_code == 0, "code": exit_code}
         )
