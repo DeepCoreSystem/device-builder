@@ -39,6 +39,14 @@ StateChangeCallback = Callable[[str, DeviceState, str], None]
 # Empty string signals the device went offline / was removed from mDNS.
 IPChangeCallback = Callable[[str, str], None]
 
+# Callback fired when the mDNS ``version`` TXT record reports a
+# different firmware version than last seen for a device.
+VersionChangeCallback = Callable[[str, str], None]
+
+# zeroconf hands us raw bytes for TXT keys; declared once so the
+# call site can decode without re-typing the key.
+_TXT_RECORD_VERSION = b"version"
+
 
 class DeviceStateMonitor:
     """
@@ -55,12 +63,15 @@ class DeviceStateMonitor:
         get_devices: Callable[[], list[Device]],
         on_state_change: StateChangeCallback,
         on_ip_change: IPChangeCallback,
+        on_version_change: VersionChangeCallback | None = None,
     ) -> None:
         self._get_devices = get_devices
         self._on_state_change = on_state_change
         self._on_ip_change = on_ip_change
+        self._on_version_change = on_version_change
         self._state_source: dict[str, str] = {}  # device name → "mdns" | "ping"
         self._device_ips: dict[str, str] = {}  # device name → last known IP
+        self._device_versions: dict[str, str] = {}  # device name → last reported version
         self._zeroconf: AsyncEsphomeZeroconf | None = None
         self._mdns_browser: Any = None
         self._ping_task: asyncio.Task | None = None
@@ -136,6 +147,46 @@ class DeviceStateMonitor:
         self._on_ip_change(name, ip)
         return True
 
+    def apply_version(self, name: str, version: str) -> bool:
+        """
+        Record a firmware version observation.
+
+        Returns True when the version actually changed and the change
+        was forwarded to the callback.
+        """
+        if not version or self._on_version_change is None:
+            return False
+        if self._find_device_by_name(name) is None:
+            return False
+        if self._device_versions.get(name) == version:
+            return False
+        self._device_versions[name] = version
+        self._on_version_change(name, version)
+        return True
+
+    def get_cached_addresses(self, host_name: str) -> list[str] | None:
+        """
+        Return zeroconf-cached IPs for *host_name* without issuing a query.
+
+        Returns ``None`` when zeroconf isn't running, the cache misses,
+        or the entry has expired.
+        """
+        if self._zeroconf is None:
+            return None
+        try:
+            from zeroconf import AddressResolver, IPVersion
+        except ImportError:
+            return None
+
+        normalized = host_name.rstrip(".").lower()
+        base_name = normalized.partition(".")[0]
+        resolver_name = f"{base_name}.local."
+        info = AddressResolver(resolver_name)
+        if not info.load_from_cache(self._zeroconf.zeroconf):
+            return None
+        addresses = info.parsed_scoped_addresses(IPVersion.All)
+        return addresses or None
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
@@ -199,7 +250,7 @@ class DeviceStateMonitor:
     async def _resolve_and_apply(
         self, zeroconf: Any, service_type: str, name: str, device_name: str
     ) -> None:
-        """Mark the device online and try to resolve its IPv4 address from mDNS."""
+        """Mark the device online and pull IP + firmware version from mDNS."""
         # State first — even if the resolve fails or times out, we know the device is online.
         self.apply(device_name, DeviceState.ONLINE, "mdns")
 
@@ -220,6 +271,16 @@ class DeviceStateMonitor:
                 # Strip any zone suffix (e.g. "fe80::1%en0") for display purposes.
                 ip = addresses[0].split("%", 1)[0]
                 self.apply_ip(device_name, ip)
+            version_bytes = info.properties.get(_TXT_RECORD_VERSION) if info.properties else None
+            if version_bytes:
+                try:
+                    self.apply_version(device_name, version_bytes.decode())
+                except UnicodeDecodeError:
+                    _LOGGER.debug(
+                        "Could not decode mDNS version TXT for %s: %r",
+                        device_name,
+                        version_bytes,
+                    )
         except Exception:
             _LOGGER.debug("mDNS resolve failed for %s", device_name, exc_info=True)
 

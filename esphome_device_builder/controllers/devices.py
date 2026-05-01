@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 from esphome import const
 from esphome.dashboard.util.text import friendly_name_slugify
+from esphome.helpers import sort_ip_addresses
 from esphome.storage_json import StorageJSON, ext_storage_path, ignored_devices_storage_path
 
 try:
@@ -69,6 +70,7 @@ class DevicesController:
             get_devices=self._get_devices,
             on_state_change=self._on_state_change,
             on_ip_change=self._on_ip_change,
+            on_version_change=self._on_version_change,
         )
 
     # ------------------------------------------------------------------
@@ -93,6 +95,23 @@ class DevicesController:
     def get_devices(self) -> list[Device]:
         """Snapshot of the currently-loaded devices."""
         return self._scanner.devices
+
+    def get_address_cache_args(self, configuration: str) -> list[str]:
+        """
+        Return ``--mdns/--dns-address-cache`` CLI args for *configuration*.
+
+        Empty list when the device is unknown, has no API integration
+        loaded, or has no cached IP available.
+        """
+        target_name = configuration.removesuffix(".yaml").removesuffix(".yml")
+        device = next((d for d in self._scanner.devices if d.name == target_name), None)
+        if device is None:
+            return []
+        # The CLI only consults the address cache through the API client;
+        # non-API devices flash via a different path that wouldn't read it.
+        if "api" not in device.loaded_integrations:
+            return []
+        return _build_address_cache_args(device, self._state_monitor)
 
     # ------------------------------------------------------------------
     # API commands — listing
@@ -562,6 +581,50 @@ class DevicesController:
         _LOGGER.debug("Device %s IP: %s", name, ip or "(cleared)")
         self._db.bus.fire(EventType.DEVICE_UPDATED, {"device": device})
 
+    def _on_version_change(self, name: str, version: str) -> None:
+        """Apply a fresh ESPHome version observed via mDNS."""
+        device = next((d for d in self._scanner.devices if d.name == name), None)
+        if device is None:
+            return
+        if device.deployed_version == version:
+            return
+
+        # StorageJSON.load/save are blocking — push to a background task
+        # so any error gets surfaced via the loop's exception handler.
+        self._db.create_background_task(
+            self._persist_storage_version_async(device.configuration, version)
+        )
+
+        old_version = device.deployed_version
+        device.deployed_version = version
+        device.update_available = bool(device.current_version and version != device.current_version)
+        _LOGGER.info("Device %s version: %s → %s (via mdns)", name, old_version or "?", version)
+        self._db.bus.fire(EventType.DEVICE_UPDATED, {"device": device})
+
+    async def _persist_storage_version_async(self, configuration: str, version: str) -> None:
+        """Update ``StorageJSON.esphome_version`` on disk if it differs."""
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._persist_storage_version, configuration, version)
+
+    @staticmethod
+    def _persist_storage_version(configuration: str, version: str) -> None:
+        """Write *version* to ``StorageJSON.esphome_version`` if it differs."""
+        storage_path = ext_storage_path(configuration)
+        storage = StorageJSON.load(storage_path)
+        if storage is None:
+            return
+        if storage.esphome_version == version:
+            return
+        previous = storage.esphome_version
+        storage.esphome_version = version
+        storage.save(storage_path)
+        _LOGGER.debug(
+            "Updated StorageJSON for %s with mdns version %s (was %s)",
+            configuration,
+            version,
+            previous,
+        )
+
     def _load_ignored_devices(self) -> None:
         storage_path = ignored_devices_storage_path()
         try:
@@ -672,3 +735,35 @@ class DevicesController:
         await client.send_event(
             message_id, "result", {"success": exit_code == 0, "code": exit_code}
         )
+
+
+def _build_address_cache_args(device: Device, monitor: DeviceStateMonitor | None) -> list[str]:
+    """Build CLI cache args from the IPs we already have for *device*."""
+    address = device.address
+    if not address:
+        return []
+
+    # mDNS hostnames are case-insensitive and may carry a trailing dot;
+    # normalise once so the CLI cache key matches what it'll look up.
+    normalized = address.rstrip(".").lower()
+    is_local = normalized.endswith(".local")
+
+    addresses: list[str] = []
+    if is_local and monitor is not None:
+        cached = monitor.get_cached_addresses(address)
+        if cached:
+            addresses = list(cached)
+
+    # Fall back to the single IP we tracked via mDNS resolution — covers
+    # the case where the zeroconf cache entry expired between resolves.
+    if not addresses and device.ip:
+        addresses = [device.ip]
+
+    if not addresses:
+        return []
+
+    cache_type = "mdns" if is_local else "dns"
+    return [
+        f"--{cache_type}-address-cache",
+        f"{normalized}={','.join(sort_ip_addresses(addresses))}",
+    ]
