@@ -10,6 +10,7 @@ a controller.
 from __future__ import annotations
 
 import base64
+import re
 import secrets
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -23,6 +24,10 @@ if TYPE_CHECKING:
     from ..models import BoardCatalogEntry
 
 _PLATFORM_KEYS = frozenset({"esp32", "esp8266", "rp2040", "bk72xx", "rtl87xx", "ln882x", "nrf52"})
+
+# Mirrors esphome's substitution regex (`config_validation.VARIABLE_PROG`):
+# matches ``$name`` or ``${name}`` where name is alphanumeric + underscore.
+_SUBSTITUTION_RE = re.compile(r"\$(\{[a-zA-Z0-9_]*\}|[a-zA-Z0-9_]+)")
 
 
 # ---------------------------------------------------------------------------
@@ -175,33 +180,56 @@ def parse_esphome_meta(
     Returns ``None`` for any field that isn't present in the YAML so
     callers can distinguish "key absent" (fall through to storage) from
     "explicit empty string" (user cleared the value).
+
+    Resolves ``$var`` / ``${var}`` references in the captured fields
+    against the file's top-level ``substitutions:`` block, so a config
+    like::
+
+        substitutions:
+          friendly_name: "Living Room Lamp"
+        esphome:
+          friendly_name: $friendly_name
+
+    yields ``friendly_name = "Living Room Lamp"`` instead of the raw
+    ``$friendly_name`` token. Unknown references are left untouched.
     """
     name: str | None = None
     friendly_name: str | None = None
     comment: str | None = None
-    in_esphome = False
+    substitutions: dict[str, str] = {}
+    current_block: str | None = None
 
     for line in yaml_content.splitlines():
         if line and not line[0].isspace() and ":" in line:
             key = line.split(":")[0].strip()
-            in_esphome = key == "esphome"
+            current_block = key if key in ("esphome", "substitutions") else None
             continue
-        if not in_esphome:
+        if current_block is None:
             continue
         stripped = line.strip()
         if stripped.startswith("#") or not stripped:
             continue
-        for field in ("name", "friendly_name", "comment"):
-            prefix = f"{field}:"
-            if stripped.startswith(prefix):
-                value = _parse_inline_value(stripped[len(prefix) :])
-                if field == "name":
-                    name = value
-                elif field == "friendly_name":
-                    friendly_name = value
-                else:
-                    comment = value
-                break
+        if current_block == "esphome":
+            for field in ("name", "friendly_name", "comment"):
+                prefix = f"{field}:"
+                if stripped.startswith(prefix):
+                    value = _parse_inline_value(stripped[len(prefix) :])
+                    if field == "name":
+                        name = value
+                    elif field == "friendly_name":
+                        friendly_name = value
+                    else:
+                        comment = value
+                    break
+        else:  # current_block == "substitutions"
+            sub_key, sep, sub_raw = stripped.partition(":")
+            if sep:
+                substitutions[sub_key.strip()] = _parse_inline_value(sub_raw)
+
+    if substitutions:
+        name = _resolve_substitutions(name, substitutions)
+        friendly_name = _resolve_substitutions(friendly_name, substitutions)
+        comment = _resolve_substitutions(comment, substitutions)
 
     return name, friendly_name, comment
 
@@ -289,3 +317,22 @@ def _parse_inline_value(raw: str) -> str:
     ):
         value = value[1:-1]
     return value
+
+
+def _resolve_substitutions(value: str | None, subs: dict[str, str]) -> str | None:
+    """
+    Replace ``$var`` / ``${var}`` references in *value* with values from *subs*.
+
+    Unknown references are left untouched (mirrors esphome's
+    ``ignore_missing`` behaviour). Returns *value* unchanged when it
+    is ``None`` or contains no references.
+    """
+    if value is None or "$" not in value:
+        return value
+
+    def repl(match: re.Match[str]) -> str:
+        token = match.group(1)
+        key = token[1:-1] if token.startswith("{") else token
+        return subs.get(key, match.group(0))
+
+    return _SUBSTITUTION_RE.sub(repl, value)
