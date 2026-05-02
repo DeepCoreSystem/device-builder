@@ -16,14 +16,26 @@ Mirrors the legacy dashboard's ``ArchiveRequestHandler`` /
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from esphome_device_builder.controllers.config import (
+    _load_metadata,
+    get_device_metadata,
+    set_device_metadata,
+)
 from esphome_device_builder.controllers.devices import DevicesController
+from esphome_device_builder.controllers.devices import helpers as devices_helpers
+from esphome_device_builder.controllers.devices.helpers import (
+    _archive_clear_device_sidecars,
+    _remove_device_sidecars,
+)
 from esphome_device_builder.helpers.api import CommandError
 from esphome_device_builder.models import ErrorCode
 
@@ -188,20 +200,18 @@ async def test_archive_wipes_storage_sidecar(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_archive_wipes_device_metadata(tmp_path: Path) -> None:
-    """The device-metadata entry is removed when archiving.
+async def test_archive_clears_volatile_metadata_keeps_identity(tmp_path: Path) -> None:
+    """Archive scrubs runtime state but keeps stable identity fields.
 
-    Same reason as the StorageJSON wipe: a future same-name
-    ``configuration`` would inherit the archived device's
-    cached IP / friendly_name / board_id otherwise.
+    Volatile fields (``ip``, ``expected_config_hash``) describe
+    the firmware / network state at archive time and go stale
+    immediately — clear them. Identity fields (``board_id``,
+    ``friendly_name``, ``comment``) survive so an unarchive of
+    the same YAML restores user-visible state unchanged.
+    ``board_id`` in particular is the catalog → YAML match key;
+    losing it on every archive cycle forced an unnecessary
+    re-derive on unarchive.
     """
-    import asyncio
-
-    from esphome_device_builder.controllers.config import (
-        get_device_metadata,
-        set_device_metadata,
-    )
-
     controller = _make_controller(tmp_path)
     _seed_device(tmp_path, "kitchen.yaml")
     # ``set_device_metadata`` writes through ``metadata_transaction``
@@ -215,17 +225,55 @@ async def test_archive_wipes_device_metadata(tmp_path: Path) -> None:
         "kitchen.yaml",
         board_id="esp32-c3-devkitm-1",
         friendly_name="Kitchen Sensor",
+        comment="By the toaster",
         ip="192.168.1.42",
+        expected_config_hash="deadbeef",
     )
-    assert await asyncio.to_thread(
-        get_device_metadata, tmp_path, "kitchen.yaml"
-    )  # truthy: dict has fields
+    pre = await asyncio.to_thread(get_device_metadata, tmp_path, "kitchen.yaml")
+    # Sanity that the seeding above wrote everything we expect.
+    assert pre["board_id"] == "esp32-c3-devkitm-1"
+    assert pre["ip"] == "192.168.1.42"
+    assert pre["expected_config_hash"] == "deadbeef"
 
     await controller._archive_single("kitchen.yaml")
 
-    # Empty dict means no metadata entry — same as a brand-new
-    # device that's never had metadata written.
+    post = await asyncio.to_thread(get_device_metadata, tmp_path, "kitchen.yaml")
+    # Identity fields survive — that's the whole point of this
+    # behaviour. A future regression that wipes the entire entry
+    # (the previous shape) fails here.
+    assert post == {
+        "board_id": "esp32-c3-devkitm-1",
+        "friendly_name": "Kitchen Sensor",
+        "comment": "By the toaster",
+    }
+
+
+@pytest.mark.asyncio
+async def test_archive_drops_metadata_entry_when_only_volatile_fields(tmp_path: Path) -> None:
+    """An entry with only volatile fields is removed entirely on archive.
+
+    Edge case: if a device has metadata that consists *only* of
+    runtime/observed fields (no ``board_id`` / ``friendly_name``
+    / ``comment`` ever set), clearing the volatile fields would
+    leave an empty dict. Drop the entry entirely so the metadata
+    file doesn't accumulate dead keys.
+    """
+    controller = _make_controller(tmp_path)
+    _seed_device(tmp_path, "kitchen.yaml")
+    await asyncio.to_thread(
+        set_device_metadata,
+        tmp_path,
+        "kitchen.yaml",
+        ip="192.168.1.42",
+        expected_config_hash="cafebabe",
+    )
+
+    await controller._archive_single("kitchen.yaml")
+
+    # No entry left at all — not just an empty dict.
     assert await asyncio.to_thread(get_device_metadata, tmp_path, "kitchen.yaml") == {}
+    raw = await asyncio.to_thread(_load_metadata, tmp_path)
+    assert "kitchen.yaml" not in raw
 
 
 @pytest.mark.asyncio
@@ -498,10 +546,6 @@ def test_remove_device_sidecars_logs_oserror_on_storage_unlink(
     on the StorageJSON sidecar shouldn't block the rest of the
     archive / delete flow.
     """
-    from esphome_device_builder.controllers.devices.helpers import (
-        _remove_device_sidecars,
-    )
-
     storage_dir = tmp_path / ".esphome" / "storage"
     storage_dir.mkdir(parents=True)
     (storage_dir / "kitchen.yaml.json").write_text("{}", encoding="utf-8")
@@ -510,7 +554,6 @@ def test_remove_device_sidecars_logs_oserror_on_storage_unlink(
         raise OSError("permission denied")
 
     monkeypatch.setattr(Path, "unlink", _raise_oserror)
-    import logging
 
     with caplog.at_level(logging.WARNING):
         _remove_device_sidecars(tmp_path, "kitchen.yaml")
@@ -521,17 +564,93 @@ def test_remove_device_sidecars_logs_exception_on_metadata_remove(
     tmp_path: Path, monkeypatch: Any, caplog: Any
 ) -> None:
     """Generic Exception from metadata-remove is logged, not raised."""
-    from esphome_device_builder.controllers.devices import helpers as devices_helpers
 
     def _raise(*args: Any, **kwargs: Any) -> None:
         raise RuntimeError("disk full")
 
     monkeypatch.setattr(devices_helpers, "remove_device_metadata", _raise)
-    import logging
 
     with caplog.at_level(logging.WARNING):
         devices_helpers._remove_device_sidecars(tmp_path, "kitchen.yaml")
     assert any("Could not remove metadata" in rec.message for rec in caplog.records)
+
+
+def test_archive_clear_device_sidecars_logs_oserror_on_storage_unlink(
+    tmp_path: Path, monkeypatch: Any, caplog: Any
+) -> None:
+    """OSError from the storage unlink is logged, not raised.
+
+    Mirrors the ``_remove_device_sidecars`` exception-path test
+    for the archive variant. The metadata clear should still run
+    after the storage unlink fails — a permission error on one
+    file mustn't block the volatile-fields wipe on the other.
+    """
+    storage_dir = tmp_path / ".esphome" / "storage"
+    storage_dir.mkdir(parents=True)
+    (storage_dir / "kitchen.yaml.json").write_text("{}", encoding="utf-8")
+
+    def _raise_oserror(self: Path, missing_ok: bool = False) -> None:
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(Path, "unlink", _raise_oserror)
+
+    with caplog.at_level(logging.WARNING):
+        _archive_clear_device_sidecars(tmp_path, "kitchen.yaml")
+    assert any("Could not remove storage file" in rec.message for rec in caplog.records)
+
+
+def test_clear_volatile_device_metadata_drops_corrupt_non_dict_entry(
+    tmp_path: Path,
+) -> None:
+    """A non-dict value at the entry is treated as corrupt and dropped.
+
+    ``set_device_metadata`` later assumes the existing entry is
+    a dict and item-assigns into it; leaving a non-dict in place
+    would crash that path. Drop the bad value so the next write
+    starts from a clean shape.
+    """
+    from esphome_device_builder.controllers.config import (
+        _save_metadata,
+        clear_volatile_device_metadata,
+        get_device_metadata,
+    )
+
+    # Seed a corrupt entry (string instead of dict) directly via
+    # the persistence helper — ``set_device_metadata`` won't let
+    # us write a non-dict value through its public surface.
+    _save_metadata(tmp_path, {"kitchen.yaml": "not-a-dict"})
+
+    clear_volatile_device_metadata(tmp_path, "kitchen.yaml")
+
+    # ``get_device_metadata`` returns ``{}`` when the value is
+    # not a dict — but here the entry should be gone entirely.
+    # Read the raw file to distinguish.
+    from esphome_device_builder.controllers.config import _load_metadata
+
+    raw = _load_metadata(tmp_path)
+    assert "kitchen.yaml" not in raw
+    assert get_device_metadata(tmp_path, "kitchen.yaml") == {}
+
+
+def test_archive_clear_device_sidecars_logs_exception_on_metadata_clear(
+    tmp_path: Path, monkeypatch: Any, caplog: Any
+) -> None:
+    """Generic Exception from clear-volatile is logged, not raised.
+
+    A failure scrubbing the volatile metadata fields shouldn't
+    propagate — the YAML has already been moved to the archive
+    by the time this helper runs, so raising would surface a
+    half-completed archive operation to the caller.
+    """
+
+    def _raise(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(devices_helpers, "clear_volatile_device_metadata", _raise)
+
+    with caplog.at_level(logging.WARNING):
+        devices_helpers._archive_clear_device_sidecars(tmp_path, "kitchen.yaml")
+    assert any("Could not clear volatile metadata" in rec.message for rec in caplog.records)
 
 
 # ---------------------------------------------------------------------------

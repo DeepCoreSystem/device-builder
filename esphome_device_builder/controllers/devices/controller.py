@@ -58,6 +58,7 @@ from ..config import (
 from ..firmware.helpers import _find_esphome_cmd
 from .helpers import (
     _apply_featured_presets,
+    _archive_clear_device_sidecars,
     _build_address_cache_args,
     _redact_concealed_secrets,
     _remove_device_sidecars,
@@ -217,7 +218,7 @@ class DevicesController:
     # ------------------------------------------------------------------
 
     @api_command("devices/create")
-    async def create_device(
+    async def create_device(  # noqa: PLR0915
         self,
         *,
         name: str,
@@ -322,6 +323,19 @@ class DevicesController:
             storage_path.parent.mkdir(parents=True, exist_ok=True)
             storage.save(storage_path)
 
+            # Clear any residual metadata entry under this filename
+            # before we write the new one. Archive preserves
+            # identity fields (``board_id`` / ``friendly_name`` /
+            # ``comment``) so an unarchive of the same YAML restores
+            # state, but a *new* device created at the same filename
+            # must start fresh — otherwise an archived device's
+            # ``board_id`` would silently mis-bind the new device's
+            # YAML to the wrong catalog entry, and the persisted
+            # ``friendly_name`` would override the new YAML's. The
+            # stub create path (no ``board_id`` provided, no derive
+            # match) wouldn't otherwise overwrite the entry, so the
+            # explicit wipe runs unconditionally.
+            remove_device_metadata(self._db.settings.config_dir, filename)
             if board_id:
                 set_device_metadata(self._db.settings.config_dir, filename, board_id=board_id)
 
@@ -488,15 +502,18 @@ class DevicesController:
 
     @api_command("devices/archive")
     async def archive_device(self, *, configuration: str, **kwargs: Any) -> None:
-        """Soft-delete a device — keep the YAML, wipe the build dir.
+        """Soft-delete a device — keep the YAML, wipe build artifacts.
 
         Moves the YAML to ``<config_dir>/archive/`` so the user
-        can ``unarchive`` later. Build dir, StorageJSON sidecar,
-        and device-metadata entry are all wiped so a future
-        ``configuration`` with the same filename starts from a
-        clean cache (per-filename keying would otherwise let the
-        new device inherit the archived one's stale state). See
-        ``_archive_single`` for the full rationale.
+        can ``unarchive`` later. Build dir + StorageJSON sidecar
+        are wiped (build artifacts go stale on archive). The
+        device-metadata sidecar's volatile fields (``ip``,
+        ``expected_config_hash``) are cleared but its stable
+        identity fields (``board_id``, ``friendly_name``,
+        ``comment``) survive so an unarchive of the same YAML
+        restores the user-visible state unchanged — ``board_id``
+        is the catalog → YAML match key. See ``_archive_single``
+        for the full keep / clear rationale.
         """
         _validate_archive_configuration(configuration)
         try:
@@ -1584,20 +1601,33 @@ class DevicesController:
             _LOGGER.warning("Could not move metadata for %s", new_filename)
 
     async def _archive_single(self, configuration: str) -> None:
-        """Soft-delete: move the YAML into ``<config_dir>/archive/`` and wipe build + sidecars.
+        """Soft-delete: move the YAML into ``<config_dir>/archive/`` and wipe build artifacts.
 
         Mirrors the legacy dashboard's archive flow with one
         deliberate divergence: we also wipe the StorageJSON
-        sidecar and the device-metadata entry. The legacy
-        dashboard preserved them so unarchive could restore the
-        cached IP / version / hash, but the per-filename keying
-        means a future ``configuration`` with the same name would
-        inherit the archived device's stale state (loaded_integrations,
-        deployed_config_hash, address) until it's recompiled or
-        edited. Wiping on archive trades a few seconds of
-        "unknown state" after unarchive (the scanner + monitor
-        refill from the next mDNS broadcast) for full isolation
-        between archive and any future same-name device.
+        sidecar (a pure build artifact — ``firmware_bin_path`` /
+        ``loaded_integrations`` / ``target_platform`` go stale
+        the moment the build dir is removed). The legacy dashboard
+        preserved StorageJSON so unarchive could restore cached
+        IP / version, but ours uses ``ext_storage_path`` which
+        is per-filename keyed — a future same-name configuration
+        would inherit the archived device's stale build state
+        until recompiled. Wiping on archive trades a few seconds
+        of "unknown state" after unarchive (the scanner + monitor
+        refill from the next mDNS broadcast + the next compile)
+        for full isolation against same-name new devices.
+
+        The device-metadata sidecar is treated more carefully —
+        only volatile fields (``ip``, ``expected_config_hash``)
+        are cleared. Stable identity fields (``board_id``,
+        ``friendly_name``, ``comment``) survive so an unarchive
+        of the same YAML restores the user-visible state
+        unchanged. ``board_id`` in particular is the catalog →
+        YAML match key; an earlier iteration wiped the entire
+        entry and forced a re-derive on every archive →
+        unarchive cycle. See
+        ``_archive_clear_device_sidecars`` for the keep / clear
+        rationale.
 
         Build dir wipe matches what ``_delete_single`` does — an
         archived device's compile output is dead weight (the
@@ -1631,12 +1661,14 @@ class DevicesController:
                 )
                 raise FileExistsError(msg)
             # Wipe build dir first (same shape as delete), then
-            # move the YAML, then wipe the sidecars so a future
-            # same-name ``configuration`` starts from a clean
-            # cache. See the docstring for the full rationale.
+            # move the YAML, then clear the build-artifact
+            # sidecars while keeping stable identity fields so an
+            # unarchive of this same YAML restores its
+            # user-visible state. See the docstring for the
+            # keep / clear split.
             _wipe_device_build_dir(configuration)
             shutil.move(str(config_path), str(target))
-            _remove_device_sidecars(config_dir, configuration)
+            _archive_clear_device_sidecars(config_dir, configuration)
 
         try:
             await loop.run_in_executor(None, _archive_sync)
