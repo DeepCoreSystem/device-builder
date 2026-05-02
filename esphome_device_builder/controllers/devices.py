@@ -3,25 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from esphome import const
+from esphome.components.dashboard_import import import_config
 from esphome.dashboard.util.text import friendly_name_slugify
 from esphome.helpers import sort_ip_addresses
 from esphome.storage_json import StorageJSON, ext_storage_path, ignored_devices_storage_path
 
-try:
-    from esphome.config_helpers import import_config
-except ImportError:
-    import_config = None  # type: ignore[assignment]
-
-import contextlib
-
-from ..helpers.api import api_command
+from ..helpers.api import CommandError, api_command
 from ..helpers.config_hash import compute_yaml_config_hash
 from ..helpers.device_yaml import (
     generate_device_yaml,
@@ -38,6 +34,7 @@ from ..models import (
     Device,
     DevicesResponse,
     DeviceState,
+    ErrorCode,
     EventType,
     JobStatus,
     JobType,
@@ -69,8 +66,11 @@ class DevicesController:
         # wired up in start(); held so stop() can detach cleanly.
         self._unsub_job_completed: Any = None
 
-        # Discovery / import state
-        self.import_result: dict[str, Any] = {}
+        # Discovery / import state. Keyed by ``device.name`` so the
+        # WebSocket layer and ``devices/ignore`` can address entries
+        # without juggling full mDNS service-instance names. Filled by
+        # ``DeviceStateMonitor`` callbacks.
+        self.import_result: dict[str, AdoptableDevice] = {}
         self.ignored_devices: set[str] = set()
 
         # Background ``--only-generate`` bookkeeping. ``--only-generate``
@@ -100,6 +100,9 @@ class DevicesController:
             on_ip_change=self._on_ip_change,
             on_version_change=self._on_version_change,
             on_config_hash_change=self._on_config_hash_change,
+            on_importable_added=self._on_importable_added,
+            on_importable_removed=self._on_importable_removed,
+            is_ignored=self.ignored_devices.__contains__,
         )
         # MQTT routes its observations through the same state monitor so
         # source-priority is enforced in one place.
@@ -173,23 +176,11 @@ class DevicesController:
         await self._scanner.scan()
         configured = self._scanner.devices
         configured_names = {d.name for d in configured}
-
-        importable = []
-        for discovered in self.import_result.values():
-            if discovered.device_name in configured_names:
-                continue
-            importable.append(
-                AdoptableDevice(
-                    name=discovered.device_name,
-                    friendly_name=discovered.friendly_name or "",
-                    package_import_url=discovered.package_import_url,
-                    project_name=discovered.project_name,
-                    project_version=discovered.project_version,
-                    network=discovered.network,
-                    ignored=discovered.device_name in self.ignored_devices,
-                )
-            )
-
+        # ``import_result`` is already pre-filtered against configured
+        # devices when the discovery callback fires; this guard catches
+        # the race where a YAML appeared between the callback and this
+        # listing.
+        importable = [d for d in self.import_result.values() if d.name not in configured_names]
         return DevicesResponse(configured=configured, importable=importable)
 
     @api_command("devices/get_states")
@@ -587,25 +578,67 @@ class DevicesController:
         **kwargs: Any,
     ) -> dict:
         """Import / adopt a discovered device."""
-        if import_config is None:
-            msg = "import_config not available in this ESPHome version"
-            raise RuntimeError(msg)
-
+        configuration = f"{name}.yaml"
+        path = self._db.settings.rel_path(configuration)
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            None,
-            import_config,
-            self._db.settings.rel_path(f"{name}.yaml"),
-            name,
-            friendly_name,
-            project_name,
-            package_import_url,
-            const.CONF_WIFI,
-            encryption,
-        )
+        try:
+            await loop.run_in_executor(
+                None,
+                import_config,
+                path,
+                name,
+                friendly_name,
+                project_name,
+                package_import_url,
+                const.CONF_WIFI,
+                encryption,
+            )
+        except FileExistsError as exc:
+            # ``import_config`` refuses to overwrite an existing YAML.
+            # Surface this as a user-facing error so the dialog can
+            # show "Configuration <file> already exists" instead of
+            # the WS layer's generic "Command failed".
+            msg = f"Configuration {configuration} already exists"
+            raise CommandError(ErrorCode.INVALID_ARGS, msg) from exc
 
-        await self._scanner.scan()
-        return {"configuration": f"{name}.yaml"}
+        # Picking up the new YAML is best-effort — if the scanner
+        # hiccups (e.g. a transient stat error on a network mount),
+        # the next periodic scan will catch it. We've already written
+        # the YAML, so failing the whole command here would lie to
+        # the user and trip a follow-up FileExistsError if they retry.
+        try:
+            await self._scanner.scan()
+        except Exception:
+            _LOGGER.exception("Scan after import failed; will pick up on next poll")
+
+        # Drop the discovery banner entry: the device is now configured,
+        # so it shouldn't continue to show up under "Discovered". The
+        # importable cache key is the device's mDNS-advertised name,
+        # which usually matches the user-chosen YAML name but may
+        # differ (e.g. they edited the MAC suffix off). Match by
+        # ``package_import_url`` so we always find the right entry,
+        # and remember the cached name so we can use it for the
+        # zeroconf-cache lookup below — the device is broadcasting
+        # under that name, not the YAML name.
+        cached_names = [
+            n for n, d in self.import_result.items() if d.package_import_url == package_import_url
+        ]
+        for cached_name in cached_names:
+            self._on_importable_removed(cached_name)
+        mdns_name = cached_names[0] if cached_names else name
+
+        # Skip-the-wait state seed. We just adopted a device that was
+        # advertising on mDNS milliseconds ago, so the next ping sweep
+        # would only confirm what zeroconf already knew. Pull the
+        # cached IP out of zeroconf — keyed by the mDNS-advertised
+        # name, not the user's chosen YAML name — and apply both
+        # ONLINE and the address right away so the new card lands
+        # online instead of blinking through OFFLINE for ~10s.
+        self._state_monitor.apply(name, DeviceState.ONLINE, "mdns", claim=True)
+        cached = self._state_monitor.get_cached_addresses(f"{mdns_name}.local")
+        if cached:
+            self._state_monitor.apply_ip(name, cached[0])
+        return {"configuration": configuration}
 
     @api_command("devices/ignore")
     async def toggle_ignore(self, *, name: str, ignore: bool = True, **kwargs: Any) -> None:
@@ -616,6 +649,14 @@ class DevicesController:
             self.ignored_devices.discard(name)
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._save_ignored_devices)
+        # Mirror the new flag onto the cached AdoptableDevice and
+        # re-publish ADDED so subscribed frontends update the badge
+        # without waiting for a full re-discovery cycle.
+        existing = self.import_result.get(name)
+        if existing is not None and existing.ignored != ignore:
+            updated = replace(existing, ignored=ignore)
+            self.import_result[name] = updated
+            self._db.bus.fire(EventType.IMPORTABLE_DEVICE_ADDED, {"device": updated})
 
     # ------------------------------------------------------------------
     # API commands — per-connection streams (validate, logs)
@@ -780,6 +821,20 @@ class DevicesController:
         # ``async_schedule_storage_json_update``.
         if kind is ScanChange.ADDED and not device.loaded_integrations:
             self._schedule_storage_regenerate(device.configuration)
+        # When a configured device is deleted, re-emit cached
+        # discoveries. Upstream's ``DashboardImportDiscovery`` only
+        # fires ``on_update`` on first sight (``is_new`` check), so
+        # without this nudge a device stays silent until it
+        # re-announces — which can be many minutes for a quiet device.
+        # Use the "revisit all" variant rather than matching on
+        # ``device.name``: the user may have adopted with a YAML name
+        # that differs from the discovered hostname (e.g. they edited
+        # the MAC suffix off), in which case a name-keyed lookup
+        # would miss. ``_on_import_update`` already filters configured
+        # + ignored entries so re-emitting the full set is cheap and
+        # only surfaces what should actually appear.
+        if kind is ScanChange.REMOVED:
+            self._state_monitor.revisit_all_importables()
 
     def _on_state_change(self, name: str, state: DeviceState, source: str) -> None:
         """Forward state monitor updates onto the event bus."""
@@ -875,6 +930,32 @@ class DevicesController:
             "Device %s config_hash: %s → %s (via mdns)", name, old_hash or "?", config_hash
         )
         self._db.bus.fire(EventType.DEVICE_UPDATED, {"device": device})
+
+    def _on_importable_added(self, device: AdoptableDevice) -> None:
+        """Stash a newly-discovered importable device and notify subscribers."""
+        # Keyed by device name so ``devices/list`` can dedupe against
+        # configured devices and ``devices/ignore`` can flip the flag
+        # by name without juggling the full mdns service-instance.
+        self.import_result[device.name] = device
+        self._db.bus.fire(EventType.IMPORTABLE_DEVICE_ADDED, {"device": device})
+
+    def _on_importable_removed(self, name: str) -> None:
+        """Forget an importable device that disappeared from mDNS."""
+        if self.import_result.pop(name, None) is None:
+            return
+        self._db.bus.fire(EventType.IMPORTABLE_DEVICE_REMOVED, {"name": name})
+
+    def get_importable_devices(self) -> list[AdoptableDevice]:
+        """
+        Snapshot of the current importable list (used for ``initial_state``).
+
+        Filters against the configured-name set on every call so an
+        adoption that landed without an mDNS Removed (the device kept
+        announcing on its old name) doesn't leak through into the
+        seed a fresh page load gets.
+        """
+        configured_names = {d.name for d in self._scanner.devices}
+        return [d for d in self.import_result.values() if d.name not in configured_names]
 
     def _on_firmware_job_completed(self, event: Any) -> None:
         """
