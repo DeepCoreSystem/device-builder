@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import shutil
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -1407,19 +1408,30 @@ class DevicesController:
     async def _delete_single(self, configuration: str) -> None:
         """Delete a single device and all associated files."""
         config_path = self._db.settings.rel_path(configuration)
-        if not config_path.exists():
-            msg = f"File not found: {configuration}"
-            raise FileNotFoundError(msg)
-
         loop = asyncio.get_running_loop()
         config_dir = self._db.settings.config_dir
 
         def _delete_all() -> None:
+            # Existence check runs in the executor too — ``Path.exists``
+            # stat()s the filesystem and would block the event loop if
+            # called from the async caller.
+            if not config_path.exists():
+                msg = f"File not found: {configuration}"
+                raise FileNotFoundError(msg)
+            # Wipe the per-device PlatformIO build tree first so a partial
+            # failure later in the cleanup still leaves the user able to
+            # retry the delete. ``StorageJSON.build_path`` is the canonical
+            # location (set during compile) — fall back to a no-op when the
+            # device has never been built or the sidecar is gone.
+            storage_path = ext_storage_path(configuration)
+            storage = StorageJSON.load(storage_path)
+            if storage is not None and storage.build_path:
+                shutil.rmtree(storage.build_path, ignore_errors=True)
             config_path.unlink(missing_ok=True)
             (config_dir / ".trash" / configuration).unlink(missing_ok=True)
             (config_dir / ".archive" / f"{configuration}.json").unlink(missing_ok=True)
             try:
-                ext_storage_path(configuration).unlink(missing_ok=True)
+                storage_path.unlink(missing_ok=True)
             except OSError:
                 _LOGGER.warning("Could not remove storage file for %s", configuration)
             try:
