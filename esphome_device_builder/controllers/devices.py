@@ -17,7 +17,7 @@ from esphome.helpers import sort_ip_addresses
 from esphome.storage_json import StorageJSON, ext_storage_path, ignored_devices_storage_path
 
 from ..helpers.api import CommandError, api_command
-from ..helpers.config_hash import compute_yaml_config_hash
+from ..helpers.config_hash import compute_yaml_config_hash, read_build_info_hash
 from ..helpers.device_yaml import (
     generate_device_yaml,
     get_api_encryption_key,
@@ -561,6 +561,12 @@ class DevicesController:
                         )
                         self._regenerate_failed.add(configuration)
                         return
+                    # ``--only-generate`` writes build_info.json with
+                    # the canonical config_hash before exiting, same as
+                    # a real compile. Persist it to the metadata
+                    # sidecar so the drawer can show "Local: <hash>"
+                    # before the first real flash.
+                    await self._persist_expected_config_hash(configuration)
                     await self._scanner.reload(configuration)
             finally:
                 self._regenerate_pending.discard(configuration)
@@ -816,14 +822,23 @@ class DevicesController:
         ``ip`` is the last-known resolved address from the metadata
         sidecar (``""`` if never seen).
 
-        ``expected_config_hash`` is the YAML's last-compiled
-        ``CORE.config_hash``, written by the firmware controller after
-        each successful compile; ``""`` when the device has never been
-        compiled or the compile predates expected-hash tracking.
+        ``expected_config_hash`` is read from
+        ``<build_path>/build_info.json`` — ESPHome's authoritative
+        post-codegen value. The metadata sidecar is consulted *only*
+        as a fallback for devices whose build directory was wiped
+        (clean) but where we'd previously cached a value. Reading
+        from ``build_info.json`` first keeps the dashboard from
+        getting stuck on a stale sidecar value if a previous run
+        wrote a wrong hash (e.g. the pre-codegen subprocess hash
+        the dashboard used to compute) — the next scan after this
+        change picks up the canonical value automatically.
         """
         md = get_device_metadata(config_dir, filename)
         ip = str(md.get("ip", ""))
-        expected_config_hash = str(md.get("expected_config_hash", ""))
+        # build_info.json wins; sidecar is the post-clean fallback.
+        expected_config_hash = read_build_info_hash(config_dir / filename) or str(
+            md.get("expected_config_hash", "")
+        )
         board_id = str(md.get("board_id", ""))
         if not board_id:
             board_id = self._derive_board_id_from_yaml(config_dir, filename)
@@ -878,7 +893,21 @@ class DevicesController:
         # ``StorageJSON``-derived values without making the user wait
         # for a real compile. Same upstream pattern used in
         # ``async_schedule_storage_json_update``.
-        if kind is ScanChange.ADDED and not device.loaded_integrations:
+        #
+        # Also fire when ``expected_config_hash`` is empty even
+        # though ``loaded_integrations`` is populated. That happens
+        # for devices configured before build_info.json existed (or
+        # imported from an older dashboard) — they have a working
+        # ``StorageJSON`` so the integrations / address / version
+        # all come through, but the build directory either pre-dates
+        # the build_info.json era or was wiped. Without this nudge
+        # the drawer's "Local config hash" shows a permanent em-dash
+        # for those devices because nothing else triggers a
+        # ``--only-generate`` until the user edits the YAML.
+        needs_storage_regen = kind is ScanChange.ADDED and (
+            not device.loaded_integrations or not device.expected_config_hash
+        )
+        if needs_storage_regen:
             self._schedule_storage_regenerate(device.configuration)
         # When a configured device is deleted, re-emit cached
         # discoveries. Upstream's ``DashboardImportDiscovery`` only
@@ -1107,21 +1136,55 @@ class DevicesController:
         push the real value back in.
         """
         if recompute_hash:
-            yaml_path = self._db.settings.rel_path(configuration)
-            new_hash = await compute_yaml_config_hash(yaml_path)
-            if new_hash:
-                loop = asyncio.get_running_loop()
-                config_dir = self._db.settings.config_dir
-                await loop.run_in_executor(
-                    None,
-                    lambda: set_device_metadata(
-                        config_dir, configuration, expected_config_hash=new_hash
-                    ),
-                )
-                _LOGGER.debug("Stored expected_config_hash for %s: %s", configuration, new_hash)
+            await self._persist_expected_config_hash(configuration)
         await self._scanner.reload(configuration)
         if flashed:
             self._sync_deployed_hash_after_flash(configuration)
+
+    async def _persist_expected_config_hash(self, configuration: str) -> None:
+        """
+        Read the canonical config_hash from build_info.json and persist it.
+
+        ESPHome's build (and ``--only-generate``) writes the
+        ``config_hash`` to ``build_info.json`` after running the full
+        validate + codegen pipeline. We read that value back rather
+        than recompute it, because reproducing the build's hash
+        in-process is fragile — ``CORE.config_hash`` is sensitive to
+        post-codegen state (id-pinning, default backfill,
+        normalisation) that ``read_config`` alone doesn't apply.
+        Verified against ``acfloatmonitor32.yaml``: pre-codegen yields
+        ``f3e21d5a`` while the firmware bakes in ``5a94a12d``.
+
+        No-op when the hash can't be read. The caller is on the
+        post-build / post-only-generate path, so a missing or
+        malformed ``build_info.json`` here is unexpected — log a
+        warning so an upstream ESPHome shape change doesn't
+        silently leave the sidecar out of date.
+        ``compute_has_pending_changes`` will lean on the bin mtime
+        in that gap, which catches the "user just edited the YAML"
+        case but won't notice firmware that's drifted from the
+        compile (e.g. flashed elsewhere) — the dot can read
+        in-sync when it shouldn't until the next real flash
+        rewrites the sidecar.
+        """
+        yaml_path = self._db.settings.rel_path(configuration)
+        new_hash = await compute_yaml_config_hash(yaml_path)
+        if not new_hash:
+            _LOGGER.warning(
+                "Could not read config_hash from build_info.json for %s — "
+                "the drawer's Local hash may stay stale until the next flash. "
+                "If this persists across compiles, check that ESPHome's "
+                "build_info.json schema hasn't changed.",
+                configuration,
+            )
+            return
+        loop = asyncio.get_running_loop()
+        config_dir = self._db.settings.config_dir
+        await loop.run_in_executor(
+            None,
+            lambda: set_device_metadata(config_dir, configuration, expected_config_hash=new_hash),
+        )
+        _LOGGER.debug("Stored expected_config_hash for %s: %s", configuration, new_hash)
 
     def _sync_deployed_hash_after_flash(self, configuration: str) -> None:
         """
