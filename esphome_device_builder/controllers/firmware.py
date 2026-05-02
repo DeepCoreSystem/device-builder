@@ -23,9 +23,9 @@ from esphome.components.esp32 import VARIANTS as ESP32_VARIANTS
 from esphome.storage_json import StorageJSON, ext_storage_path
 
 from ..controllers.config import _load_metadata, metadata_transaction
-from ..helpers.api import api_command
+from ..helpers.api import CommandError, api_command
 from ..helpers.subprocess import create_subprocess_exec
-from ..models import EventType, FirmwareJob, JobStatus, JobType
+from ..models import ErrorCode, EventType, FirmwareJob, JobStatus, JobType
 
 if TYPE_CHECKING:
     from ..device_builder import DeviceBuilder
@@ -131,6 +131,23 @@ def _trim_job_output(job: FirmwareJob) -> None:
         f"{_OUTPUT_TRIM_NOTICE_PREFIX} {total_elided} earlier line(s) elided]\n",
         *output[-_MAX_OUTPUT_LINES_RETAINED:],
     ]
+
+
+def _names_touched_by_job(job: FirmwareJob) -> set[str]:
+    """YAML filenames a job will read or write.
+
+    Used by the rename-lock check to spot collisions between an
+    in-flight rename and any other job. A rename has two: the old
+    YAML it's reading from (``configuration``) and the new YAML it
+    will create on install success (``new_name + ".yaml"``). Every
+    other job type touches just one — its ``configuration``.
+    """
+    names: set[str] = set()
+    if job.configuration:
+        names.add(job.configuration)
+    if job.job_type == JobType.RENAME and job.new_name:
+        names.add(f"{job.new_name}.yaml")
+    return names
 
 
 def _find_esphome_cmd() -> list[str]:
@@ -405,11 +422,20 @@ class FirmwareController:
 
     @api_command("firmware/compile_bulk")
     async def compile_bulk(self, *, configurations: list[str], **kwargs: Any) -> list[FirmwareJob]:
-        """Queue compile for multiple devices."""
-        jobs = []
+        """Queue compile for multiple devices.
+
+        Per-device errors (most commonly the rename lock) skip that
+        device and keep going so a single locked configuration in a
+        bulk request doesn't abort the queue for everyone else.
+        """
+        jobs: list[FirmwareJob] = []
         for config in configurations:
-            job = self._create_job(config, JobType.COMPILE)
-            await self._enqueue(job)
+            try:
+                job = self._create_job(config, JobType.COMPILE)
+                await self._enqueue(job)
+            except CommandError as exc:
+                _LOGGER.info("Skipping %s in compile_bulk: %s", config, exc.message)
+                continue
             jobs.append(job)
         return jobs
 
@@ -417,11 +443,20 @@ class FirmwareController:
     async def install_bulk(
         self, *, configurations: list[str], port: str = "OTA", **kwargs: Any
     ) -> list[FirmwareJob]:
-        """Queue update (compile + upload) for multiple devices. Defaults to OTA."""
-        jobs = []
+        """Queue update (compile + upload) for multiple devices. Defaults to OTA.
+
+        Per-device errors (most commonly the rename lock) skip that
+        device and keep going — a rename-in-flight on one of the
+        selected devices shouldn't abort the install for the rest.
+        """
+        jobs: list[FirmwareJob] = []
         for config in configurations:
-            job = self._create_job(config, JobType.INSTALL, port=port)
-            await self._enqueue(job)
+            try:
+                job = self._create_job(config, JobType.INSTALL, port=port)
+                await self._enqueue(job)
+            except CommandError as exc:
+                _LOGGER.info("Skipping %s in install_bulk: %s", config, exc.message)
+                continue
             jobs.append(job)
         return jobs
 
@@ -1207,13 +1242,58 @@ class FirmwareController:
         drop the old entry silently rather than parking it in the
         "Recent" history. Reset jobs (empty configuration) skip the
         supersede.
+
+        Rejects with ``CommandError(INVALID_ARGS)`` when an in-flight
+        ``RENAME`` job has the new job's configuration locked. Rename
+        rewrites the YAML mid-flight (old YAML still on disk during
+        compile, new YAML only written on install success), so a
+        compile/install/clean/upload — or another rename targeting the
+        same old or new name — would fight for files the rename is
+        actively reading or about to write. Same-old-config rename
+        retries are allowed through so the supersede path can cancel
+        and replace.
         """
+        self._check_rename_lock(job)
         await self._queue.put(job)
         self._db.bus.fire(EventType.JOB_QUEUED, {"job": job})
         if job.configuration:
             await self._supersede_active_jobs(job.configuration, exclude_job_id=job.job_id)
         await self._persist_jobs()
         return job
+
+    def _check_rename_lock(self, job: FirmwareJob) -> None:
+        """Reject jobs that would clash with an in-flight rename.
+
+        A rename touches two YAML filenames: the old one it's reading
+        from and the new one it'll create on install success. Any
+        other job that touches either name would either fight for the
+        same file or land its work on a half-flashed device. The one
+        exception is a fresh ``RENAME`` on the same old configuration
+        — that's an explicit user retry / target-name change and the
+        supersede path is meant to cancel-and-replace.
+        """
+        new_touches = _names_touched_by_job(job)
+        if not new_touches:
+            return
+        for active in self._jobs.values():
+            if active.job_type != JobType.RENAME:
+                continue
+            if active.status not in (JobStatus.QUEUED, JobStatus.RUNNING):
+                continue
+            # Same-old-config rename retry: let supersede do its thing.
+            if job.job_type == JobType.RENAME and job.configuration == active.configuration:
+                continue
+            clash = new_touches & _names_touched_by_job(active)
+            if not clash:
+                continue
+            old = active.configuration
+            new = f"{active.new_name}.yaml" if active.new_name else "(unknown)"
+            msg = (
+                f"Device {old} is being renamed to {new}; wait for the "
+                f"rename to finish before queueing another firmware "
+                f"task on either name."
+            )
+            raise CommandError(ErrorCode.INVALID_ARGS, msg)
 
     async def _supersede_active_jobs(self, configuration: str, *, exclude_job_id: str) -> None:
         """Cancel queued/running jobs for ``configuration``."""
