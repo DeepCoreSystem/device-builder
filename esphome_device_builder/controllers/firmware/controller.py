@@ -1364,7 +1364,33 @@ class FirmwareController:
     # ------------------------------------------------------------------
 
     async def _load_jobs(self) -> None:
-        """Load persisted jobs and re-queue any incomplete ones."""
+        """
+        Load persisted jobs and re-queue any incomplete ones.
+
+        - ``QUEUED`` and ``RUNNING`` both re-queue. The user
+          asked for the build; even though the subprocess died
+          with the dashboard, the request is still pending in
+          their head. Worst case the rebuilt-and-reflashed
+          firmware is identical to what was already on the
+          device — that's idempotent, the user pays a couple
+          minutes of compile time, no harm done.
+        - Terminal (``COMPLETED`` / ``FAILED`` / ``CANCELLED``):
+          load into the in-memory map for the recent-jobs panel
+          but don't touch ``_queue``.
+
+        ``RUNNING`` jobs go through ``FirmwareJob.reset()``
+        before being re-queued so the rebuild looks like a
+        fresh run in the per-run-state fields (``progress`` /
+        ``error`` / ``started_at`` / ``completed_at`` /
+        ``exit_code``) but keeps the pre-crash ``output`` log
+        as diagnostic history with a separator marker showing
+        where the rebuild starts. ``reset`` lives on the model
+        rather than as a free helper here so a future per-run
+        field added to ``FirmwareJob`` lands right next to the
+        method that has to clear it.
+
+        See esphome/device-builder#147 for the policy discussion.
+        """
         loop = asyncio.get_running_loop()
         data = await loop.run_in_executor(None, _load_metadata, self._db.settings.config_dir)
         for job_data in data.get(_JOBS_KEY, []):
@@ -1372,10 +1398,23 @@ class FirmwareController:
                 job = FirmwareJob.from_dict(job_data)
                 self._jobs[job.job_id] = job
                 if job.status in (JobStatus.QUEUED, JobStatus.RUNNING):
+                    if job.status == JobStatus.RUNNING:
+                        job.reset()
                     job.status = JobStatus.QUEUED
                     await self._queue.put(job)
             except Exception:
-                _LOGGER.warning("Failed to restore job: %s", job_data.get("job_id", "?"))
+                # ``job_data`` is normally a dict, but a corrupt
+                # persistence file could contain a primitive (string,
+                # int, ``None``) where a dict was expected. ``.get``
+                # would raise ``AttributeError`` on those, defeating
+                # the "skip and continue" intent of this branch.
+                # Probe by isinstance and fall back to the raw repr.
+                identity = (
+                    job_data.get("job_id", "?")
+                    if isinstance(job_data, dict)
+                    else f"<non-dict entry: {job_data!r}>"
+                )
+                _LOGGER.warning("Failed to restore job: %s", identity, exc_info=True)
 
     async def _persist_jobs(self) -> None:
         """Save all jobs to disk."""
