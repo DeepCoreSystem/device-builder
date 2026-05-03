@@ -23,7 +23,13 @@ from aiohttp import web
 from esphome import yaml_util
 
 from ..helpers.api import CommandError
-from ..helpers.json import JSONDecodeError, dumps_str, json_response, loads
+from ..helpers.json import (
+    JSONDecodeError,
+    dumps_str,
+    dumps_str_non_str_keys,
+    json_response,
+    loads,
+)
 from ..helpers.subprocess import create_subprocess_exec
 
 _LOGGER = logging.getLogger(__name__)
@@ -128,11 +134,22 @@ def create_legacy_routes() -> web.RouteTableDef:
             return json_response({"error": "Forbidden"}, status=403)
 
         try:
-            config = await loop.run_in_executor(None, yaml_util.load_yaml, str(config_path))
+            # ``yaml_util.load_yaml`` expects a ``Path`` (it calls
+            # ``fname.open(...)``); a string would raise
+            # ``AttributeError: 'str' object has no attribute 'open'``
+            # at parse time and the bare ``except`` below would
+            # surface it as 500 with that opaque message rather than
+            # a real YAML error. Keep the real ``Path`` here.
+            config = await loop.run_in_executor(None, yaml_util.load_yaml, config_path)
         except Exception as exc:
             return json_response({"error": str(exc)}, status=500)
 
-        return json_response(config)
+        # ESPHome's ``yaml_util.load_yaml`` returns an ``OrderedDict``
+        # whose keys are ``EStr`` (a ``str`` subclass that carries
+        # source-position info). orjson's strict default rejects
+        # non-exact-``str`` keys; ``dumps_str_non_str_keys`` flips
+        # the ``OPT_NON_STR_KEYS`` option just for this endpoint.
+        return web.json_response(config, dumps=dumps_str_non_str_keys)
 
     @routes.get("/compile")
     async def legacy_compile(request: web.Request) -> web.WebSocketResponse:
