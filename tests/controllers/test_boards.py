@@ -352,20 +352,68 @@ def test_iter_boards_returns_internal_list(catalog: BoardCatalog) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_find_by_pio_board_returns_first_match(catalog: BoardCatalog) -> None:
-    """A pio_board with no variant hint returns the first matching entry."""
-    # ``esp32-c3-devkitm-1`` is shared by Seeed XIAO and Generic ESP32-C3.
+def test_find_by_pio_board_prefers_generic_when_multiple_match(
+    catalog: BoardCatalog,
+) -> None:
+    """Multiple matches for the same pio_board → prefer the generic.
+
+    Real-world trigger: a user imports a vanilla ``esp32-c3-devkitm-1``
+    YAML; the catalog contains both that generic plus several vendor
+    products built on the same reference design (Seeed XIAO,
+    "Athom Smart Plug v3", etc.). Without the generic preference the
+    dashboard would mislabel a plain dev-kit as the first vendor entry
+    by alphabetical id, which is exactly the regression that motivated
+    this branch.
+    """
     board = catalog.find_by_pio_board("esp32-c3-devkitm-1")
 
     assert board is not None
-    assert board.esphome.board == "esp32-c3-devkitm-1"
+    assert board.id == "generic-esp32c3"
+    assert board.is_generic is True
+
+
+def test_find_by_pio_board_returns_first_when_no_generic(
+    catalog: BoardCatalog,
+) -> None:
+    """Without a generic among the matches, fall back to the first match.
+
+    Pin the iteration-order fallback by giving the catalog *two*
+    non-generic entries with the same ``pio_board``: a regression
+    that swapped the fallback to "any match" rather than "first
+    match" would surface here. The fixture-as-shipped only has one
+    non-generic for ``esp32-c3-devkitm-1`` once the generics are
+    dropped, so we add a second to make the order check meaningful.
+    """
+    catalog._boards = [b for b in catalog._boards if not b.is_generic]
+    # Insert a second vendor entry with the same pio_board *after*
+    # the existing Seeed XIAO so iteration order is observable.
+    catalog._boards.append(
+        _board(
+            board_id="zzz-second-vendor-c3",
+            name="ZZZ Second Vendor C3",
+            platform=Platform.ESP32,
+            variant=Esp32Variant.ESP32C3,
+            pio_board="esp32-c3-devkitm-1",
+        )
+    )
+
+    board = catalog.find_by_pio_board("esp32-c3-devkitm-1")
+
+    assert board is not None
+    assert board.is_generic is False
+    # First in iteration order wins — Seeed XIAO was added before the
+    # ZZZ stand-in.
+    assert board.id == "seeed-xiao-esp32c3"
 
 
 def test_find_by_pio_board_prefers_matching_variant(catalog: BoardCatalog) -> None:
-    """When ``pio_variant`` is provided, prefer entries whose variant matches."""
-    # The fixture has two pio_board="esp32-c3-devkitm-1" entries; both
-    # are ESP32-C3 here. Add a different-variant entry to make the
-    # preference observable.
+    """When ``pio_variant`` is provided, prefer entries whose variant matches.
+
+    Variant filter narrows the candidate pool *before* the generic
+    preference applies. Add two same-pio different-variant entries
+    (no generic among them) so the variant filter is the only thing
+    that picks a winner.
+    """
     catalog._boards.append(
         _board(
             board_id="alt-c3-board",
