@@ -58,6 +58,8 @@ from ..config import (
     set_device_metadata,
 )
 from ..firmware.helpers import _find_esphome_cmd
+from ._yaml_search import search_yaml_devices
+from ._yaml_search_cache import YamlSearchCache
 from .helpers import (
     _apply_featured_presets,
     _archive_clear_device_sidecars,
@@ -74,6 +76,13 @@ if TYPE_CHECKING:
     from ...device_builder import DeviceBuilder
 
 _LOGGER = logging.getLogger(__name__)
+
+# Per-file match cap for ``yaml/search``. Each device contributes
+# at most this many lines so a chatty match (a query of ``:``
+# against a deeply-nested config) doesn't drown hits in other
+# devices. The dropdown caps its overall hit count at the
+# caller-supplied ``max_results`` on top of this.
+_YAML_SEARCH_PER_FILE_MATCH_CAP = 5
 
 
 class DevicesController:
@@ -108,6 +117,21 @@ class DevicesController:
         self._regenerate_pending: set[str] = set()
         self._regenerate_failed: set[str] = set()
         self._regenerate_lock = asyncio.Lock()
+
+        # ``yaml/search`` per-file cache. The class owns its own
+        # ``stat``-then-read flow + ``asyncio.Lock`` so the
+        # bookkeeping doesn't sprawl across this controller. See
+        # ``_yaml_search_cache.YamlSearchCache``.
+        self._yaml_search_cache = YamlSearchCache()
+        # Global search lock — ``yaml/search`` is I/O-bound (one
+        # ``stat`` per device + reads on cache misses), so two
+        # concurrent searches against the same fleet would just
+        # double the disk pressure without helping latency. Serialise
+        # to one in-flight call per controller; the frontend's
+        # debounce + concurrency-of-1 gate keeps the queue depth low
+        # in normal use, and a slow request from a stuck client
+        # won't fan out to N parallel walks.
+        self._yaml_search_lock = asyncio.Lock()
 
         self._scanner = DeviceScanner(
             config_dir=self._db.settings.config_dir,
@@ -215,6 +239,89 @@ class DevicesController:
     async def get_device_states(self, **kwargs: Any) -> dict:
         """Get connectivity state for all devices."""
         return {d.configuration: d.state.value for d in self._scanner.devices}
+
+    @api_command("yaml/search")
+    async def search_yaml(
+        self,
+        *,
+        query: str,
+        max_results: int = 50,
+        case_sensitive: bool = False,
+        **kwargs: Any,
+    ) -> list[dict]:
+        """
+        Substring-search every configured device's raw YAML file.
+
+        Returns a list of per-device hits, each entry shaped as::
+
+            {
+              "configuration": "<filename>",
+              "device_name":   "<esphome.name>",
+              "friendly_name": "<esphome.friendly_name or name>",
+              "matches": [
+                {"line_number": <1-based int>, "line_text": "<raw line>"}
+              ]
+            }
+
+        Per-file matches are capped at
+        ``_YAML_SEARCH_PER_FILE_MATCH_CAP`` so a chatty match (e.g.
+        a query of ``:`` against a deeply-nested config) doesn't
+        crowd out hits in other devices, and the total hit count is
+        capped at ``max_results`` so the dropdown on the frontend
+        stays usable. Empty / whitespace-only queries return ``[]``
+        immediately — the frontend debounces typing but a stray
+        empty call shouldn't iterate every YAML file.
+
+        Reads the on-disk file (not the package-resolved tree) for
+        cheap line-numbered grep. Searching expanded packages would
+        need separate "matched in package X line Y" rendering on the
+        frontend; queued as a follow-up.
+
+        Iterates the scanner's existing snapshot rather than firing
+        a fresh ``await self._scanner.scan()`` like ``devices/list``
+        does — this command runs once per debounced keystroke from
+        the frontend's command palette, and a per-keystroke disk
+        scan would dominate the round-trip cost. The scanner refreshes
+        on its own cadence (file-watcher events + periodic re-scan)
+        so YAMLs added or removed between scans become visible on
+        the next scan, not the next search. The scanner-level skip
+        of YAMLs that fail to materialise into a ``Device`` (broken
+        configs that ``DeviceScanner._load_devices()`` logs and
+        drops) carries through here too: this command searches the
+        same set of devices the dashboard list shows, not the raw
+        ``*.yaml`` filesystem.
+
+        Cache: see ``_yaml_search_cache.YamlSearchCache``. The
+        frontend debounces keystrokes but still fires one search
+        per pause — on a fleet of 100 devices that's 100 reads + 100
+        splitlines per keystroke without a cache. With it, every
+        keystroke after the first becomes a stat-and-grep against
+        an already-split list (only files whose mtime changed get
+        re-read).
+        """
+        needle_raw = query.strip()
+        if not needle_raw:
+            return []
+        needle = needle_raw if case_sensitive else needle_raw.lower()
+
+        # Global search lock: serialise the I/O-bound walk so two
+        # concurrent searches don't double up on stat / read calls
+        # against the same fleet. The frontend's per-keystroke
+        # debounce + concurrency-of-1 gate keeps the queue shallow
+        # in normal use; this lock backstops the case where a slow
+        # request from a stuck client overlaps with a fresh one.
+        async with self._yaml_search_lock:
+            results, live_configurations = await search_yaml_devices(
+                devices=self._scanner.devices,
+                cache=self._yaml_search_cache,
+                rel_path=lambda c: Path(self._db.settings.rel_path(c)),
+                needle=needle,
+                case_sensitive=case_sensitive,
+                max_results=max_results,
+                per_file_cap=_YAML_SEARCH_PER_FILE_MATCH_CAP,
+            )
+            self._yaml_search_cache.prune(live_configurations)
+            return results
 
     # ------------------------------------------------------------------
     # API commands — CRUD
