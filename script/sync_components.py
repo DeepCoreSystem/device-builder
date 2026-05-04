@@ -31,6 +31,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import logging
 import re
@@ -260,6 +261,97 @@ _COMPONENT_GATED_KEYS: dict[str, str] = {
 }
 
 
+# UART ``DEBUG_SCHEMA`` shape — shared between ``uart.debug`` (the
+# original) and ``ble_nus.debug`` (which imports ``maybe_empty_debug``
+# from uart and reuses the same schema). Defined once here so both
+# overrides stay in lockstep when DEBUG_SCHEMA grows a field upstream.
+_UART_DEBUG_OVERRIDE: dict[str, Any] = {
+    "type": "nested",
+    "label": "Debug",
+    "description": (
+        "Log UART traffic to the ESPHome log for troubleshooting. "
+        "Bare `debug:` enables hex logging with sensible defaults."
+    ),
+    "advanced": False,
+    "help_link": "https://esphome.io/components/uart#uart-debugging",
+    "config_entries": [
+        {
+            "key": "direction",
+            "type": "string",
+            "label": "Direction",
+            "description": "Which side of the bus to log. Defaults to `BOTH`.",
+            "default_value": "BOTH",
+            "options": [
+                {"label": "BOTH", "value": "BOTH"},
+                {"label": "RX", "value": "RX"},
+                {"label": "TX", "value": "TX"},
+            ],
+            "help_link": "https://esphome.io/components/uart#uart-debugging",
+        },
+        {
+            "key": "debug_prefix",
+            "type": "string",
+            "label": "Debug Prefix",
+            "description": (
+                "Prefix prepended to every debug log line. Useful "
+                "when multiple UART buses log at the same time."
+            ),
+            "default_value": "",
+            "help_link": "https://esphome.io/components/uart#uart-debugging",
+        },
+        {
+            "key": "dummy_receiver",
+            "type": "boolean",
+            "label": "Dummy Receiver",
+            "description": (
+                "Capture incoming bytes even when no UART device "
+                "component is bound to the bus. Defaults to `false`."
+            ),
+            "default_value": False,
+            "advanced": True,
+            "help_link": "https://esphome.io/components/uart#uart-debugging",
+        },
+        {
+            "key": "after",
+            "type": "nested",
+            "label": "After",
+            "description": "When to flush accumulated bytes to the log.",
+            "advanced": True,
+            "help_link": "https://esphome.io/components/uart#uart-debugging",
+            "config_entries": [
+                {
+                    "key": "bytes",
+                    "type": "integer",
+                    "label": "Bytes",
+                    "description": (
+                        "Flush after this many bytes have been accumulated. Defaults to 150."
+                    ),
+                    "default_value": 150,
+                    "help_link": "https://esphome.io/components/uart#uart-debugging",
+                },
+                {
+                    "key": "timeout",
+                    "type": "time_period",
+                    "label": "Timeout",
+                    "description": (
+                        "Flush after no bytes have been seen for this long. Defaults to `100ms`."
+                    ),
+                    "default_value": "100ms",
+                    "help_link": "https://esphome.io/components/uart#uart-debugging",
+                },
+                {
+                    "key": "delimiter",
+                    "type": "string",
+                    "label": "Delimiter",
+                    "description": ("Flush as soon as this byte sequence is seen in the stream."),
+                    "help_link": "https://esphome.io/components/uart#uart-debugging",
+                },
+            ],
+        },
+    ],
+}
+
+
 # Per-(component, field) entry overrides for cases where the prebuilt
 # schema doesn't correctly capture the field's structure. Each value
 # is a partial ConfigEntry dict that overrides the schema-derived one.
@@ -290,6 +382,136 @@ _FIELD_OVERRIDES: dict[tuple[str, str], dict[str, Any]] = {
                 "help_link": ("https://esphome.io/components/api#configuration-variables"),
             },
         ],
+    },
+    # ``wifi.ap`` is wrapped in a custom validator (``wifi_network_ap``)
+    # so the schema bundle drops the inner schema and types it as a
+    # bare string. The actual YAML shape is a fallback access point
+    # — same fields as a network entry plus ``ap_timeout``. Surface it
+    # as a nested group on the main form (it's a feature users
+    # actively configure for offline recovery, not an advanced knob)
+    # and rename the label away from the schema's bare ``Ap``.
+    ("wifi", "ap"): {
+        "type": "nested",
+        "label": "Fallback Access Point",
+        "description": (
+            "Bring up an access point on the device when it can't reach "
+            "the configured WiFi network. Pair with `captive_portal:` "
+            "or `web_server:` so the user can connect to the AP and "
+            "reconfigure WiFi from a phone."
+        ),
+        "advanced": False,
+        "help_link": "https://esphome.io/components/wifi#access-point-mode",
+        "config_entries": [
+            {
+                "key": "ssid",
+                "type": "string",
+                "label": "SSID",
+                "description": (
+                    "Name of the access point to create. Leave empty to use the device name."
+                ),
+                "help_link": "https://esphome.io/components/wifi#access-point-mode",
+            },
+            {
+                "key": "password",
+                "type": "secure_string",
+                "label": "Password",
+                "description": ("Password for the access point. Leave empty for an open network."),
+                "help_link": "https://esphome.io/components/wifi#access-point-mode",
+            },
+            {
+                "key": "channel",
+                "type": "integer",
+                "label": "Channel",
+                "description": ("2.4GHz channel the AP should operate on (1-14). Defaults to 1."),
+                "default_value": 1,
+                "range": [1, 14],
+                "advanced": True,
+                "help_link": "https://esphome.io/components/wifi#access-point-mode",
+            },
+            {
+                "key": "ap_timeout",
+                "type": "time_period",
+                "label": "AP Timeout",
+                "description": (
+                    "Time without a station connection before the "
+                    "fallback access point comes up. Set to `0s` to "
+                    "disable automatic startup. Defaults to `90s`."
+                ),
+                "default_value": "90s",
+                "advanced": True,
+                "help_link": "https://esphome.io/components/wifi#access-point-mode",
+            },
+            {
+                "key": "manual_ip",
+                "type": "nested",
+                "label": "Manual IP",
+                "description": (
+                    "Manually set the IP options for the AP. Same "
+                    "fields as the station-side `manual_ip:`."
+                ),
+                "advanced": True,
+                "help_link": "https://esphome.io/components/wifi#access-point-mode",
+                "config_entries": [
+                    {
+                        "key": "static_ip",
+                        "type": "string",
+                        "label": "Static IP",
+                        "description": "The static IP of the AP.",
+                        "required": True,
+                        "help_link": "https://esphome.io/components/wifi#access-point-mode",
+                    },
+                    {
+                        "key": "gateway",
+                        "type": "string",
+                        "label": "Gateway",
+                        "description": "The gateway of the AP network.",
+                        "required": True,
+                        "help_link": "https://esphome.io/components/wifi#access-point-mode",
+                    },
+                    {
+                        "key": "subnet",
+                        "type": "string",
+                        "label": "Subnet",
+                        "description": "The subnet of the AP network.",
+                        "required": True,
+                        "help_link": "https://esphome.io/components/wifi#access-point-mode",
+                    },
+                    {
+                        "key": "dns1",
+                        "type": "string",
+                        "label": "DNS 1",
+                        "description": "The main DNS server for the AP.",
+                        "default_value": "0.0.0.0",
+                        "advanced": True,
+                        "help_link": "https://esphome.io/components/wifi#access-point-mode",
+                    },
+                    {
+                        "key": "dns2",
+                        "type": "string",
+                        "label": "DNS 2",
+                        "description": "The backup DNS server for the AP.",
+                        "default_value": "0.0.0.0",
+                        "advanced": True,
+                        "help_link": "https://esphome.io/components/wifi#access-point-mode",
+                    },
+                ],
+            },
+        ],
+    },
+    # ``uart.debug`` is wired through ``maybe_empty_debug`` (a custom
+    # validator that accepts a bare ``debug:`` and substitutes ``{}``)
+    # which hides ``DEBUG_SCHEMA`` from the bundle. The actual YAML is
+    # a mapping with direction / prefix / accumulator settings.
+    ("uart", "debug"): _UART_DEBUG_OVERRIDE,
+    # ``ble_nus.debug`` reuses ``uart.maybe_empty_debug`` for the same
+    # ``DEBUG_SCHEMA``. Mirror the override and just retitle the
+    # description so it reads about BLE NUS traffic rather than UART.
+    ("ble_nus", "debug"): {
+        **_UART_DEBUG_OVERRIDE,
+        "description": (
+            "Log BLE NUS traffic to the ESPHome log for troubleshooting. "
+            "Bare `debug:` enables hex logging with sensible defaults."
+        ),
     },
 }
 
@@ -1428,10 +1650,14 @@ def _convert_config_vars(
         if entry is None:
             continue
         # Per-(component, field) overrides patch up entries the schema
-        # generator couldn't model (e.g. ``api.encryption``).
+        # generator couldn't model (e.g. ``api.encryption``). Deep-copy
+        # so downstream apply-* passes can mutate ``config_entries``
+        # in place without leaking the change back into the static
+        # ``_FIELD_OVERRIDES`` dict (and across components when two
+        # entries share a shape, like ``uart.debug`` / ``ble_nus.debug``).
         override = _FIELD_OVERRIDES.get((component_id, key))
         if override is not None:
-            entry = {**entry, **override}
+            entry = {**entry, **copy.deepcopy(override)}
         # Cross-cutting infrastructure fields are only meaningful when
         # the named component is configured. Tag them so the frontend
         # can hide them by default.
