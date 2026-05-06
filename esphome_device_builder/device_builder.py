@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import html
 import logging
 import re
 from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +49,77 @@ _LOGGER = logging.getLogger(__name__)
 _NO_CACHE_HEADERS = {"Cache-Control": "no-cache"}
 _IMMUTABLE_HEADERS = {"Cache-Control": "public, max-age=31536000, immutable"}
 _HASHED_FILENAME_RE = re.compile(r"\.[a-f0-9]{8,}\.")
+
+# Path extensions that should NEVER fall back to ``index.html``. The
+# frontend bundle's entry script is emitted with a relative ``src``
+# (rspack ``publicPath: "auto"`` for ingress / reverse-proxy
+# subpath support), so a hard-reload of a deep SPA URL like
+# ``/device/<id>`` resolves the script as ``/device/app.<hash>.js``.
+# Falling back to ``index.html`` for that path would let the
+# browser parse HTML as JavaScript and white-screen on
+# "Unexpected token '<'". Returning 404 instead keeps the failure
+# mode legible — by then the ``<base>`` injection should have
+# steered the script's URL to the deployment root anyway, so
+# this is the belt to that suspenders.
+_ASSET_EXTENSIONS = frozenset(
+    {".js", ".css", ".map", ".woff", ".woff2", ".ttf", ".otf", ".ico", ".png"}
+)
+
+# Placeholder the frontend's ``index.html`` carries verbatim; the
+# backend renders it per-request with the deployment-base prefix.
+# Sentinel chosen to be HTML-attribute-safe and unambiguous in a
+# diff so a partial replacement is loud, not silent.
+_BASE_HREF_PLACEHOLDER = "__ESPHOME_BASE_HREF__"
+
+# Header the rendered shell varies on. Reverse proxies that strip
+# a path prefix announce it via ``X-Forwarded-Prefix`` and the
+# rendered ``<base href>`` differs accordingly — without ``Vary``,
+# an intermediary cache could serve the wrong-prefix shell to a
+# different client. (Copilot-flagged.)
+_BASE_HREF_VARY = "X-Forwarded-Prefix"
+
+
+def _resolve_base_href(request: web.Request, *, tail: str = "") -> str:
+    """Pick the ``<base href>`` for *request*'s deployment.
+
+    Sources, in priority order:
+
+    1. ``X-Forwarded-Prefix`` header — the explicit signal from a
+       reverse proxy or ingress layer that's stripping a path
+       prefix. Required for any non-root deployment whose URLs
+       the backend can't infer from ``request.path`` alone (HA
+       add-on ingress, nginx subpath, …).
+    2. The ``request.path`` minus the matched SPA-fallback tail —
+       lets a direct deploy at ``/`` recover the (empty) prefix
+       without the operator having to set a header. Caller passes
+       the aiohttp ``match_info`` tail in directly so the backend
+       doesn't track the SPA route table.
+
+    Always returns a path with leading + trailing slashes;
+    collapses ``//evil.com``-style injection attempts to a single
+    leading slash.
+    """
+    forwarded = request.headers.get("X-Forwarded-Prefix", "").strip()
+    if forwarded:
+        base = forwarded
+    elif tail and request.path.endswith(tail):
+        # Slice the matched SPA tail off the request path to get
+        # the mount-point prefix. No SPA-route knowledge needed in
+        # the backend; the aiohttp router already matched the tail
+        # and we trust its match_info.
+        base = request.path[: -len(tail)] or "/"
+    else:
+        base = request.path
+    # Collapse any leading-slash run to exactly one so
+    # ``X-Forwarded-Prefix: //evil.com`` can't yield a
+    # protocol-relative ``<base href>`` that points at another
+    # origin. (Copilot-flagged.) Same for trailing slashes — keep
+    # exactly one.
+    base = "/" + base.lstrip("/")
+    if not base.endswith("/"):
+        base += "/"
+    return base
+
 
 # Worker-thread budget for the default ``ThreadPoolExecutor``. asyncio's
 # default is ``min(32, os.cpu_count() + 4)`` — too tight for the
@@ -552,9 +625,42 @@ class DeviceBuilder:
 
         frontend_root = frontend_dir.resolve()
         shell_headers = _NO_CACHE_HEADERS if dev_mode else None
+        index_html_text = index_html.read_text(encoding="utf-8")
+        if _BASE_HREF_PLACEHOLDER not in index_html_text:
+            raise RuntimeError(
+                f"Frontend index.html at {index_html} is missing the "
+                f"{_BASE_HREF_PLACEHOLDER!r} placeholder — the wheel is "
+                "out of sync with the backend's expected template."
+            )
 
-        async def handle_index(request: web.Request) -> web.FileResponse:
-            return web.FileResponse(index_html, headers=shell_headers)
+        @lru_cache(maxsize=8)
+        def _shell_html(base_href: str) -> str:
+            """Cache rendered ``index.html`` per deployment base.
+
+            Substituting a single placeholder is cheap, but doing it
+            on every request adds up under load. Cap at 8 entries —
+            most deployments hit one or two distinct prefixes (root
+            + maybe ingress).
+            """
+            return index_html_text.replace(
+                _BASE_HREF_PLACEHOLDER, html.escape(base_href, quote=True)
+            )
+
+        def _render_shell(request: web.Request, *, tail: str = "") -> web.Response:
+            response = web.Response(
+                text=_shell_html(_resolve_base_href(request, tail=tail)),
+                content_type="text/html",
+                headers=shell_headers,
+            )
+            # The rendered shell varies by ``X-Forwarded-Prefix`` —
+            # without ``Vary`` an intermediary cache could serve a
+            # response built for one prefix to a request behind a
+            # different proxy.
+            response.headers["Vary"] = _BASE_HREF_VARY
+            return response
+
+        async def handle_index(request: web.Request) -> web.Response:
+            return _render_shell(request)
 
         def _resolve_static(candidate: Path) -> Path | None:
             """Return the candidate if it's a real file inside ``frontend_root``.
@@ -571,7 +677,7 @@ class DeviceBuilder:
                 return None
             return None
 
-        async def handle_spa(request: web.Request) -> web.FileResponse:
+        async def handle_spa(request: web.Request) -> web.StreamResponse:
             tail = request.match_info["tail"]
             # Only flat names (hashed bundles, license sidecars) get
             # served from disk. Anything with a path separator is an
@@ -584,7 +690,13 @@ class DeviceBuilder:
                         _IMMUTABLE_HEADERS if _HASHED_FILENAME_RE.search(tail) else shell_headers
                     )
                     return web.FileResponse(resolved, headers=headers)
-            return web.FileResponse(index_html, headers=shell_headers)
+            # 404 asset-shaped requests instead of returning the SPA
+            # shell so the browser doesn't try to parse HTML as JS /
+            # CSS / etc. on a hard-reload of a deep URL — see
+            # ``_ASSET_EXTENSIONS`` for the rationale.
+            if tail and Path(tail).suffix.lower() in _ASSET_EXTENSIONS:
+                raise web.HTTPNotFound()
+            return _render_shell(request, tail=tail)
 
         app.router.add_static("/assets", assets_dir)
         app.router.add_get("/", handle_index)
