@@ -26,6 +26,11 @@ from esphome_device_builder.models import ErrorCode
 
 from .conftest import MakeControllerFactory, StubBoardLookups
 
+VALID_FILE_CONTENT = (
+    "esphome:\n  name: kitchen\n  friendly_name: Kitchen\n"
+    "esp32:\n  variant: esp32\n  board: nodemcu-32s\n"
+)
+
 
 async def test_create_device_translates_file_exists_to_command_error(
     tmp_path: Path,
@@ -41,7 +46,7 @@ async def test_create_device_translates_file_exists_to_command_error(
     (tmp_path / "kitchen.yaml").write_text("esphome:\n  name: kitchen\n", "utf-8")
 
     with pytest.raises(CommandError) as excinfo:
-        await ctrl.create_device(name="kitchen")
+        await ctrl.create_device(name="kitchen", file_content=VALID_FILE_CONTENT)
 
     assert excinfo.value.code == ErrorCode.INVALID_ARGS
     assert "kitchen.yaml already exists" in excinfo.value.message
@@ -79,25 +84,129 @@ async def test_create_device_rejects_unknown_board_id(
 
 
 @pytest.mark.usefixtures("stub_create_device_metadata_helpers")
-async def test_create_device_writes_stub_yaml_and_scans(
+async def test_create_device_emits_minimal_stub_when_no_board_or_file_content(
     tmp_path: Path, make_controller: MakeControllerFactory
 ) -> None:
-    """Happy path with no board / no file_content: stub YAML lands on disk and scan fires."""
+    """No board / no file_content → minimal valid esp32 stub.
+
+    The wizard's "Empty Configuration — for manually writing or
+    pasting" button hits this path: the user wants a starter
+    they can fully rewrite. The starter MUST validate so every
+    downstream operation (rename, edit_friendly_name, install)
+    accepts it; the previous "name-only" stub failed schema
+    validation and silently broke those flows. The stub now
+    defaults to esp32 + ``board: esp32dev`` with a leading
+    "Replace this with your platform" comment so the silent-
+    bind concern is at least visible in the file the user is
+    about to edit.
+    """
     ctrl = make_controller(tmp_path, with_state_monitor=True, with_boards=True)
-    # Catalog lookups must return ``None`` so the derive-from-yaml
-    # branch leaves ``board`` unset; otherwise ``StorageJSON``'s
-    # ``target_platform`` would receive a ``MagicMock``.
     boards = StubBoardLookups(ctrl)
-    boards.find_by_pio_board_returns(None)
-    boards.find_by_platform_variant_returns(None)
+    # Catalog returns a board for ``esp32dev`` to model the realistic
+    # scenario flagged in review: many curated entries share that
+    # PIO board, so a naive lookup would happily pick one.
+    pio_lookup = boards.find_by_pio_board_returns("generic-esp32-board")
+    variant_lookup = boards.find_by_platform_variant_returns("generic-esp32-board")
 
     result = await ctrl.create_device(name="kitchen")
 
     assert result.configuration == "kitchen.yaml"
     yaml_path = tmp_path / "kitchen.yaml"
-    assert yaml_path.read_text("utf-8").startswith("esphome:\n  name: kitchen\n")
-    assert (tmp_path / "storage.json").exists()
+    content = yaml_path.read_text("utf-8")
+    assert "esphome:\n  name: kitchen\n  friendly_name: kitchen\n" in content
+    assert "esp32:\n  board: esp32dev\n" in content
+    assert "Replace this with your actual platform" in content
+    assert "api:\n  encryption:\n    key:" in content
     assert ctrl._scanner.calls == [("scan",)]
+    # Stub branch deliberately skips the catalog lookup so an
+    # arbitrary entry sharing ``esp32dev`` doesn't get pinned to
+    # this device's metadata before the user picks real hardware.
+    pio_lookup.assert_not_called()
+    variant_lookup.assert_not_called()
+
+
+@pytest.mark.usefixtures("stub_create_device_metadata_helpers")
+async def test_create_device_rejects_invalid_file_content(
+    tmp_path: Path, make_controller: MakeControllerFactory
+) -> None:
+    """User-supplied ``file_content`` that doesn't validate is refused.
+
+    The frontend's "import YAML" flow lets users paste arbitrary
+    text into the wizard. Without this guard a malformed paste
+    would land on disk, every downstream operation would refuse
+    it, and the user would have to delete the device and try
+    again. Surfacing the editor's actual errors gives them
+    something to fix.
+    """
+    ctrl = make_controller(tmp_path, with_state_monitor=True, with_boards=True)
+    boards = StubBoardLookups(ctrl)
+    boards.find_by_pio_board_returns(None)
+    boards.find_by_platform_variant_returns(None)
+    # File content that mirrors what the user's failing scenario
+    # would actually look like — esphome block with a name but no
+    # platform block at all, which the editor rejects with the
+    # mocked error below.
+    invalid_file_content = "esphome:\n  name: kitchen\n  friendly_name: Kitchen\n"
+    ctrl._db.editor.validate_yaml = AsyncMock(
+        return_value={
+            "yaml_errors": [],
+            "validation_errors": [
+                {"message": "[esphome] required key not provided: a platform"},
+            ],
+        }
+    )
+
+    with pytest.raises(CommandError) as excinfo:
+        await ctrl.create_device(name="kitchen", file_content=invalid_file_content)
+
+    assert excinfo.value.code == ErrorCode.INVALID_ARGS
+    assert "required key not provided: a platform" in excinfo.value.message
+    # File never landed on disk.
+    assert not (tmp_path / "kitchen.yaml").exists()
+    assert ctrl._scanner.calls == []
+
+
+@pytest.mark.usefixtures("stub_create_device_metadata_helpers")
+async def test_create_device_template_invalid_yaml_surfaces_internal_error(
+    tmp_path: Path, make_controller: MakeControllerFactory
+) -> None:
+    """Generator producing an invalid YAML is *our* bug, not the user's.
+
+    When the wizard's ``board_id`` template emits something that
+    doesn't validate, that's a regression in
+    ``generate_device_yaml`` — the user can't fix it. Raise
+    ``INTERNAL_ERROR`` with a "please report" hint so the
+    diagnostic lands in our issue tracker rather than confusing
+    the user with a "config doesn't validate" they didn't write.
+    """
+    ctrl = make_controller(tmp_path, with_state_monitor=True, with_boards=True)
+    # Board returns a valid catalog entry that drives ``generate_device_yaml``.
+    board = MagicMock()
+    board.id = "esp32-c3"
+    board.esphome.platform = "esp32"
+    board.esphome.variant = "esp32c3"
+    board.esphome.framework = "esp-idf"
+    board.esphome.board = ""
+    board.hardware.flash_size = "4MB"
+    board.hardware.connectivity = []
+    board.name = "Generic ESP32-C3"
+    board.manufacturer = "Generic"
+    ctrl._db.boards.get_board = AsyncMock(return_value=board)
+    ctrl._db.editor.validate_yaml = AsyncMock(
+        return_value={
+            "yaml_errors": [],
+            "validation_errors": [{"message": "[esphome] generator regression"}],
+        }
+    )
+
+    with pytest.raises(CommandError) as excinfo:
+        await ctrl.create_device(name="kitchen", board_id="esp32-c3")
+
+    assert excinfo.value.code == ErrorCode.INTERNAL_ERROR
+    assert "generator regression" in excinfo.value.message
+    assert "report" in excinfo.value.message.lower()
+    assert not (tmp_path / "kitchen.yaml").exists()
+    assert ctrl._scanner.calls == []
 
 
 async def test_create_device_clears_residual_metadata_from_archived_same_name(
@@ -105,16 +214,17 @@ async def test_create_device_clears_residual_metadata_from_archived_same_name(
     monkeypatch: pytest.MonkeyPatch,
     make_controller: MakeControllerFactory,
 ) -> None:
-    """Stub create at a previously-archived filename starts with a clean entry.
+    """Create at a previously-archived filename starts with a clean entry.
 
     Archive preserves identity fields (``board_id``,
     ``friendly_name``, ``comment``) so an unarchive of the same
     YAML restores user-visible state. But a *new* device created
-    at the same filename via the stub flow (no ``board_id``
-    provided, no derive match) must NOT inherit those — otherwise
-    the new device is silently bound to the old catalog entry,
-    and the dashboard renders the new YAML's friendly_name as
-    the archived one's. Pin the wipe-on-create contract.
+    at the same filename — even via ``file_content`` whose YAML
+    didn't carry a recognised board — must NOT inherit those
+    archived fields; otherwise the new device is silently bound
+    to the old catalog entry and the dashboard renders the new
+    YAML's friendly_name as the archived one's. Pin the wipe-on-
+    create contract.
     """
     config_dir = tmp_path
     storage_path = tmp_path / "storage.json"
@@ -140,10 +250,10 @@ async def test_create_device_clears_residual_metadata_from_archived_same_name(
     boards.find_by_pio_board_returns(None)
     boards.find_by_platform_variant_returns(None)
 
-    await ctrl.create_device(name="kitchen")
+    await ctrl.create_device(name="kitchen", file_content=VALID_FILE_CONTENT)
 
-    # Stale entry was cleared. The stub flow has no board_id to
-    # write back, so the entry should be absent (not just empty).
+    # Stale entry was cleared. No matching board → no board_id
+    # written back, so the entry should be absent (not just empty).
     post = await asyncio.to_thread(get_device_metadata, config_dir, "kitchen.yaml")
     assert post == {}
 

@@ -17,7 +17,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from esphome import const
 from esphome.components.dashboard_import import import_config
@@ -30,6 +30,7 @@ from ...helpers.config_hash import compute_yaml_config_hash, read_build_info_has
 from ...helpers.device_yaml import (
     configuration_stem,
     generate_device_yaml,
+    generate_minimal_stub_yaml,
     get_api_encryption_key,
     load_device_yaml,
     parse_esphome_meta,
@@ -96,8 +97,21 @@ from .helpers import (
 
 if TYPE_CHECKING:
     from ...device_builder import DeviceBuilder
+    from ...models import BoardCatalogEntry
 
 _LOGGER = logging.getLogger(__name__)
+
+# Provenance tag for ``_yaml_content_for_create``'s return tuple.
+# ``"user"`` → caller-supplied ``file_content`` (validation
+# failure surfaces as ``INVALID_ARGS``).
+# ``"template"`` → :func:`generate_device_yaml` against a known
+# catalog entry (validation failure → ``INTERNAL_ERROR``).
+# ``"stub"`` → :func:`generate_minimal_stub_yaml` (no inputs;
+# validation failure → ``INTERNAL_ERROR``; caller skips the YAML-
+# driven board-id derivation since the stub's hard-coded
+# ``board: esp32dev`` would otherwise pin metadata to whatever
+# catalog entry happens to share that PIO board).
+_CreateYamlSource = Literal["user", "template", "stub"]
 
 # How long the persisted "regen failed" stamp is honoured before a
 # restart-time check is allowed to re-spawn ``--only-generate`` for
@@ -447,7 +461,22 @@ class DevicesController:
 
         1. ``file_content`` given → write it as-is (user supplied full YAML).
         2. ``board_id`` given → generate a basic config from the board template.
-        3. Neither → write a minimal stub the user fills in manually.
+        3. Neither given → emit a minimal valid esp32 stub via
+           :func:`generate_minimal_stub_yaml`. The wizard's
+           "Empty Configuration — for manually writing or pasting"
+           button hits this path; the user wants a starter they
+           can fully rewrite, but the starter must validate so
+           downstream operations don't refuse it. esp32 is the
+           default platform (most common); a leading comment in
+           the stub tells the user to swap the platform block if
+           their hardware differs.
+
+        Whichever flow runs, the resulting YAML is validated through
+        ``EditorController``'s schema check before the file lands on
+        disk. Validation failures surface as ``INVALID_ARGS`` (the
+        user's ``file_content`` is unfixable from our side) or
+        ``INTERNAL_ERROR`` (one of the generators emitted an
+        invalid YAML — that's our bug to fix, not the user's).
 
         After writing, we always try to derive a board_id by parsing
         the resulting YAML's platform/board/variant fields and matching
@@ -460,6 +489,17 @@ class DevicesController:
 
         filename = f"{name}.yaml"
         config_path = self._db.settings.rel_path(filename)
+
+        # Fast collision check before the (~hundreds of ms) validator
+        # round-trip so a duplicate-name attempt fails on the right
+        # diagnostic instead of surfacing a "config doesn't validate"
+        # for a YAML we weren't about to write anyway. The ``open(...,
+        # "x")`` further down is the actual race-safe write — the
+        # check here is a UX optimisation, not a TOCTOU guard.
+        loop_for_check = asyncio.get_running_loop()
+        if await loop_for_check.run_in_executor(None, config_path.exists):
+            msg = f"Configuration {filename} already exists"
+            raise CommandError(ErrorCode.INVALID_ARGS, msg)
 
         # Surface user-correctable failures (unknown board, name
         # collision) as typed ``INVALID_ARGS`` so the wizard can show
@@ -475,28 +515,49 @@ class DevicesController:
                 raise CommandError(ErrorCode.INVALID_ARGS, msg)
 
         friendly = friendly_name_slugify(name)
-        if file_content:
-            yaml_content = file_content
-        elif board:
-            yaml_content = generate_device_yaml(name, friendly, board, ssid, psk)
-        else:
-            yaml_content = f"esphome:\n  name: {name}\n  friendly_name: {friendly}\n\n"
+        yaml_content, source = self._yaml_content_for_create(
+            name, friendly, board, file_content, ssid, psk
+        )
+
+        # Validate before write so an unflashable YAML never lands
+        # on disk. ``INVALID_ARGS`` for the user-supplied
+        # ``file_content`` branch (the user can fix their input);
+        # ``INTERNAL_ERROR`` for the two generator branches because
+        # an invalid template / stub is our regression and we want
+        # it routed to the issue tracker, not to the user.
+        await self._validate_rewritten_yaml_or_raise(
+            filename,
+            yaml_content,
+            action="create",
+            on_failure=ErrorCode.INVALID_ARGS if source == "user" else ErrorCode.INTERNAL_ERROR,
+        )
 
         # Derive board_id from YAML when not explicitly provided.
         # Mirrors the scanner's resolution chain: pio_board match first,
         # then platform+variant fallback for generic ``esp32:``-style
         # configs without a specific PlatformIO board id.
+        #
+        # Skip derivation for the stub branch. ``generate_minimal_stub_yaml``
+        # hard-codes ``esp32: board: esp32dev`` because the user
+        # hasn't picked hardware yet, but many catalog entries share
+        # that PIO board — running the lookup would pin the new
+        # device to whatever catalog entry the index happens to
+        # surface first, and the wrong entry would stay bound even
+        # after the user rewrites the platform block. ``parsed_platform``
+        # is still set so :func:`StorageJSON` gets a sensible
+        # ``target_platform`` for the initial sidecar.
         parsed_platform = ""
         if not board_id and self._db.boards:
             parsed_platform, pio_board, variant = parse_platform_from_yaml(yaml_content)
-            matched = None
-            if pio_board:
-                matched = self._db.boards.find_by_pio_board(pio_board, variant)
-            if matched is None and parsed_platform:
-                matched = self._db.boards.find_by_platform_variant(parsed_platform, variant)
-            if matched:
-                board = matched
-                board_id = matched.id
+            if source != "stub":
+                matched = None
+                if pio_board:
+                    matched = self._db.boards.find_by_pio_board(pio_board, variant)
+                if matched is None and parsed_platform:
+                    matched = self._db.boards.find_by_platform_variant(parsed_platform, variant)
+                if matched:
+                    board = matched
+                    board_id = matched.id
 
         loop = asyncio.get_running_loop()
 
@@ -1096,42 +1157,68 @@ class DevicesController:
         await self._scanner.scan()
         return {"configuration": configuration, "rewritten": True}
 
+    def _yaml_content_for_create(
+        self,
+        name: str,
+        friendly: str,
+        board: BoardCatalogEntry | None,
+        file_content: str | None,
+        ssid: str,
+        psk: str,
+    ) -> tuple[str, _CreateYamlSource]:
+        """
+        Pick the YAML body for ``devices/create`` based on the inputs.
+
+        Returns ``(yaml_content, source)``; see :data:`_CreateYamlSource`
+        for the meaning of each tag and which post-processing the
+        caller applies per branch.
+        """
+        if file_content:
+            return file_content, "user"
+        if board:
+            return generate_device_yaml(name, friendly, board, ssid, psk), "template"
+        return generate_minimal_stub_yaml(name, friendly), "stub"
+
     async def _validate_rewritten_yaml_or_raise(
         self,
         configuration: str,
         content: str,
         *,
         action: str,
+        on_failure: ErrorCode = ErrorCode.INVALID_ARGS,
     ) -> None:
         """
         Schema-validate *content* via the editor; raise if invalid.
 
-        Used by commands that rewrite a device's YAML and depend on
-        a follow-up install to apply the change (``edit_friendly_name``
-        today, future rename / save / mass-edit handlers). The
-        rewritten YAML only takes effect once an install lands the
-        new firmware, so a YAML that won't validate means the
-        install fails and the running device keeps its old state —
-        the dashboard ends up showing a half-finished change that
-        will never reach the device. Refusing the write here keeps
-        on-disk state and live state in lockstep.
+        Used by commands that produce a YAML and depend on a follow-
+        up install to apply the change (``create_device``,
+        ``edit_friendly_name``, future rename / save handlers). A
+        YAML that won't validate means the install fails and the
+        device-on-network keeps its old state — the dashboard ends
+        up showing a half-finished change that will never reach the
+        device. Refusing the write here keeps on-disk state and
+        live state in lockstep.
 
         Reuses :class:`EditorController`'s warm validator subprocess
         (one per configuration), so the cost is single-digit hundreds
         of ms when the session is warm. ``self._db.editor`` is None
         during dashboard boot before
-        :meth:`EditorController.start` finishes; that window is
-        too narrow for a user to hit in practice, but the guard
-        means the controller still behaves coherently if the
-        editor is unavailable for any reason (e.g. the ``esphome``
-        CLI not on PATH) — better to skip validation than reject
-        every rewrite.
+        :meth:`EditorController.start` finishes; that window is too
+        narrow for a user to hit in practice, but the guard means
+        the controller still behaves coherently if the editor is
+        unavailable (e.g. the ``esphome`` CLI not on PATH) — better
+        to skip validation than reject every write.
 
         *action* is interpolated into the error message ("Can't
-        <action> — config doesn't validate: …"); pass the
-        user-facing verb the dialog will show ("rename",
-        "save"). The error list is capped at three entries so a
-        long error pile collapses to "first three + (+N more)"
+        <action> — config doesn't validate: …"); pass the user-
+        facing verb the dialog will show ("rename", "save",
+        "create"). *on_failure* picks the ``ErrorCode`` raised:
+        default ``INVALID_ARGS`` when the user can fix the input
+        themselves, ``INTERNAL_ERROR`` when the broken YAML came
+        from one of *our* generators (``generate_device_yaml``,
+        clone's leaf rewrite, ...) and the user can't do anything
+        but report it. The error list is capped at three entries so
+        a long error pile collapses to "first three + (+N more)"
         rather than overflowing the toast.
         """
         editor = self._db.editor
@@ -1147,12 +1234,20 @@ class DevicesController:
             return
         shown = errors[:3]
         suffix = f" (+{len(errors) - len(shown)} more)" if len(errors) > len(shown) else ""
+        message_tail = (
+            ". Please report this with a redacted snippet of just the "
+            "esphome: / substitutions: blocks (strip Wi-Fi credentials, "
+            "API keys, and static IPs) so the dashboard generator can "
+            "be fixed."
+            if on_failure is ErrorCode.INTERNAL_ERROR
+            else ". Fix the errors in the editor and try again."
+        )
         raise CommandError(
-            ErrorCode.INVALID_ARGS,
+            on_failure,
             f"Can't {action} — config doesn't validate: "
             + "; ".join(shown)
             + suffix
-            + ". Fix the errors in the editor and try again.",
+            + message_tail,
         )
 
     @api_command("devices/delete")
