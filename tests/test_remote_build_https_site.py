@@ -26,7 +26,7 @@ import hashlib
 import ssl
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import aiohttp
 import pytest
@@ -46,6 +46,7 @@ from esphome_device_builder.device_builder import (
 from esphome_device_builder.helpers.dashboard_identity import (
     _CERT_FILENAME,
     get_or_create_identity,
+    rotate_certificate,
 )
 from esphome_device_builder.helpers.event_bus import Event
 from esphome_device_builder.helpers.remote_build_auth import (
@@ -616,3 +617,193 @@ async def test_maybe_start_remote_build_site_warns_on_ha_addon(
                 await db._remote_build_runner.cleanup()
     warnings = [r for r in caplog.records if "HA addon" in r.getMessage()]
     assert warnings, "expected an HA-addon warning"
+
+
+@pytest.mark.asyncio
+async def test_reload_remote_build_identity_no_op_when_listener_unbound(
+    tmp_path: Path,
+) -> None:
+    """
+    Rotation when the listener isn't bound: no advertiser touch, no rebuild.
+
+    A user can rotate from the Settings UI even with
+    remote-build disabled. The cert + key on disk are already
+    updated by the time this method runs; without a listener,
+    pushing ``pin_sha256`` to mDNS would contradict the TXT
+    contract (pin + port appear iff bound) and point peers at
+    a port that isn't serving traffic. Pin the no-op so a
+    refactor that adds an unconditional advertiser push gets
+    caught here.
+    """
+    settings = DashboardSettings(config_dir=tmp_path)
+    db = DeviceBuilder(settings)
+    advertiser = MagicMock()
+    advertiser.refresh = AsyncMock()
+    db._dashboard_advertiser = advertiser
+    db._remote_build_runner = None
+
+    loop = asyncio.get_running_loop()
+    identity = await loop.run_in_executor(None, get_or_create_identity, tmp_path)
+
+    listener_bound = await db.reload_remote_build_identity(pin_sha256=identity.pin_sha256)
+
+    advertiser.set_pin_sha256.assert_not_called()
+    advertiser.set_remote_build_port.assert_not_called()
+    advertiser.refresh.assert_not_awaited()
+    assert db._remote_build_runner is None
+    # Reload returns ``False`` when there's no listener to rebuild.
+    assert listener_bound is False
+
+
+@pytest.mark.asyncio
+async def test_reload_remote_build_identity_rebuilds_listener(tmp_path: Path) -> None:
+    """
+    Rotation while the listener is bound: tear down + rebuild against the new cert.
+
+    Pins that the live socket picks up the rotated cert without
+    a dashboard restart. Done by checking that the runner ID
+    changes across the call (a fresh ``AppRunner`` is built).
+    """
+    loop = asyncio.get_running_loop()
+
+    def _enable() -> None:
+        with remote_build_settings_transaction(tmp_path) as txn:
+            txn.enabled = True
+
+    await loop.run_in_executor(None, _enable)
+
+    settings = DashboardSettings(config_dir=tmp_path)
+    settings.host = "127.0.0.1"
+    settings.remote_build_port = 0
+    db = DeviceBuilder(settings)
+    db.loop = loop
+    db.remote_build = MagicMock()
+    db.remote_build.lookup_token = MagicMock(return_value=None)
+
+    try:
+        await db._maybe_start_remote_build_site()
+        assert db._remote_build_runner is not None
+        first_runner = db._remote_build_runner
+
+        # Rotate the cert + key on disk so the rebuild loads
+        # the new identity.
+        new_identity = await loop.run_in_executor(None, rotate_certificate, tmp_path)
+        listener_bound = await db.reload_remote_build_identity(
+            pin_sha256=new_identity.pin_sha256,
+        )
+
+        # Listener was rebuilt — different ``AppRunner`` instance.
+        assert db._remote_build_runner is not None
+        assert db._remote_build_runner is not first_runner
+        # Reload reports the post-rebuild state — listener is up.
+        assert listener_bound is True
+    finally:
+        if db._remote_build_runner is not None:
+            await db._remote_build_runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_reload_remote_build_identity_clears_advertiser_when_rebuild_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Rebuild failure leaves the advertiser cleared, not stale.
+
+    The TXT contract is "``pin_sha256`` and ``remote_build_port``
+    appear iff the listener is currently bound". If rotation
+    tears down the runner and the rebuild fails (port now bound
+    by something else, cert load throws, …), the advertiser
+    must NOT keep advertising the pre-rotation pin + port —
+    peers re-browsing would otherwise try to connect to a
+    socket that's no longer there. Pin both fields cleared on
+    the failure path.
+    """
+    loop = asyncio.get_running_loop()
+
+    def _enable() -> None:
+        with remote_build_settings_transaction(tmp_path) as txn:
+            txn.enabled = True
+
+    await loop.run_in_executor(None, _enable)
+
+    settings = DashboardSettings(config_dir=tmp_path)
+    settings.host = "127.0.0.1"
+    settings.remote_build_port = 0
+    db = DeviceBuilder(settings)
+    db.loop = loop
+    db.remote_build = MagicMock()
+    db.remote_build.lookup_token = MagicMock(return_value=None)
+
+    advertiser = MagicMock()
+    advertiser.refresh = AsyncMock()
+    db._dashboard_advertiser = advertiser
+
+    try:
+        # Fake the runner-bound state without going through
+        # ``_maybe_start_remote_build_site``; the test cares
+        # about the teardown + clear + failed-rebuild sequence,
+        # not the initial bind.
+        old_runner = MagicMock()
+        old_runner.cleanup = AsyncMock()
+        db._remote_build_runner = old_runner
+
+        # Make the rebuild deterministically fail-soft. Stubbing
+        # ``TCPSite.start`` matches the existing fail-soft test
+        # in this file.
+        async def _failing_start(self: web.TCPSite) -> None:
+            raise OSError("address in use (test stub)")
+
+        monkeypatch.setattr(web.TCPSite, "start", _failing_start)
+
+        listener_bound = await db.reload_remote_build_identity(
+            pin_sha256="newpin" * 10 + "abcd",  # 64 chars; value irrelevant
+        )
+
+        # No listener after failed rebuild.
+        assert listener_bound is False
+        assert db._remote_build_runner is None
+        # Advertiser was cleared during teardown — pin AND port
+        # both went to None. _maybe_start_remote_build_site's
+        # post-bind push didn't run (rebuild failed before it),
+        # so the cleared state is the steady state.
+        assert advertiser.set_pin_sha256.call_args_list == [call(None)]
+        assert advertiser.set_remote_build_port.call_args_list == [call(None)]
+    finally:
+        if db._remote_build_runner is not None:
+            await db._remote_build_runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_reload_remote_build_identity_advertiser_refresh_failure_is_swallowed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A flaky mDNS refresh during rotation must not raise out of the helper."""
+    settings = DashboardSettings(config_dir=tmp_path)
+    db = DeviceBuilder(settings)
+    advertiser = MagicMock()
+    advertiser.refresh = AsyncMock(side_effect=RuntimeError("zeroconf wedged"))
+    db._dashboard_advertiser = advertiser
+
+    # Listener IS bound — the advertiser-clear-during-teardown
+    # path is the one that touches mDNS now. Stub the runner
+    # cleanup so the test stays focused on the refresh
+    # fail-soft.
+    old_runner = MagicMock()
+    old_runner.cleanup = AsyncMock()
+    db._remote_build_runner = old_runner
+
+    # Force the rebuild to also fail so the test doesn't have
+    # to stand up a real listener.
+    async def _failing_start(self: web.TCPSite) -> None:
+        raise OSError("address in use (test stub)")
+
+    monkeypatch.setattr(web.TCPSite, "start", _failing_start)
+
+    # Must not raise — fail-soft contract on the refresh tick.
+    listener_bound = await db.reload_remote_build_identity(pin_sha256="x" * 64)
+    # Both fields were cleared (ignoring the flaky refresh).
+    advertiser.set_pin_sha256.assert_called_once_with(None)
+    advertiser.set_remote_build_port.assert_called_once_with(None)
+    assert listener_bound is False
