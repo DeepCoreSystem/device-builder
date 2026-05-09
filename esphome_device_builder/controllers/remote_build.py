@@ -65,6 +65,7 @@ from dataclasses import dataclass as _dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
 from esphome.const import __version__ as esphome_version
+from yarl import URL
 from zeroconf import IPVersion, ServiceStateChange
 from zeroconf.asyncio import AsyncServiceBrowser, AsyncServiceInfo
 
@@ -77,6 +78,7 @@ from ..helpers.dashboard_identity import (
     get_or_create_identity,
     rotate_certificate,
 )
+from ..helpers.peer_link_identity import get_or_create_peer_link_identity
 from ..models import (
     ErrorCode,
     EventType,
@@ -96,6 +98,12 @@ from ..models import (
     StoredPeer,
 )
 from .config import load_remote_build_settings, remote_build_settings_transaction
+from .remote_build_peer_link_client import (
+    PeerLinkClientError,
+)
+from .remote_build_peer_link_client import (
+    preview_pair as peer_link_preview_pair,
+)
 
 if TYPE_CHECKING:
     from ..device_builder import DeviceBuilder
@@ -224,6 +232,22 @@ def _validate_hostname(raw: object) -> str:
     ``list_pool``) with a megabyte-string masquerading as a
     hostname.
 
+    Defers the URL-validity check to :class:`yarl.URL.build` so
+    the WS-command validator and the offloader's
+    ``_build_ws_url`` (in
+    :mod:`controllers.remote_build_peer_link_client`) share a
+    single source of truth on what constitutes a host. yarl
+    rejects ``/``, ``?``, ``#``, ``@``, embedded ``:port``, and
+    other URL-injection shapes that would otherwise let a
+    pathological hostname smuggle path / query / fragment /
+    userinfo into the rendered URL. Without this layered check
+    the offloader's ``preview_pair`` would have to catch the
+    ``ValueError`` from ``URL.build`` at request time and map
+    it to ``UNAVAILABLE``; surfacing the same shape as
+    ``INVALID_ARGS`` here means the frontend gets a "fix your
+    input" diagnostic rather than a "transient remote
+    failure" toast.
+
     Lowercase normalisation matches the duplicate-check
     semantics; hostnames are case-insensitive per RFC 1035 §2.3.3,
     so ``Desktop.local`` and ``desktop.local`` should be the same
@@ -245,6 +269,16 @@ def _validate_hostname(raw: object) -> str:
     if len(trimmed) > _HOSTNAME_MAX_CHARS:
         msg = f"manual host: 'hostname' must be at most {_HOSTNAME_MAX_CHARS} characters"
         raise CommandError(ErrorCode.INVALID_ARGS, msg)
+    # The ``port=80, path="/"`` are sentinels for the build call
+    # — only the host arg is being validated. yarl's host parser
+    # is the same one ``_build_ws_url`` will use later, so any
+    # input that passes here is guaranteed to round-trip
+    # through the URL builder without raising.
+    try:
+        URL.build(scheme="ws", host=trimmed, port=80, path="/")
+    except ValueError as exc:
+        msg = f"manual host: 'hostname' is not a valid host: {exc}"
+        raise CommandError(ErrorCode.INVALID_ARGS, msg) from exc
     return trimmed
 
 
@@ -683,6 +717,61 @@ class RemoteBuildController:
             settings.manual_hosts = kept
 
         return await self._modify_settings(_remove)
+
+    # ------------------------------------------------------------------
+    # Offloader-side pair flow (phase 4a-o) — initiator commands that
+    # open Noise XX WebSockets to a receiver's peer-link endpoint. The
+    # wire-shape driver lives in
+    # :mod:`controllers.remote_build_peer_link_client`; the WS command
+    # here owns input validation, identity loading, and error mapping.
+    # ------------------------------------------------------------------
+
+    @api_command("remote_build/preview_pair")
+    async def preview_pair(self, *, hostname: str, port: int, **kwargs: Any) -> dict[str, str]:
+        """Open a brief Noise XX WS to *hostname*:*port* and return the receiver's pin.
+
+        The offloader runs ``intent="preview"`` to capture the
+        receiver's static X25519 pubkey from the Noise handshake
+        transcript before committing to pair. The frontend
+        renders the returned ``pin_sha256`` for the user to
+        OOB-verify against the receiver's "Build server"
+        Settings card; only after that confirmation does the
+        offloader call ``request_pair`` (phase 4a-o part 3).
+
+        Args:
+            hostname: Receiver's hostname / IP (validated as for
+                manual hosts: non-empty, ≤255 chars,
+                lowercase-normalised).
+            port: Receiver's peer-link port (1-65535, non-bool).
+
+        Returns:
+            ``{"pin_sha256": "<lowercase-hex-64>"}`` on a
+            successful preview round-trip.
+
+        Raises:
+            :class:`CommandError(INVALID_ARGS)` for bad inputs.
+            :class:`CommandError(UNAVAILABLE)` for any transport
+            / handshake / decode failure (connection refused,
+            timeout, malformed Noise frame, mismatched
+            ``intent_response``).
+        """
+        clean_host = _validate_hostname(hostname)
+        clean_port = _validate_port(port)
+        loop = asyncio.get_running_loop()
+        identity = await loop.run_in_executor(
+            None,
+            get_or_create_peer_link_identity,
+            self._db.settings.config_dir,
+        )
+        try:
+            pin = await peer_link_preview_pair(
+                hostname=clean_host,
+                port=clean_port,
+                identity_priv=identity.private_bytes,
+            )
+        except PeerLinkClientError as exc:
+            raise CommandError(ErrorCode.UNAVAILABLE, str(exc)) from exc
+        return {"pin_sha256": pin}
 
     # ------------------------------------------------------------------
     # Identity (phase 3c1) — surface the receiver's own dashboard_id +
