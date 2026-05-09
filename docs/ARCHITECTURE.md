@@ -183,7 +183,81 @@ The 15-character RFC 6335 §5.1 cap on service-type labels is why the new type i
 
 ## Remote build
 
-Receiver-side surface for the remote-build offload feature (issue #106). The dashboard can play *receiver* (lend its CPU to other dashboards) and *offloader* (delegate compiles to a paired receiver) — phases 3a–3c land the receiver half; offloader-side pairing + peer-link work is phase 4+ and not yet shipped.
+Receiver-side surface for the remote-build offload feature (issue #106). The dashboard can play *receiver* (lend its CPU to other dashboards) and *offloader* (delegate compiles to a paired receiver). Phases 3a–3c landed the receiver half against a bearer-token auth model that is now being torn out and replaced by the Noise XX peer-link described below; phase 4a-r1 is in flight. Bullets further down ("Second TCP listener", "Middleware stack", "Token store", "First-use binding") describe the currently-shipped bearer machinery that phase 4a-r2 deletes wholesale.
+
+### Pairing auth flow (Noise XX, phase 4 target)
+
+Pairing is a two-human action: an offloader-side user picks a discovered receiver and clicks Pair; a receiver-side admin sees the request in an inbox and OOB-confirms the offloader's identity before approving. Out-of-band pin verification defeats a LAN MITM at first contact (the only window where pinning hasn't established trust yet); the **pairing window** narrows when new requests are even accepted (only while the receiver-side admin is on the Pairing requests screen) so an idle receiver doesn't accumulate inbox noise from arbitrary LAN scanners. Already-approved peers connect anytime for real builds; the window only gates new pair_requests.
+
+The cryptographic primitives are `Noise_XX_25519_ChaChaPoly_SHA256` (mutual identity exchange + forward secrecy) over a dedicated peer-link TCP listener (default port 6058, separate from the dashboard UI port). Each dashboard holds a long-lived X25519 keypair as its peer-link identity, persisted at `<config_dir>/.device-builder-peer-link-key.bin` (0o600); `pin_sha256` is the lowercase-hex SHA-256 of the static pubkey.
+
+The numbered phases:
+
+All WS commands below use the `remote_build/` namespace and all events use the `remote_build_` prefix (matching the existing convention in `docs/API.md` and `models/common.py`); the diagram further down strips both for readability.
+
+1. **Discovery** — both dashboards advertise on mDNS (`_esphomebuilder._tcp.local`); the post-pivot TXT carries `peer_link_port` + `pin_sha256`. (Currently-shipped TXT advertises `remote_build_port` + `pin_sha256` instead, where `remote_build_port` points at the about-to-be-removed 6055 HTTPS listener; the rename to `peer_link_port` lands with phase 4a-r2.)
+2. **Receiver opens pairing window** — admin navigates to the Pairing requests screen; the frontend calls `remote_build/set_pairing_window` with `open=true`; the backend flips an in-process deadline and fires `remote_build_pairing_window_changed`. The window closes automatically on screen-unmount or user-idle timeout.
+3. **Preview pair (intent=preview)** — three Noise XX handshake messages. The offloader captures the receiver's static pubkey from the handshake transcript and surfaces `pin_sha256` to the user; no application data crosses the wire.
+4. **OOB pin verification** — human-mediated. The user compares the pin shown on the offloader UI against the receiver UI's Build server card.
+5. **Pair request (intent=pair_request)** — fresh Noise XX with payload `{label, dashboard_id}`. If the pairing window is open, the receiver creates a PENDING `StoredPeer` row, fires `remote_build_pair_request_received`, and returns `intent_response=pending`. If the window is closed, it returns `intent_response=no_pairing_window` without creating a row.
+6. **Receiver admin approves** — admin OOB-confirms the offloader's pin, clicks Accept; the receiver `remote_build/approve_peer` flips the row to APPROVED and fires `remote_build_pair_status_changed`.
+7. **Offloader observes approval (5s polling)** — while the offloader's local row is pending, its frontend polls `remote_build/list_pool`; the offloader backend opens a fresh Noise WS with `intent=pair_status` and writes the response back into the local row.
+8. **Subsequent real-build sessions** — `intent=peer_link`. **Not gated by the pairing window**; paired peers connect anytime. The receiver looks up the offloader's static-pubkey-hash against its `StoredPeer` table; an APPROVED match returns `intent_response=ok` and the session stays open for application messages.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant OF as Offloader frontend
+    participant OB as Offloader backend
+    participant RB as Receiver backend
+    participant RF as Receiver frontend
+    participant RU as Receiver admin
+
+    RU->>RF: open Pairing requests screen
+    RF->>RB: set_pairing_window open=true
+    RB-->>RF: pairing_window_changed expires_in=300
+
+    OF->>OB: preview_pair
+    OB->>RB: Noise XX msg1 intent=preview
+    RB->>OB: Noise XX msg2 responder pubkey
+    OB->>RB: Noise XX msg3 finish
+    OB-->>OF: pin_sha256
+
+    Note over OF,RF: OOB pin verification
+
+    OF->>OB: request_pair
+    OB->>RB: Noise XX intent=pair_request
+    alt pairing window open
+        RB->>RB: create StoredPeer PENDING
+        RB-->>RF: pair_request_received
+        RB-->>OB: intent_response=pending
+    else window closed
+        RB-->>OB: intent_response=no_pairing_window
+    end
+
+    RU->>RF: OOB-confirm pin, click Accept
+    RF->>RB: approve_peer
+    RB->>RB: PENDING to APPROVED
+    RB-->>RF: pair_status_changed approved
+
+    loop while pending
+        OF->>OB: list_pool
+        OB->>RB: Noise XX intent=pair_status
+        RB-->>OB: status
+    end
+    OB-->>OF: paired
+
+    OB->>RB: Noise XX intent=peer_link
+    RB-->>OB: intent_response=ok
+```
+
+**Why two Noise handshakes for one pairing.** The preview handshake (step 3) captures the receiver's static pubkey for OOB display *before* the offloader has decided to trust this receiver; the WS closes immediately, no application data crosses the wire. The pair-request handshake (step 5) is a fresh handshake that re-binds the OOB-confirmed pin (defends against TOCTOU between preview and confirm: if the pubkey-hash on the second handshake doesn't match `pin_sha256` from preview, the offloader aborts). Re-handshakes are cheap because Noise's setup cost is negligible at this cadence (pair flows are rare, not a hot path).
+
+**Why polling instead of a long-held WS.** The offloader's `request_pair` returns immediately with `pending`; the offloader's frontend polls `list_pool` every 5s while a pending row is visible. The alternative (a long-held WS frame waiting for the admin to click Accept) fails on idle timeouts (load-balancer, HA addon ingress, offloader process restart) and forces the receiver to track stale connections across approval. Polling makes each interaction self-contained; a 2s server-side debounce on the offloader backend caches the receiver-side status to prevent cross-tab amplification.
+
+**Identity rotation.** The peer-link X25519 keypair has its own rotation lifecycle (`rotate_peer_link_identity`), independent of the phase-3a Ed25519 cert. Rotating the 3a cert does NOT change the X25519 pubkey; only `rotate_peer_link_identity` does. When an admin rotates, the `dashboard_id` stays stable but `pin_sha256` changes; every paired peer sees a `pin_mismatch` event on the next handshake and has to re-pair (this is the desired behaviour for "operator suspects compromise"). The separate-keypair design was decided during PR #472 review: the alternative (deriving X25519 from Ed25519 via libsodium-style `crypto_sign_ed25519_sk_to_curve25519`) adds non-trivial code for no benefit pre-release, and an implicit cascade would hide a security-relevant rotation event behind a routine cert renewal.
+
+### Currently-shipped bearer machinery (slated for deletion in 4a-r2)
 
 **Second TCP listener.** When `_remote_build.enabled` is `true`, `DeviceBuilder` binds a third aiohttp `TCPSite` on `--remote-build-port` (default 6055) over TLS, served with the cert from `helpers/dashboard_identity`. Disabled by default; the listener doesn't bind at all when the toggle is off (a sidecar `enabled=false` skip beats default-deny 404s — nothing to probe). This sits alongside the public + ingress sites from the Authentication section: HA-addon mode with remote-build enabled binds three listeners on three different ports, each with its own middleware stack.
 
