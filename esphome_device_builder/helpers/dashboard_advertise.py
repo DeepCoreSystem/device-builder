@@ -15,8 +15,8 @@ alternative that fits. Parallels the existing ``_esphomelib._tcp.local.``
 device service type so a packet capture shows both ESPHome surfaces
 in the same ``_esphome*`` namespace.
 
-The TXT record carries the two version fields a peer can't derive
-from the browse response on its own:
+The TXT record carries the fields a peer can't derive from the
+browse response on its own:
 
 * ``server_version`` — this dashboard's own package version, so a
   peer can flag a release-skew warning before pairing.
@@ -24,6 +24,16 @@ from the browse response on its own:
   dashboard would compile against, so the version-mismatch warning
   in phase 7 can fire on the listing page rather than waiting for
   an upload to come back with a surprise build.
+* ``pin_sha256`` (optional) — the receiver's SPKI fingerprint
+  (lowercase hex). Peers cross-check the cert they observe on
+  connect against this TXT entry; the fingerprint is also what
+  pairing pins out-of-band. Omitted when the identity helper
+  hasn't run yet.
+* ``remote_build_port`` (optional) — the TLS port the receiver's
+  ``/remote-build/v1/*`` listener is bound to. Carried in TXT so
+  paired peers connect to the right port even when the operator
+  has overridden ``--remote-build-port``. Omitted when the
+  receiver site isn't bound (default-off mode).
 
 A friendly label and the host's mDNS name are *not* in TXT — both
 are already on the wire. python-zeroconf exposes the service
@@ -219,6 +229,8 @@ class DashboardAdvertiser:
         port: int,
         server_version: str,
         esphome_version: str,
+        pin_sha256: str | None = None,
+        remote_build_port: int | None = None,
         name: str | None = None,
         hostname: str | None = None,
     ) -> None:
@@ -234,6 +246,23 @@ class DashboardAdvertiser:
         record's target. Neither is duplicated in TXT — peers read
         them off ``ServiceInfo.name`` / ``ServiceInfo.server`` for
         free.
+
+        ``pin_sha256`` is the receiver's SPKI fingerprint (lowercase
+        hex, RFC 7469-form input but hex-encoded for parity with TLS
+        UI display). When set, peers who browse the broadcast can
+        sanity-check the cert they observe on connect against this
+        TXT entry — a useful tampering tripwire on top of the
+        out-of-band-confirmed pin from pairing. ``None`` when the
+        identity helper hasn't run yet (pre-3a deployments, or when
+        the dashboard's own remote-build feature is disabled).
+
+        ``remote_build_port`` is the TLS port the receiver's
+        ``/remote-build/v1/*`` listener is bound to. Carried in TXT
+        so paired peers can connect to the right port without
+        re-typing it; the SRV record's port stays at the dashboard's
+        main HTTP port (``port`` arg) so the existing browse path
+        for general dashboard discovery isn't broken. ``None`` when
+        the listener isn't bound (default-off shape).
         """
         friendly = (name or "").strip() or _default_friendly_name()
         host = (hostname or "").strip() or _default_hostname()
@@ -242,6 +271,8 @@ class DashboardAdvertiser:
         self._hostname = host
         self._server_version = server_version
         self._esphome_version = esphome_version
+        self._pin_sha256 = pin_sha256
+        self._remote_build_port = remote_build_port
         self._info: ServiceInfo | None = None
         self._zeroconf: AsyncEsphomeZeroconf | None = None
         # Background tick that calls :meth:`refresh` on
@@ -260,6 +291,34 @@ class DashboardAdvertiser:
     def registered(self) -> bool:
         """True between a successful :meth:`register` and :meth:`unregister`."""
         return self._info is not None
+
+    def set_pin_sha256(self, pin_sha256: str | None) -> None:
+        """
+        Update the published cert pin and refresh the broadcast.
+
+        Called when the remote-build receiver site comes up and
+        the cert + key have been loaded; lets the advertiser
+        carry ``pin_sha256`` in TXT without having to know the
+        identity helper at construction time. A subsequent
+        :meth:`refresh` (the periodic background tick already
+        does this) re-publishes the ServiceInfo with the new
+        property. Safe to call before / after :meth:`register`;
+        if not yet registered, the value is simply captured for
+        the next ``build_service_info`` call.
+        """
+        self._pin_sha256 = pin_sha256
+
+    def set_remote_build_port(self, remote_build_port: int | None) -> None:
+        """
+        Update the published remote-build listener port.
+
+        Same shape as :meth:`set_pin_sha256` — captured here, picked
+        up by the next ``build_service_info`` (the periodic refresh
+        re-publishes). Lets paired peers find the listener port
+        without having to re-type it after a ``--remote-build-port``
+        override.
+        """
+        self._remote_build_port = remote_build_port
 
     @property
     def service_instance_name(self) -> str | None:
@@ -302,10 +361,14 @@ class DashboardAdvertiser:
         # target (``server`` below) are returned by every browse;
         # peers read them directly off ``ServiceInfo.name`` /
         # ``ServiceInfo.server`` rather than parsing TXT.
-        properties = {
+        properties: dict[str, str] = {
             "server_version": self._server_version,
             "esphome_version": self._esphome_version,
         }
+        if self._pin_sha256:
+            properties["pin_sha256"] = self._pin_sha256
+        if self._remote_build_port is not None:
+            properties["remote_build_port"] = str(self._remote_build_port)
         # ``server`` is the SRV record's target. Zeroconf appends
         # ``.local.`` if missing; pass the FQDN through as-is so a
         # host already advertising e.g. ``desktop.local`` keeps the
@@ -400,20 +463,19 @@ class DashboardAdvertiser:
 
     async def refresh(self) -> bool:
         """
-        Re-publish the advertise if the local-address set has changed.
+        Re-publish the advertise if anything observable on the wire changed.
 
-        Re-runs :func:`_local_addresses` (via the executor — see
-        :meth:`register`), compares the result against the address
-        list that's currently on the wire, and calls
-        :meth:`AsyncEsphomeZeroconf.async_update_service` only when the
-        sorted sets differ. The no-op return path keeps callers
-        free to invoke this on a tick / interface-change event
-        without flooding the network with unchanged updates.
+        Compares both the local-address set AND the TXT properties
+        against what's currently published; calls
+        :meth:`AsyncEsphomeZeroconf.async_update_service` only when
+        either differs. The no-op return path keeps callers free to
+        invoke this on a tick / interface-change event / TXT-field
+        update without flooding the network with unchanged updates.
 
         Returns ``True`` if a re-publish actually fired, ``False``
-        when the cached and freshly-enumerated address sets matched
-        (or when the advertiser isn't currently registered, in
-        which case there's nothing to refresh against).
+        when the cached state matched (or when the advertiser isn't
+        currently registered, in which case there's nothing to
+        refresh against).
         """
         info = self._info
         zeroconf = self._zeroconf
@@ -421,12 +483,18 @@ class DashboardAdvertiser:
             return False
         loop = asyncio.get_running_loop()
         new_addresses = await loop.run_in_executor(None, _local_addresses)
+        new_info = self.build_service_info(new_addresses)
         # Compare normalized sets so the order ifaddr returns
         # interfaces in (which can shift between calls on some
-        # platforms) doesn't trigger a spurious re-publish.
-        if sorted(new_addresses) == sorted(info.parsed_addresses()):
+        # platforms) doesn't trigger a spurious re-publish. Also
+        # compare TXT properties so a setter-driven change (e.g.
+        # ``set_pin_sha256``, ``set_remote_build_port``) actually
+        # makes it onto the wire — without this, a TXT update
+        # after register would never propagate.
+        addresses_unchanged = sorted(new_addresses) == sorted(info.parsed_addresses())
+        properties_unchanged = new_info.properties == info.properties
+        if addresses_unchanged and properties_unchanged:
             return False
-        new_info = self.build_service_info(new_addresses)
         try:
             await zeroconf.async_update_service(new_info)
         except Exception:

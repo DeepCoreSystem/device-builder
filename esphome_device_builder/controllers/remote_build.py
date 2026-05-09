@@ -8,21 +8,29 @@ cross-subnet / non-multicast LANs, and the receiver-issued
 bearer-token list; merges discovery sources into a single
 ``remote_build/list_hosts`` snapshot.
 
-Current scope:
+The ``enabled`` flag gates the HTTPS receiver site
+:class:`DeviceBuilder` binds at startup (``/remote-build/v1/*``,
+default port 6055). Toggling ``enabled`` at runtime persists
+the new value but does NOT live-bind / unbind the listener;
+flipping it requires a dashboard restart for the listener
+state to follow. The 3c Settings UI surfaces this constraint;
+a future PR can wire the start / stop hooks if interactive
+toggling matters.
 
-* No HTTP / WS endpoints under ``/remote-build/v1/*`` yet (the
-  HTTPS listener + auth middleware land alongside the token
-  store's first consumer).
-* No pairing or peer-link WS yet.
-* The ``enabled`` setting is persisted but not wired to any
-  endpoint registration; flipping it currently has no observable
-  effect beyond round-tripping in the settings UI.
-* Tokens are issuable / revocable but nothing consumes them yet;
-  ``add_token`` returns the cleartext bearer once at creation
-  time, only the SHA-256 of the secret half lands on disk.
-* Manual hosts have no version / fingerprint resolution; they
-  land in ``list_hosts`` with empty ``server_version`` /
-  ``esphome_version`` until phase 4 attempts the connection.
+Tokens are validated by the auth middleware on that site
+against an in-memory index seeded from disk in :meth:`start`
+and refreshed on every CRUD mutation. ``add_token`` flashes
+the cleartext bearer through its response once at creation
+time; only the SHA-256 of the secret half lands on disk.
+
+Pairing flow + peer-link WS arrive in later phases. The
+listener currently serves only ``/remote-build/v1/health`` as
+a smoke endpoint; phase 5+ adds the real bundle / build /
+firmware RPCs against the same auth surface.
+
+Manual hosts have no version / fingerprint resolution yet;
+they land in ``list_hosts`` with empty ``server_version`` /
+``esphome_version`` until pairing attempts the connection.
 
 Browser uses the existing ``AsyncEsphomeZeroconf`` instance owned by
 :class:`~esphome_device_builder.controllers._device_state_monitor.DeviceStateMonitor`,
@@ -352,6 +360,12 @@ class RemoteBuildController:
         # advertiser was skipped (HA addon mode, zeroconf failed),
         # in which case there's nothing to filter.
         self._own_instance_name: str | None = None
+        # In-memory token index keyed off ``token_id``. Built from
+        # disk at start; refreshed after every CRUD mutation so
+        # the auth middleware's lookup is constant-time and
+        # never has to hit the filesystem on the request hot
+        # path. Empty until ``start`` runs.
+        self._tokens_by_id: dict[str, StoredToken] = {}
 
     async def start(self) -> None:
         """
@@ -363,6 +377,18 @@ class RemoteBuildController:
         restart. Same fail-soft contract as
         :class:`DashboardAdvertiser`.
         """
+        # Seed the token index from disk before the zeroconf gate
+        # below: the index is consumed by the HTTPS auth middleware
+        # (phase 3b2), not by the zeroconf browser. Even on a
+        # zeroconf-disabled deployment (HA addon, container with
+        # mDNS broken) the index needs to be live so the listener
+        # can validate bearers.
+        loop = asyncio.get_running_loop()
+        settings = await loop.run_in_executor(
+            None, load_remote_build_settings, self._db.settings.config_dir
+        )
+        self._tokens_by_id = {t.token_id: t for t in settings.tokens}
+
         if self._db.devices is None:
             _LOGGER.debug("RemoteBuildController.start called before devices controller")
             return
@@ -524,22 +550,48 @@ class RemoteBuildController:
 
         loop = asyncio.get_running_loop()
         settings = await loop.run_in_executor(None, _txn)
+        # Keep the auth middleware's lookup index in sync with the
+        # post-write state. Add / remove / first-use-binding all
+        # route through here, so this is the one place that needs
+        # to refresh.
+        self._tokens_by_id = {t.token_id: t for t in settings.tokens}
         return _to_view(settings)
+
+    def lookup_token(self, token_id: str) -> StoredToken | None:
+        """
+        Return the matching :class:`StoredToken` for ``token_id``, or ``None``.
+
+        Public accessor for the phase-3b2 auth middleware. Reads
+        the in-memory index (constant-time dict hit, no I/O on
+        the request hot path). The index is seeded in
+        :meth:`start` and kept in sync via
+        :meth:`_modify_settings`.
+        """
+        return self._tokens_by_id.get(token_id)
 
     @api_command("remote_build/set_settings")
     async def set_settings(self, *, enabled: bool, **kwargs: Any) -> RemoteBuildSettingsView:
         """
         Persist the receiver-side ``enabled`` master switch.
 
-        Read-modify-write so manual hosts and any future phase-3+
-        fields stay intact; a client toggling just ``enabled``
-        doesn't reset every other field to its default.
+        Read-modify-write so manual hosts, tokens, and any future
+        phase-3+ fields stay intact; a client toggling just
+        ``enabled`` doesn't reset every other field to its default.
 
         Validates ``enabled`` is strictly a ``bool`` rather than
         coercing truthiness; a client sending the string ``"false"``
         for example would otherwise persist as ``True``, which is
         the opposite of what the user intended on a security-
         sensitive toggle.
+
+        **Listener bind requires restart.** The HTTPS receiver
+        site (``/remote-build/v1/*``) is bound once in
+        :meth:`DeviceBuilder.start` based on the value at startup;
+        flipping ``enabled`` here persists the new value but does
+        NOT live-rebind. The frontend should surface a "restart
+        required" hint to the operator. A future PR can wire
+        ``set_settings`` into the lifecycle hooks if interactive
+        toggling becomes a real UX concern.
         """
         if not isinstance(enabled, bool):
             msg = "remote_build/set_settings: 'enabled' must be a boolean"

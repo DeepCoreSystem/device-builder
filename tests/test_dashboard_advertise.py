@@ -41,11 +41,13 @@ def _make_advertiser(
     name: str | None = None,
     hostname: str | None = None,
     port: int = 6052,
+    pin_sha256: str | None = None,
 ) -> DashboardAdvertiser:
     return DashboardAdvertiser(
         port=port,
         server_version="1.2.3",
         esphome_version="2026.5.0",
+        pin_sha256=pin_sha256,
         name=name,
         hostname=hostname,
     )
@@ -263,6 +265,123 @@ def test_build_service_info_populates_txt_and_server() -> None:
     }
     # ``server`` is always trailing-dotted so zeroconf doesn't double-suffix it.
     assert info.server == "green.local."
+
+
+def test_build_service_info_carries_pin_sha256_when_set() -> None:
+    """``pin_sha256`` lands in TXT when the advertiser was constructed with it."""
+    pin = "a" * 64
+    advertiser = _make_advertiser(name="green", hostname="green.local", pin_sha256=pin)
+    info = advertiser.build_service_info()
+    decoded = {k.decode(): v.decode() for k, v in info.properties.items()}
+    assert decoded["pin_sha256"] == pin
+
+
+def test_build_service_info_omits_pin_sha256_when_unset() -> None:
+    """``pin_sha256`` is absent from TXT when the advertiser doesn't have one."""
+    advertiser = _make_advertiser(name="green", hostname="green.local")
+    info = advertiser.build_service_info()
+    decoded = {k.decode(): v.decode() for k, v in info.properties.items()}
+    assert "pin_sha256" not in decoded
+
+
+def test_set_pin_sha256_updates_subsequent_advertise() -> None:
+    """``set_pin_sha256`` makes the next ``build_service_info`` carry the new pin."""
+    advertiser = _make_advertiser(name="green", hostname="green.local")
+    advertiser.set_pin_sha256("b" * 64)
+    info = advertiser.build_service_info()
+    decoded = {k.decode(): v.decode() for k, v in info.properties.items()}
+    assert decoded["pin_sha256"] == "b" * 64
+
+
+def test_build_service_info_carries_remote_build_port_when_set() -> None:
+    """``remote_build_port`` lands in TXT as a stringified int when set."""
+    advertiser = DashboardAdvertiser(
+        port=6052,
+        server_version="1.2.3",
+        esphome_version="2026.5.0",
+        remote_build_port=6055,
+    )
+    info = advertiser.build_service_info()
+    decoded = {k.decode(): v.decode() for k, v in info.properties.items()}
+    assert decoded["remote_build_port"] == "6055"
+
+
+def test_build_service_info_omits_remote_build_port_when_unset() -> None:
+    """``remote_build_port`` is absent when the listener isn't bound."""
+    advertiser = _make_advertiser()
+    info = advertiser.build_service_info()
+    decoded = {k.decode(): v.decode() for k, v in info.properties.items()}
+    assert "remote_build_port" not in decoded
+
+
+def test_set_remote_build_port_updates_subsequent_advertise() -> None:
+    """``set_remote_build_port`` makes the next advertise carry the new port."""
+    advertiser = _make_advertiser()
+    advertiser.set_remote_build_port(7000)
+    info = advertiser.build_service_info()
+    decoded = {k.decode(): v.decode() for k, v in info.properties.items()}
+    assert decoded["remote_build_port"] == "7000"
+
+
+@pytest.mark.asyncio
+async def test_refresh_republishes_when_only_txt_changed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A TXT-only change triggers ``async_update_service`` on the next refresh.
+
+    Pre-fix, ``refresh`` short-circuited when the address set was
+    unchanged, so a setter-driven TXT update (``set_pin_sha256``,
+    ``set_remote_build_port``) never made it onto the wire after
+    the initial register. The fix detects TXT differences too;
+    pin that contract.
+    """
+    advertiser = _make_advertiser()
+    # Pre-seed an "already registered" state. We don't actually
+    # talk to a real zeroconf instance — fake the bits ``refresh``
+    # reads / writes.
+    initial_addresses = ["10.0.0.5"]
+    monkeypatch.setattr(
+        "esphome_device_builder.helpers.dashboard_advertise._local_addresses",
+        lambda: list(initial_addresses),
+    )
+    advertiser._info = advertiser.build_service_info(initial_addresses)
+    fake_zeroconf = MagicMock()
+    fake_zeroconf.async_update_service = AsyncMock()
+    advertiser._zeroconf = fake_zeroconf
+
+    # Now set a TXT field WITHOUT changing addresses.
+    advertiser.set_pin_sha256("a" * 64)
+    refreshed = await advertiser.refresh()
+
+    assert refreshed is True
+    assert fake_zeroconf.async_update_service.called
+    # The republished info carries the new pin.
+    new_info = fake_zeroconf.async_update_service.call_args.args[0]
+    decoded = {k.decode(): v.decode() for k, v in new_info.properties.items()}
+    assert decoded["pin_sha256"] == "a" * 64
+
+
+@pytest.mark.asyncio
+async def test_refresh_no_op_when_nothing_changed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``refresh`` returns False without calling zeroconf when nothing changed."""
+    advertiser = _make_advertiser()
+    initial_addresses = ["10.0.0.5"]
+    monkeypatch.setattr(
+        "esphome_device_builder.helpers.dashboard_advertise._local_addresses",
+        lambda: list(initial_addresses),
+    )
+    advertiser._info = advertiser.build_service_info(initial_addresses)
+    fake_zeroconf = MagicMock()
+    fake_zeroconf.async_update_service = AsyncMock()
+    advertiser._zeroconf = fake_zeroconf
+
+    refreshed = await advertiser.refresh()
+
+    assert refreshed is False
+    assert not fake_zeroconf.async_update_service.called
 
 
 def test_build_service_info_keeps_trailing_dot_on_explicit_fqdn() -> None:
