@@ -83,6 +83,88 @@ class TokenSummary(DataClassORJSONMixin):
     bound_dashboard_id: str | None = None
 
 
+class PeerStatus(StrEnum):
+    """
+    Lifecycle state of a :class:`StoredPeer` row.
+
+    ``PENDING``: an offloader's pair-request landed and the
+    receiver's admin hasn't accepted yet. The peer-link auth
+    gate lets a connection from this peer's pubkey complete the
+    Noise handshake but only honours an ``intent="pair_status"``
+    query; every other intent is rejected at the post-handshake
+    dispatch.
+
+    ``APPROVED``: admin clicked Accept. Full access — the auth
+    gate looks up the offloader's static X25519 pubkey hash
+    (extracted from the Noise XX handshake transcript) against
+    this row on every connection.
+
+    No explicit ``REJECTED`` terminal state — a rejected request
+    deletes the row. If the same offloader retries, it lands as
+    a fresh pending row and the admin chooses again. Avoids the
+    bookkeeping a rejected-list would need; phase 8's re-auth
+    wizard can revisit if blocklisting becomes useful.
+    """
+
+    PENDING = "pending"
+    APPROVED = "approved"
+
+
+@dataclass
+class StoredPeer(DataClassORJSONMixin):
+    """
+    Receiver-side record of a paired (or pending) offloader.
+
+    Persisted under ``_remote_build.peers``. Created by the
+    pair-request flow over the peer-link WS: an offloader runs
+    a Noise XX handshake with ``intent="pair_request"`` and a
+    payload carrying its ``label`` + ``dashboard_id``. The
+    receiver reads the offloader's static X25519 pubkey from
+    the Noise handshake itself (no cert involved) and stores it.
+
+    ``static_x25519_pub`` is the canonical identifier the
+    Noise handshake binds to. ``pin_sha256`` is its lowercase-
+    hex SHA-256, used for log lines / event payloads / wire
+    fields where we already have a hex-pin convention.
+
+    ``dashboard_id`` is the offloader's stable identity from
+    phase 3a; sent in the pair_request payload so the admin UI
+    has a friendly identifier (the X25519 pubkey alone doesn't
+    carry one). Primary key for the receiver WS surface
+    (``approve_peer({dashboard_id})`` etc.) so a future X25519
+    keypair rotation on the offloader's side doesn't change the
+    user-facing handle.
+
+    ``label`` is a human-readable name the offloader's user
+    sets during pair (e.g. ``green``, ``laptop``).
+    """
+
+    dashboard_id: str
+    pin_sha256: str
+    static_x25519_pub: bytes
+    label: str
+    paired_at: float
+    status: PeerStatus = PeerStatus.PENDING
+
+
+@dataclass
+class PeerSummary(DataClassORJSONMixin):
+    """
+    Public-facing wire view of :class:`StoredPeer`.
+
+    Drops ``static_x25519_pub`` — the raw 32-byte pubkey is
+    on-disk only; ``pin_sha256`` (lowercase-hex SHA-256 of the
+    pubkey) is the wire-friendly form that UIs render for
+    OOB-verification.
+    """
+
+    dashboard_id: str
+    pin_sha256: str
+    label: str
+    paired_at: float
+    status: PeerStatus
+
+
 @dataclass
 class RemoteBuildSettings(DataClassORJSONMixin):
     """
@@ -95,11 +177,17 @@ class RemoteBuildSettings(DataClassORJSONMixin):
     wire. Use :class:`RemoteBuildSettingsView` (or the
     ``_summarise_token`` projection) for any response that leaves
     the server.
+
+    ``peers`` carries phase-4a :class:`StoredPeer` rows: the
+    receiver's pinned offloaders (Noise XX over a dedicated
+    peer-link port replaces the bearer flow). ``tokens`` is on
+    a deletion path (phase 4a-r2) once the new auth has soaked.
     """
 
     enabled: bool = False
     manual_hosts: list[ManualHost] = field(default_factory=list)
     tokens: list[StoredToken] = field(default_factory=list)
+    peers: list[StoredPeer] = field(default_factory=list)
 
 
 @dataclass
@@ -112,12 +200,17 @@ class RemoteBuildSettingsView(DataClassORJSONMixin):
     ``tokens`` is a list of :class:`TokenSummary` (no
     ``secret_sha256``), so issuing or removing tokens via the
     CRUD methods can't accidentally leak the stored hash back to
-    the frontend through the response shape.
+    the frontend through the response shape. ``peers`` is also
+    projected to :class:`PeerSummary` for symmetry — the storage
+    and wire shapes happen to match today, but the projection
+    seam keeps a future "store extra peer-only fields" change
+    from accidentally leaking those.
     """
 
     enabled: bool = False
     manual_hosts: list[ManualHost] = field(default_factory=list)
     tokens: list[TokenSummary] = field(default_factory=list)
+    peers: list[PeerSummary] = field(default_factory=list)
 
 
 @dataclass
