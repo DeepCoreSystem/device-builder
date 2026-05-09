@@ -34,14 +34,16 @@ from .conftest import FakeWebSocketClient
 def _make_db() -> DeviceBuilder:
     """Build a minimally-initialised DeviceBuilder for the handler.
 
-    Only ``self.bus``, ``self.devices``, and
-    ``self.subscriber_presence`` are read by
-    ``_cmd_subscribe_events``; everything else can be a stub.
+    Only ``self.bus``, ``self.devices``,
+    ``self.subscriber_presence``, and ``self.remote_build`` are
+    read by ``_cmd_subscribe_events``; everything else can be a
+    stub.
     """
     db = DeviceBuilder.__new__(DeviceBuilder)
     db.bus = EventBus()
     db.subscriber_presence = SubscriberPresence()
-    db.devices = None  # skip the initial-snapshot branch
+    db.devices = None  # skip the device-snapshot branch
+    db.remote_build = None  # skip the pairings-snapshot branch
     return db
 
 
@@ -130,6 +132,51 @@ async def test_subscribe_events_excludes_device_reachability() -> None:
         await handler_task
 
 
+async def test_subscribe_events_includes_pairings_snapshot_in_initial_state() -> None:
+    """``_send_initial`` includes the offloader pairings snapshot when remote_build is up.
+
+    Pins the contract that the frontend's first paint receives the
+    full set of pairings server-side knows about (PENDING +
+    APPROVED) without a follow-up read. The snapshot is a sync
+    RAM read off ``RemoteBuildController._pairings`` — no executor
+    hop, no disk read.
+    """
+    db = DeviceBuilder.__new__(DeviceBuilder)
+    db.bus = EventBus()
+    db.subscriber_presence = SubscriberPresence()
+    db.devices = None  # skip the device-snapshot branch
+    # Stub a remote_build with one APPROVED pairing in the
+    # snapshot. ``pairings_snapshot()`` is sync; mock it directly.
+    summary = MagicMock()
+    summary.to_dict = lambda: {
+        "receiver_hostname": "build.local",
+        "receiver_port": 6055,
+        "status": "approved",
+    }
+    remote_build = MagicMock()
+    remote_build.pairings_snapshot = MagicMock(return_value=[summary])
+    db.remote_build = remote_build
+
+    client = FakeWebSocketClient()
+    handler_task = asyncio.create_task(db._cmd_subscribe_events(client=client, message_id="m1"))
+    # Wait for the initial_state event to land.
+    for _ in range(50):
+        await asyncio.sleep(0)
+        if client.events:
+            break
+
+    initial_events = [e for e in client.events if e[1] == "initial_state"]
+    assert len(initial_events) == 1
+    _, _, payload = initial_events[0]
+    assert payload["pairings"] == [
+        {"receiver_hostname": "build.local", "receiver_port": 6055, "status": "approved"}
+    ]
+    remote_build.pairings_snapshot.assert_called_once()
+
+    handler_task.cancel()
+    await asyncio.gather(handler_task, return_exceptions=True)
+
+
 async def test_subscribe_events_listener_forwards_bus_events() -> None:
     """While parked, fired bus events reach the client as send_event calls.
 
@@ -159,7 +206,13 @@ async def test_subscribe_events_listener_forwards_bus_events() -> None:
         if client.events:
             break
 
-    assert client.events == [("m1", "device_updated", {"device": {"x": 1}})]
+    # Filter to the bus-driven event — ``_send_initial`` always
+    # emits an ``initial_state`` event ahead of the live drain
+    # (empty dict when ``devices``/``remote_build`` are absent),
+    # which is part of the snapshot contract, not what this test
+    # is pinning.
+    bus_events = [e for e in client.events if e[1] == "device_updated"]
+    assert bus_events == [("m1", "device_updated", {"device": {"x": 1}})]
 
     # Clean up the parked task so the test finishes.
     handler_task.cancel()
@@ -188,6 +241,7 @@ async def test_subscribe_events_subscribed_arrives_before_live_events() -> None:
     devices_mock.get_devices.return_value = []
     devices_mock.get_importable_devices.return_value = []
     db.devices = devices_mock
+    db.remote_build = None
 
     class YieldingClient:
         """``send_event`` / ``send_result`` actually yield the loop.

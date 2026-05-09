@@ -24,7 +24,7 @@ every initiator-side intent the offloader needs (``preview``,
 ``pair_request``, ``pair_status``, eventually ``peer_link``);
 only the msg3 payload and which response codes count as success
 differ. :func:`drive_initiator_round_trip` owns the shared flow;
-each public ``preview_pair`` / ``request_pair`` / ``poll_pair_status``
+each public ``preview_pair`` / ``request_pair`` / ``await_pair_status``
 function (parts 2-4 of phase 4a-o) is a thin wrapper that
 provides the intent + msg3 payload + accepted-response set.
 """
@@ -72,6 +72,26 @@ _RESPONSE_DECODE_ERRORS: tuple[type[Exception], ...] = (
 # receiver does, but doesn't pin a coroutine forever if the
 # remote side is gone.
 _DEFAULT_TIMEOUT_SECONDS = 10.0
+
+
+# Total budget for one ``intent="pair_status"`` round-trip.
+# Receiver-side ``lookup_peer_for_status`` parks indefinitely on
+# its bus listener — there's no internal timeout, the connection
+# stays open until either an admin click flips the row or the
+# receiver-side pairing window closes (firing ``status="removed"``
+# events that wake the wait). The pairing window's default
+# lifetime is ``_PAIRING_WINDOW_DURATION_SECONDS`` = 300s but
+# extends on user activity, so the receiver-side wait can
+# legitimately span tens of minutes. Pick a client-side total an
+# order of magnitude above the default window so a typical
+# "admin opens screen, walks away to verify, comes back, clicks
+# Accept" flow doesn't trip the offloader's ``aiohttp`` timeout
+# and force a reconnect (which would itself land back on the
+# same wait, just with a Noise handshake of churn). When the
+# offloader process actually wants to give up — controller stop,
+# unpair — the listener task is cancelled directly and the WS
+# closes via the cancellation, not via this timeout.
+_PAIR_STATUS_TIMEOUT_SECONDS = 3600.0
 
 
 # Hard cap on a single inbound WS frame for the *control-plane*
@@ -385,4 +405,116 @@ async def request_pair(
         status=status,
         pin_sha256=pin_sha256_for_pubkey(rt.remote_static_pub),
         remote_static_pub=rt.remote_static_pub,
+    )
+
+
+@dataclass(frozen=True)
+class PairStatusResult:
+    """Outcome of an ``intent="pair_status"`` long-poll round-trip.
+
+    Returned by :func:`await_pair_status` after the Noise XX
+    handshake completes and the receiver's ``intent_response``
+    has been received. The receiver-side handler parks
+    indefinitely on the bus event channel until either an admin
+    click flips the row or the pairing window closes (firing
+    removed events that wake the wait), so the round-trip can
+    legitimately take seconds to many minutes; the caller's
+    listener task is the only thing that puts an upper bound
+    on how long the WS stays open (via cancellation on
+    ``unpair`` / controller stop).
+
+    * :attr:`status` is the receiver's verbatim response —
+      :attr:`IntentResponse.APPROVED` if the matching
+      ``StoredPeer`` row is APPROVED, or
+      :attr:`IntentResponse.REJECTED` if no row matches (admin
+      clicked Reject, or window-close cleared the receiver's
+      pending dict, or pin drift on the receiver side). The
+      caller flips local state accordingly.
+      :attr:`IntentResponse.PENDING` doesn't appear on this
+      path — the receiver doesn't return PENDING from
+      ``intent="pair_status"``; the long-poll keeps waiting.
+    * :attr:`pin_sha256` is the lowercase-hex hash of the
+      receiver's static X25519 pubkey observed on the live
+      handshake. The :class:`StoredPairing` consumer compares
+      this against its stored ``pin_sha256`` so a receiver-side
+      identity rotation between :func:`request_pair` and the
+      first :func:`await_pair_status` doesn't silently slide a
+      compromised pubkey into ``APPROVED`` state.
+    """
+
+    status: IntentResponse
+    pin_sha256: str
+
+
+async def await_pair_status(
+    *,
+    hostname: str,
+    port: int,
+    identity_priv: bytes,
+    dashboard_id: str,
+) -> PairStatusResult:
+    """Run an ``intent="pair_status"`` long-poll round-trip.
+
+    Used by the offloader's pair-status listener tasks (phase
+    4a-o part 4) to ask the receiver "has my pending row
+    flipped status yet?" with sub-second latency on the
+    happy path.
+
+    Receiver-side semantics: if the snapshot is APPROVED or
+    REJECTED, returns immediately. If PENDING, the receiver
+    holds the response open indefinitely (no timeout) while
+    parking on its own bus's
+    :attr:`EventType.REMOTE_BUILD_PAIR_STATUS_CHANGED` event
+    for the matching ``dashboard_id``. Window-close clears the
+    receiver's pending dict and fires removed events for each
+    cleared entry, which wakes the wait and re-snapshots to
+    REJECTED (no row matches anymore) — the caller's listener
+    treats this the same as an admin Reject.
+
+    Client-side total budget is
+    :data:`_PAIR_STATUS_TIMEOUT_SECONDS` (~1h),
+    deliberately set well above the receiver's 5-min default
+    pairing-window lifetime so a typical "admin opens screen,
+    walks away to verify pin, comes back, clicks Accept" flow
+    doesn't trip the offloader's ``aiohttp`` timeout. The
+    listener task that owns the call is cancelled directly on
+    ``unpair`` / controller stop, so this timeout only fires
+    if a receiver-side process becomes wedged for an hour.
+
+    Wire shape: the encrypted msg3 carries
+    ``{"dashboard_id": dashboard_id}``. The receiver doesn't
+    need any other field — the row already exists, the pin is
+    captured from the handshake transcript, and there's no
+    ``label`` to update on a status query.
+
+    Caller is responsible for the pin-drift check: compare
+    :attr:`PairStatusResult.pin_sha256` against the stored
+    :attr:`models.StoredPairing.pin_sha256`. A mismatch means
+    the receiver rotated identity since pair time; the caller
+    should treat that as a peer-revoked signal (drop the local
+    row + fire ``status="removed"``) rather than persisting a
+    silently-substituted pubkey.
+
+    Maps unknown ``intent_response`` strings to
+    :class:`PeerLinkClientError`; the WS-command layer treats
+    that as ``UNAVAILABLE`` (transient receiver protocol bug,
+    not a confirmed peer-revoked signal).
+    """
+    msg3_payload = _json.dumps({"dashboard_id": dashboard_id})
+    rt = await drive_initiator_round_trip(
+        hostname=hostname,
+        port=port,
+        identity_priv=identity_priv,
+        intent=PeerLinkIntent.PAIR_STATUS,
+        msg3_payload=msg3_payload,
+        timeout_seconds=_PAIR_STATUS_TIMEOUT_SECONDS,
+    )
+    try:
+        status = IntentResponse(rt.intent_response)
+    except ValueError as exc:
+        msg = f"peer-link pair_status: unknown intent_response={rt.intent_response!r}"
+        raise PeerLinkClientError(msg) from exc
+    return PairStatusResult(
+        status=status,
+        pin_sha256=pin_sha256_for_pubkey(rt.remote_static_pub),
     )

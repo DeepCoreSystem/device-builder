@@ -267,9 +267,24 @@ Renaming or recoloring a label leaves device assignments untouched — devices r
 >
 > Models: [`RemoteBuildSettingsView`](../esphome_device_builder/models/remote_build.py), [`RemoteBuildPeer`](../esphome_device_builder/models/remote_build.py), [`ManualHost`](../esphome_device_builder/models/remote_build.py), [`PeerSummary`](../esphome_device_builder/models/remote_build.py), [`IdentityView`](../esphome_device_builder/models/remote_build.py)
 
-Receiver-side surface for the remote-build offload feature (issue #106). Discovers peer dashboards via mDNS (`_esphomebuilder._tcp.local.`), lets the user add manual peers for cross-subnet LANs, and pairs with offloaders over the peer-link Noise WS (`/remote-build/peer-link`, default port 6055). Settings persist in `.device-builder.json` under `_remote_build`.
+Receiver-side surface for the remote-build offload feature (issue #106). Discovers peer dashboards via mDNS (`_esphomebuilder._tcp.local.`), lets the user add manual peers for cross-subnet LANs, and pairs with offloaders over the peer-link Noise WS (`/remote-build/peer-link`, default port 6055). Receiver-side state persists in `.device-builder.json` under the `_remote_build` key; offloader-side pairings live in their own sibling file `<config_dir>/.offloader_pairings.json` (per-file `helpers.storage.Store` with debounced writes — atomic per-domain, no lock contention against unrelated metadata writers).
 
 The pre-pivot HTTPS+bearer auth surface (phases 3b1-3c) was wound down across phase 4a-r1 (listener body swap to Noise WS) and phase 4a-r2 (helper deletion); only the WS commands below ship today.
+
+#### Surface map: which commands run on which side
+
+A single `device-builder` process can be a *receiver* (accepts Noise WS connections from offloaders, lets a human admin pair them) and an *offloader* (initiates Noise WS connections to receivers it has pinned) at the same time. Each WS command targets one role. The frontend surfaces them on different Settings screens — "Build server" (receiver role) vs "Send builds" (offloader role). All commands run over the dashboard's main `/ws` endpoint and inherit whatever auth that endpoint enforces (today: none — the dashboard `/ws` trusts any local connection); none of these commands run over the peer-link Noise WS, which carries only `intent=...` frames between dashboards, never WS commands.
+
+| Command | Side | Notes |
+|---|---|---|
+| `list_hosts` / `add_manual_host` / `remove_manual_host` | both | Discovery surface; the same dashboard browses receivers it can offload TO, and lists itself among receivers other dashboards see. |
+| `get_settings` / `set_settings` | receiver | Master toggle for whether this dashboard accepts incoming offloader connections. Off-default; toggling requires a restart. |
+| `list_peers` / `approve_peer` / `remove_peer` | receiver | Admin manages incoming pairings. |
+| `set_pairing_window` | receiver | Frontend-driven; the Pairing requests screen calls `open=true` on mount + extend ticks, `open=false` on unmount. |
+| `get_identity` / `rotate_identity` | receiver | Surfaces / rotates the dashboard's identity for OOB pin verification. |
+| `preview_pair` | offloader | Open a brief Noise WS to capture a receiver's pin for OOB display. |
+| `request_pair` | offloader | Send `intent=pair_request`. Both PENDING and APPROVED rows live in the controller's unified `_pairings` dict; the per-file `Store` debounce-saves APPROVED rows to `<config_dir>/.offloader_pairings.json` (PENDING is filtered out at serialise time). APPROVED result spawns no listener; PENDING result spawns a `_pair_status_listener` task that flips the row's status on flip. |
+| `unpair` | offloader | Drop the row from the unified `_pairings` dict and schedule the debounced save. Cancels the row's listener task if any. Idempotent. |
 
 | Command | Args | Response | Description |
 |---------|------|----------|-------------|
@@ -280,10 +295,13 @@ The pre-pivot HTTPS+bearer auth surface (phases 3b1-3c) was wound down across ph
 | `remote_build/remove_manual_host` | `{hostname, port}` | `RemoteBuildSettingsView` | Remove a manual peer. Unknown pair raises `not_found`. |
 | `remote_build/list_peers` | — | `[PeerSummary]` | Receiver-side list of paired (or pending) offloaders, projected to drop the raw X25519 pubkey bytes. |
 | `remote_build/approve_peer` | `{dashboard_id}` | `RemoteBuildSettingsView` | Promote a `PENDING` row to `APPROVED`. Fires `remote_build_pair_status_changed`. |
-| `remote_build/remove_peer` | `{dashboard_id}` | `RemoteBuildSettingsView` | Drop a peer row. Fires `remote_build_pair_status_changed` when the row was previously approved. |
+| `remote_build/remove_peer` | `{dashboard_id}` | `RemoteBuildSettingsView` | Drop a peer row. PENDING entries live in the controller's in-memory dict; APPROVED rows live in `settings.peers`. Fires `remote_build_pair_status_changed` with `status="removed"` for either case (the event wakes any in-flight pair_status long-poll, which is needed for the PENDING case to drop the offloader's local state). `not_found` when neither dict nor list has a matching row. |
 | `remote_build/set_pairing_window` | `{open}` | — | Open / close the pairing window for the calling WS client. The window narrows when `intent="pair_request"` Noise frames are even accepted; refcounted across clients with auto-close timeout. Fires `remote_build_pairing_window_changed` on transitions. |
 | `remote_build/get_identity` | — | `IdentityView` | Read the receiver's stable identity: `{dashboard_id, pin_sha256, server_version, esphome_version, listener_bound}`. The cert + key PEMs are intentionally NOT included; `pin_sha256` is the cert SPKI fingerprint (lowercase hex SHA-256) — a vestige of the pre-pivot bearer flow that the WS surface still returns until phase 4b+ swaps in the peer-link X25519 pubkey hash advertised in mDNS TXT. `listener_bound` reports whether the peer-link Noise WS listener is currently serving traffic. Idempotent (no rotation triggered). |
 | `remote_build/rotate_identity` | — | `IdentityView` | Mint a fresh dashboard cert + key pair, replacing whatever's on disk. **Note: this rotates the TLS cert from phase 3a (still used for `dashboard_id` provenance) but is *not* the peer-link rotation; the listener is torn down + rebuilt as a side effect, which reloads the X25519 peer-link identity from disk.** Phase 4b+ replaces this WS surface with peer-link identity rotation. |
+| `remote_build/preview_pair` | `{hostname, port}` | `{pin_sha256}` | Open a brief Noise XX WS to a receiver, capture the static pubkey, return the lowercase-hex SHA-256 for OOB display. No state mutated on either side. `unavailable` on transport / handshake failure. |
+| `remote_build/request_pair` | `{hostname, port, pin_sha256, receiver_label, offloader_label}` | `PairingSummary` | Re-handshake (defends against TOCTOU between preview and confirm), send `intent="pair_request"` carrying `{label: offloader_label, dashboard_id}` in encrypted msg3. The unified `_pairings` dict holds both PENDING and APPROVED rows; APPROVED rows debounce-save to `<config_dir>/.offloader_pairings.json` via the per-file `Store`, and PENDING rows are filtered out at serialise time so a malicious LAN scanner can't bloat the file. PENDING result spawns a pair-status listener task that flips the row's status in place + schedules a save when the receiver reports the eventual flip; APPROVED result short-circuits the inbox dance. PENDING rows don't survive a controller restart — any in-flight pair attempt has to be re-issued. `precondition_failed` on pin mismatch; `no_pairing_window` when the receiver's window is closed; `unavailable` on transport failure; `internal_error` on an unexpected receiver `intent_response`. |
+| `remote_build/unpair` | `{hostname, port}` | `{removed: bool}` | Pop the row from the unified `_pairings` dict and schedule the debounced save. Idempotent — `removed=false` when no row matched. Cancels the row's pair-status listener task. The receiver-side `StoredPeer` is *not* notified; that's the receiver admin's concern (a future `intent="peer_link"` from this offloader will be rejected because the local row is gone). |
 
 #### Peer-link Noise WS receiver site
 
@@ -309,15 +327,20 @@ Same-subnet peers read `remote_build_port` from TXT so a `--remote-build-port` o
 | `ping` | — | `{pong: true}` | Health check |
 | `subscribe_events` | — | Streaming | Subscribe to real-time events |
 
+**`subscribe_events` initial state:**
+
+Right after a client subscribes (and before any live events arrive), the server pushes one `initial_state` event carrying a snapshot of state that's accumulated server-side via background activity (mDNS browser, completed pair flows, etc.) so the frontend can paint the first frame without follow-up reads. Shape: `{devices?: [...], importable?: [...], pairings?: [PairingSummary]}`. Each field is present only when the corresponding controller is up; `pairings` carries both PENDING and APPROVED rows from the offloader-side `_pairings` dict (sync read, no executor hop). Live updates that arrive after the initial state mutate against this seed via the events below.
+
 **`subscribe_events` events:**
 - `device_added`, `device_removed`, `device_updated`, `device_state_changed`
 - `importable_device_added`, `importable_device_removed`
 - `label_created`, `label_updated`, `label_deleted`
 - `job_queued`, `job_started`, `job_output`, `job_completed`, `job_failed`
 - `remote_build_pair_request_received` — `{dashboard_id, pin_sha256, label, peer_ip}` — fires when an offloader's `intent="pair_request"` Noise frame lands a new `PENDING` row inside the receiver's open pairing window. The Settings UI surfaces the row in the inbox with the offending `dashboard_id`, the peer-link `pin_sha256` (X25519 pubkey hash), the offloader's claimed `label`, and `peer_ip` for sanity-checking.
-- `remote_build_pair_status_changed` — `{dashboard_id, status}` (`status: "approved" | "removed"`) — fires when the receiver's admin promotes a pending row via `approve_peer` or drops a row via `remove_peer`. Subscribers refresh the paired-peers list without polling.
+- `remote_build_pair_status_changed` — `{dashboard_id, status}` (`status: "approved" | "removed"`) — fires from three paths: (a) `approve_peer` promoting a PENDING dict entry to APPROVED (`status="approved"`), (b) `remove_peer` dropping either a PENDING dict entry or an APPROVED list row (`status="removed"`), (c) pairing-window-close clearing the PENDING dict (`status="removed"` per cleared entry). The "removed" event is what wakes any in-flight `intent="pair_status"` long-poll on a paired offloader so its listener task drops the offloader's local state. Subscribers refresh the paired-peers list without polling.
 - `remote_build_pairing_window_changed` — `{open, expires_in_seconds}` — fires when the pairing window opens / closes (refcount transitions, auto-close timeout, idle ageing). `expires_in_seconds` is `null` when `open` is `false`; otherwise it's the float remaining lifetime against the latest user-activity extend. Subscribers render the "Pairing window: X seconds remaining" countdown from this value (and tick locally between events).
 - `remote_build_identity_rotated` — `{dashboard_id, pin_sha256}` — fires when the operator triggers `remote_build/rotate_identity`. Subscribers refresh their cached pin without polling `get_identity`. Only fires when the on-disk rotation succeeds; the listener rebuild may still fail-soft, in which case the rotater's `IdentityView` response carries `listener_bound=false` while this event reflects only that the cert + key on disk changed.
+- `offloader_pair_status_changed` — `{receiver_hostname, receiver_port, status: "approved" | "removed"}` — offloader-side counterpart to `remote_build_pair_status_changed`. Fired by the per-row pair-status listener task (`_await_pair_status_flip` → `_apply_pair_status_result` → `_fire_offloader_pair_status_changed`) when its `intent="pair_status"` round-trip resolves: APPROVED + matching pin → `status="approved"`; APPROVED + drifted pin → `status="removed"` (treat receiver-side identity rotation as peer-revoked); REJECTED → `status="removed"`. Also fired by `remote_build/unpair` when the user removes a row. Keys on `(hostname, port)` because the offloader's `StoredPairing` keys on the receiver coordinates the user dialled, not on a receiver-side identifier the offloader doesn't track. Delivered to clients via the existing global `subscribe_events` stream — no separate subscription channel.
 
 ---
 

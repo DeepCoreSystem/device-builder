@@ -189,14 +189,59 @@ class RemoteBuildPairStatusChangedData(TypedDict):
     """
     Payload for ``EventType.REMOTE_BUILD_PAIR_STATUS_CHANGED``.
 
-    Fired by ``approve_peer`` (``status="approved"``) and by
-    ``remove_peer`` for previously-APPROVED rows
-    (``status="removed"``). Removing a still-PENDING row is
-    rejection-as-cleanup and intentionally does not fire — see
-    ``remove_peer`` docstring.
+    Fires from three paths:
+
+    * ``approve_peer`` promoting a PENDING dict entry to
+      APPROVED (``status="approved"``).
+    * ``remove_peer`` dropping either a PENDING dict entry or
+      an APPROVED list row (``status="removed"``).
+    * Pairing-window-close clearing the in-memory PENDING dict
+      (``status="removed"`` per cleared entry).
+
+    The ``status="removed"`` event is what wakes any in-flight
+    ``intent="pair_status"`` long-poll on a paired offloader so
+    its listener task drops the offloader's local state.
     """
 
     dashboard_id: str
+    status: Literal["approved", "removed"]
+
+
+class OffloaderPairStatusChangedData(TypedDict):
+    """
+    Payload for ``EventType.OFFLOADER_PAIR_STATUS_CHANGED``.
+
+    Offloader-side counterpart to
+    :class:`RemoteBuildPairStatusChangedData`. Fired on the
+    offloader's local bus from two paths:
+
+    * The per-row pair-status listener task
+      (``RemoteBuildController._await_pair_status_flip`` →
+      ``_apply_pair_status_result`` → ``_fire_offloader_pair_status_changed``)
+      when a previously-PENDING :class:`StoredPairing` flips to
+      ``APPROVED`` (admin clicked Accept) or is dropped because
+      the receiver returned ``REJECTED`` (admin clicked Reject;
+      window closed clearing the receiver-side dict; row never
+      existed; pin rotated).
+    * ``RemoteBuildController.unpair`` when the user removes a
+      row, so other clients on the global ``subscribe_events``
+      stream see the removal without re-fetching the pairings
+      snapshot.
+
+    Delivered to clients via the existing global
+    ``subscribe_events`` stream — no separate subscription
+    channel.
+
+    The two events have the same wire shape but live on
+    different buses (receiver vs offloader) and key on
+    different identifiers — the offloader's
+    :class:`StoredPairing` never stores the receiver's
+    ``dashboard_id``, so the receiver coordinates are the
+    ``(hostname, port)`` the user originally dialled.
+    """
+
+    receiver_hostname: str
+    receiver_port: int
     status: Literal["approved", "removed"]
 
 
@@ -249,7 +294,6 @@ class StoredPeer(DataClassORJSONMixin):
     static_x25519_pub: bytes
     label: str
     paired_at: float
-    status: PeerStatus = PeerStatus.PENDING
 
     def refresh_from_pair_request(
         self,
@@ -377,7 +421,16 @@ _PAIRING_VALIDATOR = vol.Schema(
         # (``isinstance(True, int)`` is true) before ever reaching the
         # bool reject. Run ``not_bool`` first, then assert int-or-float.
         vol.Required("paired_at"): vol.All(not_bool, vol.Any(int, float)),
-        vol.Required("status"): PeerStatus,
+        # ``status`` is in-memory only (the controller's serialiser
+        # filters PENDING rows out before writing to disk so the
+        # on-disk shape stays APPROVED-only), but ``__post_init__``
+        # runs the validator over ``asdict(self)`` which includes
+        # the field, so the schema must accept it. ``vol.In(PeerStatus)``
+        # matches both the enum instance (live constructor paths)
+        # and the bare string forms (``"pending"`` / ``"approved"``)
+        # that ``DataClassORJSONMixin.from_dict`` produces when
+        # round-tripping through JSON.
+        vol.Required("status"): vol.In(PeerStatus),
     }
 )
 
@@ -387,9 +440,13 @@ class StoredPairing(DataClassORJSONMixin):
     """
     Offloader-side record of a paired (or pending) receiver.
 
-    Persisted under ``_offloader_remote_build.pairings``. Created
-    by the ``request_pair`` flow over the peer-link WS: the
-    offloader runs a Noise XX handshake with
+    Persisted in the per-file
+    :class:`~helpers.storage.Store` at
+    ``<config_dir>/.offloader_pairings.json`` (RAM-first model:
+    the controller's ``_pairings`` dict is the runtime source of
+    truth, and the ``Store`` debounce-saves APPROVED rows to
+    disk). Created by the ``request_pair`` flow over the
+    peer-link WS: the offloader runs a Noise XX handshake with
     ``intent="pair_request"``, captures the receiver's static
     X25519 pubkey from the handshake transcript, and stores it
     here together with the receiver's ``(hostname, port)``
@@ -421,6 +478,26 @@ class StoredPairing(DataClassORJSONMixin):
     offloader's pair_request payload (the offloader-supplied
     name FOR the offloader, not for the receiver).
 
+    ``status`` is the row's lifecycle position. The controller
+    holds one in-RAM dict containing both PENDING and APPROVED
+    rows; the disk filter in ``_serialize_pairings`` strips
+    PENDING rows so the on-disk shape stays APPROVED-only.
+    ``status`` defaults to ``APPROVED`` for two reasons:
+
+    * **Disk shape invariant** — only APPROVED rows ever reach
+      disk, so reading a row back from the per-file ``Store``
+      always produces an APPROVED row. The default matches the
+      invariant.
+    * **Test ergonomics** — fixtures and ad-hoc constructions
+      that don't care about lifecycle (most of the
+      validator-shape tests, the reflection-driven event-payload
+      contracts) don't have to thread a status arg through.
+
+    PENDING is the explicit case — ``request_pair`` sets it on
+    the row before adding it to the dict; ``_apply_pair_status_result``
+    flips it to APPROVED in place when the receiver reports the
+    flip.
+
     ``__post_init__`` enforces upper bounds on the user-supplied
     string fields (hostname, label) + shape on the cryptographic
     fields so a malformed sidecar row (hand-edit, partial-write
@@ -435,7 +512,7 @@ class StoredPairing(DataClassORJSONMixin):
     static_x25519_pub: bytes
     label: str
     paired_at: float
-    status: PeerStatus = PeerStatus.PENDING
+    status: PeerStatus = PeerStatus.APPROVED
 
     def __post_init__(self) -> None:
         """Run :data:`_PAIRING_VALIDATOR`; re-raise as ``ValueError``."""
@@ -511,12 +588,16 @@ class OffloaderRemoteBuildSettings(DataClassORJSONMixin):
     """
     Offloader-side settings for the remote-build feature (storage shape).
 
-    Stored in ``.device-builder.json`` under the
-    ``_offloader_remote_build`` top-level key — distinct from
-    the receiver's ``_remote_build`` key so a dashboard playing
-    both roles persists each side's state independently and a
-    future "split offloader / receiver into separate processes"
-    refactor only has to peel one key out.
+    Stored in its own per-file :class:`~helpers.storage.Store`
+    instance at ``<config_dir>/.offloader_pairings.json`` —
+    sibling of the metadata sidecar rather than a sub-key of it,
+    so atomic writes are per-domain (corrupting the offloader
+    pairings file can't take out the receiver-side
+    ``.device-builder.json``) and there's no lock contention
+    against unrelated metadata writers. A dashboard playing both
+    roles persists each side's state independently; a future
+    "split offloader / receiver into separate processes" refactor
+    only has to move one file.
 
     ``pairings`` carries phase-4a-o :class:`StoredPairing`
     rows: the offloader's pinned receivers. There's no

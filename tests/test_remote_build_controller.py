@@ -29,14 +29,15 @@ from esphome_device_builder.controllers.config import (
 )
 from esphome_device_builder.controllers.remote_build import (
     RemoteBuildController,
+    _decode_pairings,
     _decode_txt_value,
+    _encode_pairings,
     _enforce_pin_match,
     _intent_response_to_command_error,
     _pairing_summary,
     _PairLabelField,
     _peer_from_manual_host,
     _peer_from_service_info,
-    _upsert_pairing,
     _validate_hostname,
     _validate_pair_label,
     _validate_pin_sha256,
@@ -44,6 +45,7 @@ from esphome_device_builder.controllers.remote_build import (
 )
 from esphome_device_builder.helpers.api import CommandError
 from esphome_device_builder.helpers.dashboard_advertise import SERVICE_TYPE
+from esphome_device_builder.helpers.event_bus import EventBus
 from esphome_device_builder.models import (
     ErrorCode,
     EventType,
@@ -87,13 +89,27 @@ def _fake_service_info(
     return info
 
 
-def _make_controller(*, config_dir: Any = None) -> RemoteBuildController:
+def _make_controller(*, config_dir: Path, real_bus: bool = False) -> RemoteBuildController:
     db = MagicMock()
     db.devices = MagicMock()
     db.devices.zeroconf = None
     db._dashboard_advertiser = None
     db.settings = MagicMock()
+    # The controller's ``__init__`` constructs a per-file
+    # ``Store`` keyed off ``config_dir / ".offloader_pairings.json"``,
+    # so callers must thread a real ``Path`` through (typically
+    # pytest's ``tmp_path``). Mocking it would land the store at
+    # ``MagicMock() / "..."`` and trip ``__truediv__`` somewhere
+    # downstream; an explicit signature beats the silent failure
+    # mode.
     db.settings.config_dir = config_dir
+    if real_bus:
+        # Long-poll tests for ``lookup_peer_for_status`` exercise the
+        # bus.listening machinery for real (a MagicMock bus would
+        # never deliver events to the listener and the long-poll
+        # would only ever take the timeout fallback). Bring up an
+        # actual ``EventBus`` for those.
+        db.bus = EventBus()
     return RemoteBuildController(db)
 
 
@@ -191,9 +207,9 @@ def test_peer_from_service_info_handles_missing_txt_keys() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_on_service_state_change_filters_own_advertise() -> None:
+def test_on_service_state_change_filters_own_advertise(tmp_path: Path) -> None:
     """Our own service-instance name never lands in ``_peers``."""
-    controller = _make_controller()
+    controller = _make_controller(config_dir=tmp_path)
     controller._own_instance_name = f"self.{SERVICE_TYPE}"
     zeroconf = MagicMock()
     controller._on_service_state_change(
@@ -202,9 +218,11 @@ def test_on_service_state_change_filters_own_advertise() -> None:
     assert controller._peers == {}
 
 
-def test_on_service_state_change_removed_drops_peer(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_on_service_state_change_removed_drops_peer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A ``Removed`` event clears the peer entry immediately."""
-    controller = _make_controller()
+    controller = _make_controller(config_dir=tmp_path)
     controller._peers[f"desktop.{SERVICE_TYPE}"] = RemoteBuildPeer(
         name="desktop",
         hostname="desktop.local.",
@@ -218,10 +236,11 @@ def test_on_service_state_change_removed_drops_peer(monkeypatch: pytest.MonkeyPa
 
 
 def test_on_service_state_change_uses_cache_when_available(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A cache-hit resolves the peer synchronously without spawning a task."""
-    controller = _make_controller()
+    controller = _make_controller(config_dir=tmp_path)
     fake_info = _fake_service_info(name="desktop")
     fake_info.load_from_cache = MagicMock(return_value=True)
     monkeypatch.setattr(
@@ -447,10 +466,11 @@ async def test_stop_swallows_browser_cancel_errors(
 
 @pytest.mark.asyncio
 async def test_on_service_state_change_spawns_resolve_task_on_cache_miss(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A cache-miss queues the async resolve task and tracks it in ``_tasks``."""
-    controller = _make_controller()
+    controller = _make_controller(config_dir=tmp_path)
     fake_info = _fake_service_info(name="desktop")
     fake_info.load_from_cache = MagicMock(return_value=False)
     fake_info.async_request = AsyncMock(return_value=True)
@@ -471,9 +491,9 @@ async def test_on_service_state_change_spawns_resolve_task_on_cache_miss(
 
 
 @pytest.mark.asyncio
-async def test_resolve_and_apply_swallows_errors() -> None:
+async def test_resolve_and_apply_swallows_errors(tmp_path: Path) -> None:
     """A resolve-side exception leaves the peer map untouched."""
-    controller = _make_controller()
+    controller = _make_controller(config_dir=tmp_path)
     fake_info = _fake_service_info(name="desktop")
     fake_info.async_request = AsyncMock(side_effect=RuntimeError("network down"))
     await controller._resolve_and_apply(MagicMock(), fake_info, f"desktop.{SERVICE_TYPE}")
@@ -481,9 +501,9 @@ async def test_resolve_and_apply_swallows_errors() -> None:
 
 
 @pytest.mark.asyncio
-async def test_resolve_and_apply_skips_when_resolution_returns_false() -> None:
+async def test_resolve_and_apply_skips_when_resolution_returns_false(tmp_path: Path) -> None:
     """An ``async_request`` that returns ``False`` (timeout) doesn't add a peer."""
-    controller = _make_controller()
+    controller = _make_controller(config_dir=tmp_path)
     fake_info = _fake_service_info(name="desktop")
     fake_info.async_request = AsyncMock(return_value=False)
     await controller._resolve_and_apply(MagicMock(), fake_info, f"desktop.{SERVICE_TYPE}")
@@ -491,9 +511,9 @@ async def test_resolve_and_apply_skips_when_resolution_returns_false() -> None:
 
 
 @pytest.mark.asyncio
-async def test_stop_drains_resolve_tasks() -> None:
+async def test_stop_drains_resolve_tasks(tmp_path: Path) -> None:
     """In-flight resolve tasks are cancelled and the set is cleared."""
-    controller = _make_controller()
+    controller = _make_controller(config_dir=tmp_path)
     started = asyncio.Event()
 
     async def _slow() -> None:
@@ -1021,9 +1041,16 @@ def _stored_peer(
     pin_sha256: str | None = None,
     static_x25519_pub: bytes | None = None,
     paired_at: float = 1_700_000_000.0,
-    status: PeerStatus = PeerStatus.PENDING,
 ) -> StoredPeer:
-    """Construct a ``StoredPeer`` with sensible defaults for tests."""
+    """Construct a ``StoredPeer`` with sensible defaults for tests.
+
+    All ``StoredPeer`` instances are implicitly APPROVED in the
+    storage model — PENDING peers live in the controller's
+    in-memory ``_pending_peers`` dict, not in the dataclass.
+    Tests that need a PENDING entry build a ``StoredPeer`` with
+    this helper and add it via :func:`_seed_pending_peer`; tests
+    that need an APPROVED entry seed it via :func:`_seed_peer`.
+    """
     pub = static_x25519_pub if static_x25519_pub is not None else _secrets.token_bytes(32)
     pin = pin_sha256 if pin_sha256 is not None else hashlib.sha256(pub).hexdigest()
     return StoredPeer(
@@ -1032,12 +1059,16 @@ def _stored_peer(
         static_x25519_pub=pub,
         label=label,
         paired_at=paired_at,
-        status=status,
     )
 
 
 async def _seed_peer(config_dir: Path, peer: StoredPeer) -> None:
-    """Persist a single ``StoredPeer`` row under ``_remote_build.peers``."""
+    """Persist *peer* as an APPROVED row under ``_remote_build.peers``.
+
+    The persistent list is APPROVED-only — for PENDING entries
+    use :func:`_seed_pending_peer` to add to the controller's
+    in-memory dict instead.
+    """
     loop = asyncio.get_running_loop()
 
     def _write() -> None:
@@ -1045,6 +1076,18 @@ async def _seed_peer(config_dir: Path, peer: StoredPeer) -> None:
             settings.peers.append(peer)
 
     await loop.run_in_executor(None, _write)
+
+
+def _seed_pending_peer(controller: RemoteBuildController, peer: StoredPeer) -> None:
+    """Add *peer* to the controller's in-memory pending dict.
+
+    Mirrors what ``record_pair_request`` does for a fresh
+    pair_request inside an open pairing window — sets up a
+    ``StoredPeer`` instance keyed on ``dashboard_id``. Use this
+    in place of :func:`_seed_peer` for tests that exercise the
+    PENDING path; the persistent list stays APPROVED-only.
+    """
+    controller._pending_peers[peer.dashboard_id] = peer
 
 
 @pytest.mark.asyncio
@@ -1056,11 +1099,11 @@ async def test_list_peers_returns_empty_when_none_stored(tmp_path: Path) -> None
 
 @pytest.mark.asyncio
 async def test_list_peers_returns_summary_for_each_row(tmp_path: Path) -> None:
-    """``list_peers`` projects every stored peer to ``PeerSummary``."""
+    """``list_peers`` merges in-memory PENDING + persisted APPROVED rows."""
     controller = _make_controller(config_dir=tmp_path)
-    pending = _stored_peer(dashboard_id="pending", status=PeerStatus.PENDING)
-    approved = _stored_peer(dashboard_id="approved", status=PeerStatus.APPROVED)
-    await _seed_peer(tmp_path, pending)
+    pending = _stored_peer(dashboard_id="pending")
+    approved = _stored_peer(dashboard_id="approved")
+    _seed_pending_peer(controller, pending)
     await _seed_peer(tmp_path, approved)
 
     rows = await controller.list_peers()
@@ -1087,16 +1130,17 @@ async def test_list_peers_drops_static_x25519_pub_from_wire(tmp_path: Path) -> N
 async def test_approve_peer_promotes_pending_to_approved(tmp_path: Path) -> None:
     controller = _make_controller(config_dir=tmp_path)
     controller._db.bus = MagicMock()
-    await _seed_peer(tmp_path, _stored_peer(dashboard_id="alpha", status=PeerStatus.PENDING))
+    _seed_pending_peer(controller, _stored_peer(dashboard_id="alpha"))
 
     view = await controller.approve_peer(dashboard_id="alpha")
 
     assert view.peers[0].status == PeerStatus.APPROVED
+    assert "alpha" not in controller._pending_peers
     # Hop the sync I/O off the loop so blockbuster doesn't flag it
     # (the production path always goes through run_in_executor too).
     loop = asyncio.get_running_loop()
     settings = await loop.run_in_executor(None, load_remote_build_settings, tmp_path)
-    assert settings.peers[0].status == PeerStatus.APPROVED
+    assert settings.peers[0].dashboard_id == "alpha"
 
 
 @pytest.mark.asyncio
@@ -1104,7 +1148,7 @@ async def test_approve_peer_fires_pair_status_changed(tmp_path: Path) -> None:
     """Approval fires ``REMOTE_BUILD_PAIR_STATUS_CHANGED`` with status=approved."""
     controller = _make_controller(config_dir=tmp_path)
     controller._db.bus = MagicMock()
-    await _seed_peer(tmp_path, _stored_peer(dashboard_id="alpha"))
+    _seed_pending_peer(controller, _stored_peer(dashboard_id="alpha"))
 
     await controller.approve_peer(dashboard_id="alpha")
 
@@ -1132,7 +1176,7 @@ async def test_approve_peer_already_approved_returns_invalid_args(tmp_path: Path
     """Re-approving an already-APPROVED peer is rejected, not silently re-fired."""
     controller = _make_controller(config_dir=tmp_path)
     controller._db.bus = MagicMock()
-    await _seed_peer(tmp_path, _stored_peer(dashboard_id="alpha", status=PeerStatus.APPROVED))
+    await _seed_peer(tmp_path, _stored_peer(dashboard_id="alpha"))
 
     with pytest.raises(CommandError) as exc:
         await controller.approve_peer(dashboard_id="alpha")
@@ -1166,16 +1210,28 @@ async def test_approve_peer_rejects_non_string_dashboard_id(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
-async def test_remove_peer_drops_pending_silently(tmp_path: Path) -> None:
-    """Removing a PENDING peer is rejection-as-cleanup; no event fires."""
+async def test_remove_peer_drops_pending_and_fires_removed(tmp_path: Path) -> None:
+    """Removing a PENDING peer fires ``status="removed"``.
+
+    The event wakes any in-flight pair_status long-poll on the
+    offloader so its listener drops the local row. Pre-refactor
+    this path was silent (no event); after the in-memory-pending
+    refactor PENDING and APPROVED removals fire the same event
+    for a uniform wake-up signal.
+    """
     controller = _make_controller(config_dir=tmp_path)
     controller._db.bus = MagicMock()
-    await _seed_peer(tmp_path, _stored_peer(dashboard_id="alpha", status=PeerStatus.PENDING))
+    _seed_pending_peer(controller, _stored_peer(dashboard_id="alpha"))
 
     view = await controller.remove_peer(dashboard_id="alpha")
 
     assert view.peers == []
-    controller._db.bus.fire.assert_not_called()
+    assert "alpha" not in controller._pending_peers
+    fire = controller._db.bus.fire
+    fire.assert_called_once()
+    event_type, payload = fire.call_args.args
+    assert event_type is EventType.REMOTE_BUILD_PAIR_STATUS_CHANGED
+    assert payload == {"dashboard_id": "alpha", "status": "removed"}
 
 
 @pytest.mark.asyncio
@@ -1183,7 +1239,7 @@ async def test_remove_peer_drops_approved_and_fires_event(tmp_path: Path) -> Non
     """Removing an APPROVED peer is revocation; fires the removed event."""
     controller = _make_controller(config_dir=tmp_path)
     controller._db.bus = MagicMock()
-    await _seed_peer(tmp_path, _stored_peer(dashboard_id="alpha", status=PeerStatus.APPROVED))
+    await _seed_peer(tmp_path, _stored_peer(dashboard_id="alpha"))
 
     view = await controller.remove_peer(dashboard_id="alpha")
 
@@ -1476,6 +1532,8 @@ async def test_record_pair_request_creates_pending_row(tmp_path: Path) -> None:
     """First pair_request from a previously-unknown dashboard_id creates PENDING."""
     controller = _make_controller(config_dir=tmp_path)
     controller._db.bus = MagicMock()
+    await controller.set_pairing_window(open=True, client="receiver-tab")
+    controller._db.bus.fire.reset_mock()
     pubkey = b"\xaa" * 32
     pin = hashlib.sha256(pubkey).hexdigest()
 
@@ -1488,14 +1546,14 @@ async def test_record_pair_request_creates_pending_row(tmp_path: Path) -> None:
     )
 
     assert response == "pending"
+    # PENDING entries live in-memory; persistent storage is empty.
     loop = asyncio.get_running_loop()
     settings = await loop.run_in_executor(None, load_remote_build_settings, tmp_path)
-    [peer] = settings.peers
-    assert peer.dashboard_id == "alpha"
-    assert peer.status == PeerStatus.PENDING
-    assert peer.pin_sha256 == pin
-    assert peer.static_x25519_pub == pubkey
-    assert peer.label == "alpha"
+    assert settings.peers == []
+    pending = controller._pending_peers["alpha"]
+    assert pending.pin_sha256 == pin
+    assert pending.static_x25519_pub == pubkey
+    assert pending.label == "alpha"
 
 
 @pytest.mark.asyncio
@@ -1503,6 +1561,8 @@ async def test_record_pair_request_fires_event(tmp_path: Path) -> None:
     """Creating a PENDING row fires REMOTE_BUILD_PAIR_REQUEST_RECEIVED."""
     controller = _make_controller(config_dir=tmp_path)
     controller._db.bus = MagicMock()
+    await controller.set_pairing_window(open=True, client="receiver-tab")
+    controller._db.bus.fire.reset_mock()
     pubkey = b"\xbb" * 32
     pin = hashlib.sha256(pubkey).hexdigest()
 
@@ -1537,9 +1597,10 @@ async def test_record_pair_request_refreshes_existing_pending_row(tmp_path: Path
         static_x25519_pub=b"\x11" * 32,
         label="old",
         paired_at=1.0,
-        status=PeerStatus.PENDING,
     )
-    await _seed_peer(tmp_path, initial)
+    _seed_pending_peer(controller, initial)
+    await controller.set_pairing_window(open=True, client="receiver-tab")
+    controller._db.bus.fire.reset_mock()
     new_pubkey = b"\xcc" * 32
     new_pin = hashlib.sha256(new_pubkey).hexdigest()
 
@@ -1552,14 +1613,15 @@ async def test_record_pair_request_refreshes_existing_pending_row(tmp_path: Path
     )
 
     assert response == "pending"
+    # PENDING refresh updates the in-memory dict, not disk.
+    refreshed = controller._pending_peers["alpha"]
+    assert refreshed.pin_sha256 == new_pin
+    assert refreshed.static_x25519_pub == new_pubkey
+    assert refreshed.label == "renamed"
+    assert refreshed.paired_at > 1.0
     loop = asyncio.get_running_loop()
     settings = await loop.run_in_executor(None, load_remote_build_settings, tmp_path)
-    [peer] = settings.peers
-    assert peer.pin_sha256 == new_pin
-    assert peer.static_x25519_pub == new_pubkey
-    assert peer.label == "renamed"
-    assert peer.paired_at > 1.0
-    assert peer.status == PeerStatus.PENDING
+    assert settings.peers == []
 
 
 @pytest.mark.asyncio
@@ -1586,7 +1648,6 @@ async def test_record_pair_request_already_approved_same_pin_returns_approved(
         static_x25519_pub=pubkey,
         label="alpha",
         paired_at=1.0,
-        status=PeerStatus.APPROVED,
     )
     await _seed_peer(tmp_path, approved)
 
@@ -1602,11 +1663,86 @@ async def test_record_pair_request_already_approved_same_pin_returns_approved(
     loop = asyncio.get_running_loop()
     settings = await loop.run_in_executor(None, load_remote_build_settings, tmp_path)
     [peer] = settings.peers
-    assert peer.status == PeerStatus.APPROVED
     assert peer.pin_sha256 == pin
     assert peer.label == "alpha"
     assert peer.paired_at == 1.0
     controller._db.bus.fire.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_record_pair_request_unknown_dashboard_id_closed_window_returns_no_pairing_window(
+    tmp_path: Path,
+) -> None:
+    """A new offloader hitting pair_request while window is closed returns NO_PAIRING_WINDOW.
+
+    The pairing window only gates branches that would create or
+    refresh a PENDING row (new authorization). With no row for
+    the offloader yet and the window closed, the result is
+    NO_PAIRING_WINDOW — admin needs to open the screen for new
+    pair-requests to even be accepted.
+    """
+    controller = _make_controller(config_dir=tmp_path)
+    controller._db.bus = MagicMock()
+    pubkey = b"\x33" * 32
+    pin = hashlib.sha256(pubkey).hexdigest()
+
+    response = await controller.record_pair_request(
+        dashboard_id="newcomer",
+        pin_sha256=pin,
+        static_x25519_pub=pubkey,
+        label="newcomer",
+        peer_ip="10.0.0.1",
+    )
+
+    assert response is IntentResponse.NO_PAIRING_WINDOW
+    # No row was created — the gate fired before the append.
+    loop = asyncio.get_running_loop()
+    settings = await loop.run_in_executor(None, load_remote_build_settings, tmp_path)
+    assert settings.peers == []
+    # No event fired either — the pair_request_received event is
+    # for surfacing rows in the inbox, and no row was created.
+    controller._db.bus.fire.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_record_pair_request_already_approved_bypasses_closed_window(
+    tmp_path: Path,
+) -> None:
+    """An already-approved peer re-pairing with matching pin bypasses the window gate.
+
+    The window only narrows when *new authorization* is being
+    requested. A pair_request from a peer whose pubkey matches
+    an APPROVED row is just re-establishing existing trust —
+    admin doesn't need to be on the Pairing requests screen for
+    that to work. Otherwise an offloader's pair-request retry
+    after a network blip would surface NO_PAIRING_WINDOW just
+    because the receiver-side admin closed the screen between
+    pairings, forcing the user to re-engage with no security
+    benefit.
+    """
+    controller = _make_controller(config_dir=tmp_path)
+    controller._db.bus = MagicMock()
+    pubkey = b"\x44" * 32
+    pin = hashlib.sha256(pubkey).hexdigest()
+    approved = _stored_peer(
+        dashboard_id="alpha",
+        pin_sha256=pin,
+        static_x25519_pub=pubkey,
+        label="alpha",
+        paired_at=1.0,
+    )
+    await _seed_peer(tmp_path, approved)
+    # Window stays CLOSED — no set_pairing_window call.
+
+    response = await controller.record_pair_request(
+        dashboard_id="alpha",
+        pin_sha256=pin,
+        static_x25519_pub=pubkey,
+        label="alpha",
+        peer_ip="10.0.0.1",
+    )
+
+    assert response is IntentResponse.APPROVED
 
 
 @pytest.mark.asyncio
@@ -1634,7 +1770,6 @@ async def test_record_pair_request_already_approved_different_pin_returns_reject
         static_x25519_pub=original_pubkey,
         label="alpha",
         paired_at=1.0,
-        status=PeerStatus.APPROVED,
     )
     await _seed_peer(tmp_path, approved)
 
@@ -1653,7 +1788,6 @@ async def test_record_pair_request_already_approved_different_pin_returns_reject
     settings = await loop.run_in_executor(None, load_remote_build_settings, tmp_path)
     [peer] = settings.peers
     # Original row untouched.
-    assert peer.status == PeerStatus.APPROVED
     assert peer.pin_sha256 == original_pin
     assert peer.static_x25519_pub == original_pubkey
     assert peer.label == "alpha"
@@ -1673,7 +1807,6 @@ async def test_lookup_peer_for_session_approved_returns_ok(tmp_path: Path) -> No
             dashboard_id="alpha",
             pin_sha256=pin,
             static_x25519_pub=pubkey,
-            status=PeerStatus.APPROVED,
         ),
     )
 
@@ -1688,13 +1821,12 @@ async def test_lookup_peer_for_session_pending_returns_pending(tmp_path: Path) -
     controller._db.bus = MagicMock()
     pubkey = b"\xee" * 32
     pin = hashlib.sha256(pubkey).hexdigest()
-    await _seed_peer(
-        tmp_path,
+    _seed_pending_peer(
+        controller,
         _stored_peer(
             dashboard_id="alpha",
             pin_sha256=pin,
             static_x25519_pub=pubkey,
-            status=PeerStatus.PENDING,
         ),
     )
 
@@ -1734,7 +1866,6 @@ async def test_lookup_peer_for_session_pin_mismatch_returns_rejected(tmp_path: P
             dashboard_id="alpha",
             pin_sha256=stored_pin,
             static_x25519_pub=stored_pubkey,
-            status=PeerStatus.APPROVED,
         ),
     )
 
@@ -1760,7 +1891,6 @@ async def test_lookup_peer_for_status_mirrors_session_but_uses_approved_string(
             dashboard_id="alpha",
             pin_sha256=pin,
             static_x25519_pub=pubkey,
-            status=PeerStatus.APPROVED,
         ),
     )
 
@@ -1784,6 +1914,109 @@ async def test_lookup_peer_for_status_unknown_returns_rejected(tmp_path: Path) -
     assert response == "rejected"
 
 
+@pytest.mark.asyncio
+async def test_lookup_peer_for_status_long_polls_until_approve_fires(
+    tmp_path: Path,
+) -> None:
+    """Long-poll wakes promptly when ``approve_peer`` flips the row mid-wait.
+
+    Mirrors the production wire flow: an offloader's ``intent="pair_status"``
+    arrives while its row is still PENDING; the receiver's admin clicks
+    Accept on a second WS, which fires ``REMOTE_BUILD_PAIR_STATUS_CHANGED``
+    on the bus; the long-poll wakes, re-snapshots the now-APPROVED row,
+    returns ``APPROVED``. Uses a real :class:`EventBus` so the listener
+    machinery actually runs (the MagicMock fixture used elsewhere doesn't
+    deliver events).
+    """
+    controller = _make_controller(config_dir=tmp_path, real_bus=True)
+    pubkey = b"\x55" * 32
+    pin = hashlib.sha256(pubkey).hexdigest()
+    # Open the window first so the dict-clear-on-close path doesn't
+    # immediately wipe what we seed below.
+    await controller.set_pairing_window(open=True, client="receiver-tab")
+    _seed_pending_peer(
+        controller,
+        _stored_peer(
+            dashboard_id="alpha",
+            pin_sha256=pin,
+            static_x25519_pub=pubkey,
+        ),
+    )
+
+    async def _flip_after_short_delay() -> None:
+        # Yield enough loop ticks that ``lookup_peer_for_status`` has
+        # time to register its bus listener and park on the wait.
+        await asyncio.sleep(0.05)
+        await controller.approve_peer(dashboard_id="alpha")
+
+    flip_task = asyncio.create_task(_flip_after_short_delay())
+    try:
+        response = await controller.lookup_peer_for_status(dashboard_id="alpha", pin_sha256=pin)
+    finally:
+        await flip_task
+        await controller.stop()
+
+    assert response is IntentResponse.APPROVED
+
+
+@pytest.mark.asyncio
+async def test_lookup_peer_for_status_long_poll_ignores_other_dashboard_ids(
+    tmp_path: Path,
+) -> None:
+    """Bus events for unrelated ``dashboard_id`` don't wake the long-poll.
+
+    Two pending rows; firing approve_peer for bravo must not unpark
+    alpha's waiter. Closing the pairing window then deterministically
+    ends alpha's long-poll: window-close fires
+    ``pair_status_changed`` for each cleared dict entry (including
+    alpha), the listener wakes, re-snapshots, finds alpha gone, and
+    returns ``REJECTED``.
+    """
+    controller = _make_controller(config_dir=tmp_path, real_bus=True)
+    pubkey = b"\x66" * 32
+    pin = hashlib.sha256(pubkey).hexdigest()
+    await controller.set_pairing_window(open=True, client="receiver-tab")
+    _seed_pending_peer(
+        controller,
+        _stored_peer(
+            dashboard_id="alpha",
+            pin_sha256=pin,
+            static_x25519_pub=pubkey,
+        ),
+    )
+    _seed_pending_peer(
+        controller,
+        _stored_peer(
+            dashboard_id="bravo",
+            pin_sha256=pin,
+            static_x25519_pub=pubkey,
+        ),
+    )
+
+    async def _approve_bravo_then_close_window() -> None:
+        # Yield long enough for alpha's long-poll to park.
+        await asyncio.sleep(0.02)
+        await controller.approve_peer(dashboard_id="bravo")
+        # Bravo's flip event must NOT have unparked alpha. Then
+        # close the window to deterministically end alpha's wait
+        # (else the test parks indefinitely — no timeout exists).
+        await asyncio.sleep(0.02)
+        await controller.set_pairing_window(open=False, client="receiver-tab")
+
+    flip_task = asyncio.create_task(_approve_bravo_then_close_window())
+    try:
+        response = await controller.lookup_peer_for_status(dashboard_id="alpha", pin_sha256=pin)
+    finally:
+        await flip_task
+        await controller.stop()
+
+    # Window-close cleared alpha from the pending dict + fired the
+    # removal event; alpha's re-snapshot misses → REJECTED. NOT
+    # APPROVED (which would mean bravo's flip woke alpha's waiter
+    # incorrectly).
+    assert response is IntentResponse.REJECTED
+
+
 # ---------------------------------------------------------------------------
 # Offloader-side pair-flow helpers (phase 4a-o part 3)
 # ---------------------------------------------------------------------------
@@ -1795,9 +2028,15 @@ def _valid_stored_pairing(
     receiver_port: int = 6055,
     label: str = "desktop",
     paired_at: float = 1.0,
-    status: PeerStatus = PeerStatus.PENDING,
+    status: PeerStatus = PeerStatus.APPROVED,
 ) -> StoredPairing:
-    """Build a passing :class:`StoredPairing` so tests don't repeat the boilerplate."""
+    """Build a passing :class:`StoredPairing` so tests don't repeat the boilerplate.
+
+    Defaults to APPROVED — that's the on-disk shape. PENDING is
+    only ever in-RAM (the controller filters PENDING out at
+    serialise time), so tests that want a PENDING row in the
+    controller's dict opt in explicitly.
+    """
     return StoredPairing(
         receiver_hostname=receiver_hostname,
         receiver_port=receiver_port,
@@ -1946,46 +2185,12 @@ def test_enforce_pin_match_raises_precondition_failed_on_drift() -> None:
     assert "got " + "b" * 64 in str(exc.value)
 
 
-# --- _upsert_pairing ---
-
-
-def test_upsert_pairing_appends_when_no_existing_row() -> None:
-    settings = OffloaderRemoteBuildSettings()
-    pairing = _valid_stored_pairing()
-    _upsert_pairing(settings, pairing)
-    assert settings.pairings == [pairing]
-
-
-def test_upsert_pairing_replaces_existing_row_for_same_host_port() -> None:
-    """Re-pair from the same offloader to the same receiver overwrites, doesn't duplicate."""
-    old = _valid_stored_pairing(label="old", paired_at=1.0)
-    new = _valid_stored_pairing(label="new", paired_at=2.0, status=PeerStatus.APPROVED)
-    settings = OffloaderRemoteBuildSettings(pairings=[old])
-    _upsert_pairing(settings, new)
-    assert len(settings.pairings) == 1
-    assert settings.pairings[0].label == "new"
-    assert settings.pairings[0].status is PeerStatus.APPROVED
-
-
-def test_upsert_pairing_keeps_other_rows_intact() -> None:
-    """Replacement is keyed on (hostname, port) — different receivers are independent."""
-    other = _valid_stored_pairing(receiver_hostname="other.local")
-    target_old = _valid_stored_pairing(receiver_hostname="target.local", label="old")
-    target_new = _valid_stored_pairing(receiver_hostname="target.local", label="new")
-    settings = OffloaderRemoteBuildSettings(pairings=[other, target_old])
-    _upsert_pairing(settings, target_new)
-    assert {(p.receiver_hostname, p.label) for p in settings.pairings} == {
-        ("other.local", "desktop"),
-        ("target.local", "new"),
-    }
-
-
 # --- _pairing_summary ---
 
 
 def test_pairing_summary_drops_static_pubkey() -> None:
     """Wire view drops ``static_x25519_pub`` so the raw pubkey stays server-side."""
-    pairing = _valid_stored_pairing()
+    pairing = _valid_stored_pairing(status=PeerStatus.PENDING)
     summary = _pairing_summary(pairing)
     assert isinstance(summary, PairingSummary)
     assert summary.receiver_hostname == "build.local"
@@ -1994,3 +2199,50 @@ def test_pairing_summary_drops_static_pubkey() -> None:
     assert summary.status is PeerStatus.PENDING
     # PairingSummary doesn't carry the raw bytes.
     assert not hasattr(summary, "static_x25519_pub")
+
+
+# --- _decode_pairings / _encode_pairings ---
+
+
+def test_encode_decode_pairings_round_trip() -> None:
+    """Encoded bytes round-trip back through the decoder unchanged."""
+    settings = OffloaderRemoteBuildSettings(pairings=[_valid_stored_pairing()])
+    payload = _encode_pairings(settings)
+    decoded = _decode_pairings(payload)
+    assert decoded == settings
+
+
+def test_decode_pairings_recovers_to_empty_on_garbage(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A corrupt or unparsable file resets to empty + logs the exception.
+
+    The dashboard's policy on a corrupt offloader pairings file is
+    soft-recovery: every offloader has to re-pair (annoying but
+    not fatal), versus crashing the dashboard at startup which
+    would lock the user out entirely. The recovery is observable
+    via the logged exception so an operator can see *why* their
+    pairings vanished.
+    """
+    with caplog.at_level("ERROR"):
+        result = _decode_pairings(b"this is not json {{{")
+    assert result == OffloaderRemoteBuildSettings()
+    assert any("Corrupt offloader pairings file" in r.message for r in caplog.records), (
+        "expected corruption-recovery log line"
+    )
+
+
+def test_decode_pairings_recovers_to_empty_on_schema_drift(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """JSON parses but ``OffloaderRemoteBuildSettings.from_dict`` rejects → empty.
+
+    Pins the second branch of the recovery: valid JSON but a
+    payload mashumaro can't coerce (e.g. a list at the top level
+    where a dict is expected, or a future-shape sidecar a
+    downgraded dashboard read).
+    """
+    with caplog.at_level("ERROR"):
+        result = _decode_pairings(b'["unexpected", "list", "shape"]')
+    assert result == OffloaderRemoteBuildSettings()
+    assert any("Corrupt offloader pairings file" in r.message for r in caplog.records)
