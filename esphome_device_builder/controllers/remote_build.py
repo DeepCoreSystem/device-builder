@@ -19,9 +19,15 @@ toggling matters.
 
 Tokens are validated by the auth middleware on that site
 against an in-memory index seeded from disk in :meth:`start`
-and refreshed on every CRUD mutation. ``add_token`` flashes
-the cleartext bearer through its response once at creation
-time; only the SHA-256 of the secret half lands on disk.
+and refreshed on every CRUD mutation. **The frontend
+generates the bearer (token_id + secret) client-side** and
+submits only ``SHA-256(secret)`` to the backend; the
+cleartext bearer never crosses the wire from frontend to
+dashboard. This closes the leak that would otherwise occur
+when the dashboard is reachable on plain HTTP (standalone
+``--host 0.0.0.0`` without a reverse-proxy TLS terminator).
+Only the hash lands on disk; if the user loses the cleartext,
+the recovery is to remove the token and register a fresh one.
 
 Pairing flow + peer-link WS arrive in later phases. The
 listener currently serves only ``/remote-build/v1/health`` as
@@ -44,10 +50,8 @@ own browsers (``_esphomelib._tcp.local.`` for devices,
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import logging
 import re
-import secrets
 import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
@@ -65,7 +69,6 @@ from ..models import (
     RemoteBuildSettings,
     RemoteBuildSettingsView,
     StoredToken,
-    TokenCreateResult,
     TokenSummary,
 )
 from .config import load_remote_build_settings, remote_build_settings_transaction
@@ -177,21 +180,33 @@ def _validate_hostname(raw: object) -> str:
     return trimmed
 
 
-# Wire format for the bearer token presented by the offloader is
-# ``{token_id}.{secret}``. Splitting on the dot lets the receiver
-# look up the candidate row by ``token_id`` (a future in-memory
-# index keyed off this field, built once at startup, gives O(1)
-# verification; the on-disk persistence is a list, but the hot
-# path doesn't scan it). The secret half is then compared
-# against ``StoredToken.secret_sha256`` via
-# ``hmac.compare_digest``. 8 random bytes for the id keeps it
-# short enough to type if a user ever has to and large enough
-# that the id alone reveals nothing usable; 32 random bytes for
-# the secret matches the entropy of a typical session token.
-# Both halves are base64url so the wire form has no
-# shell-quoting hazards.
-_TOKEN_ID_BYTES = 8
-_TOKEN_SECRET_BYTES = 32
+# Wire format for the bearer the offloader presents is
+# ``{token_id}.{secret}``: a fixed 11-char base64url ``token_id``
+# (the textual form of 8 random bytes — 64 bits, plenty against
+# birthday collisions at the ``_MAX_TOKENS = 100`` cap) plus a
+# 43-char base64url ``secret`` (the textual form of 32 random
+# bytes — 256 bits, infeasible to brute force). Both halves are
+# base64url so the wire form has no shell-quoting hazards.
+# ``_validate_token_id`` enforces the exact 11-char length so
+# the collision math stays load-bearing — without that pin, a
+# client could ship arbitrary-length ids and the backend's
+# bookkeeping would still work but the entropy guarantee
+# wouldn't.
+#
+# **The cleartext bearer is never sent to the backend.** The
+# frontend generates ``token_id`` + ``secret`` client-side
+# (``crypto.getRandomValues`` — the only acceptable source;
+# any fallback to ``Math.random`` or similar is a security
+# regression because the backend has no way to verify the
+# entropy of a hash, only its shape), computes
+# ``SHA-256(secret)`` locally, and POSTs
+# ``{label, token_id, secret_sha256}``. The backend stores only
+# the hash; the cleartext bearer stays on the user's screen
+# long enough to copy into the offloader, then discarded. This
+# closes the leak that would otherwise occur when the dashboard
+# is reachable on plain HTTP (for example a standalone
+# ``--host 0.0.0.0`` deployment without a reverse-proxy TLS
+# terminator).
 
 # Cap label length to keep ``list_tokens`` payloads bounded and
 # prevent a misbehaving frontend from accidentally storing a
@@ -201,11 +216,13 @@ _TOKEN_LABEL_MAX = 128
 
 # ``secrets.token_urlsafe`` emits the base64url alphabet only;
 # any other character means the caller is sending something that
-# isn't a token_id (most likely the full bearer or a typo). Cap
-# the length at a generous 64 to defend against a runaway
-# request body.
+# isn't a token_id (most likely the full bearer or a typo). Pin
+# the exact length to ``base64url(8 bytes) = 11`` so the
+# collision math stays load-bearing — a client that shipped
+# longer / shorter ids would still work for storage but the
+# 64-bit entropy guarantee wouldn't.
 _TOKEN_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
-_TOKEN_ID_MAX_CHARS = 64
+_TOKEN_ID_LEN = 11
 
 # Soft cap on the receiver-side token list so a misbehaving
 # frontend looping ``add_token`` can't grow the metadata file
@@ -240,19 +257,26 @@ def _validate_label(raw: object) -> str:
 
 def _validate_token_id(raw: object) -> str:
     """
-    Validate a user-supplied token_id (e.g. for ``remove_token``).
+    Validate a user-supplied token_id.
+
+    Pins the exact 11-char length so the 64-bit entropy
+    guarantee in the bearer-format docstring stays accurate;
+    the frontend's ``crypto.getRandomValues(new Uint8Array(8))``
+    + base64url encode produces 11 chars, and ``secrets.token_urlsafe(8)``
+    on the test side does the same. A shorter id shrinks the
+    namespace; a longer one isn't generated by any honest
+    client and almost certainly indicates the caller stuffed
+    extra data in.
+
+    Also rejects values containing ``.``: the bearer wire form
+    is ``{token_id}.{secret}``, so a value with a dot is most
+    likely the full bearer mistakenly passed instead of the id
+    half. Rejecting before the value lands in any error message
+    keeps the cleartext secret out of logs / DevTools / frontend
+    telemetry.
 
     Shape-checks only; the existence check happens in the mutator
     under the metadata lock so look-up and delete are atomic.
-
-    Also rejects values containing ``.``: the bearer wire form is
-    ``{token_id}.{secret}``, so a value with a dot is most likely
-    the full bearer mistakenly passed instead of the id half. The
-    error path serialises validation messages back over the WS,
-    and rejecting before the value lands in any error message
-    keeps the cleartext secret out of logs / DevTools / frontend
-    telemetry. The format check (base64url-only, length cap)
-    catches typos too.
     """
     if not isinstance(raw, str):
         msg = "token: 'token_id' must be a string"
@@ -267,8 +291,8 @@ def _validate_token_id(raw: object) -> str:
         # variable.
         msg = "token: 'token_id' must be the id half only, not the full bearer"
         raise CommandError(ErrorCode.INVALID_ARGS, msg)
-    if len(trimmed) > _TOKEN_ID_MAX_CHARS:
-        msg = f"token: 'token_id' must be at most {_TOKEN_ID_MAX_CHARS} characters"
+    if len(trimmed) != _TOKEN_ID_LEN:
+        msg = f"token: 'token_id' must be exactly {_TOKEN_ID_LEN} characters"
         raise CommandError(ErrorCode.INVALID_ARGS, msg)
     if not _TOKEN_ID_PATTERN.fullmatch(trimmed):
         msg = "token: 'token_id' must contain base64url characters only"
@@ -276,20 +300,33 @@ def _validate_token_id(raw: object) -> str:
     return trimmed
 
 
-def _generate_token() -> tuple[str, str, str]:
-    """
-    Mint a fresh ``(token_id, secret, secret_sha256)`` triple.
+_SECRET_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
-    ``token_id`` and ``secret`` are independent base64url strings
-    drawn from :func:`secrets.token_urlsafe`. The cleartext bearer
-    the caller hands to the offloader is ``{token_id}.{secret}``;
-    only ``secret_sha256`` lands on disk so a snapshot of
-    ``.device-builder.json`` can't be replayed as a valid bearer.
+
+def _validate_secret_sha256(raw: object) -> str:
     """
-    token_id = secrets.token_urlsafe(_TOKEN_ID_BYTES)
-    secret = secrets.token_urlsafe(_TOKEN_SECRET_BYTES)
-    secret_sha256 = hashlib.sha256(secret.encode("ascii")).hexdigest()
-    return token_id, secret, secret_sha256
+    Validate a client-supplied SHA-256 hash of the bearer secret half.
+
+    Must be exactly 64 lowercase hex chars (the textual form of
+    SHA-256). Catches frontend bugs that send the cleartext
+    secret instead of the hash, send an uppercase / mixed-case
+    digest, or send a different-length string.
+
+    The frontend computes ``sha256(secret)`` client-side so the
+    cleartext bearer never crosses the wire to the backend; the
+    backend persists only this hash. Defending against
+    malformed-input here is a sanity check, not a security
+    boundary — even a valid-shape hash with no matching cleartext
+    is just an unusable token row.
+    """
+    if not isinstance(raw, str):
+        msg = "token: 'secret_sha256' must be a string"
+        raise CommandError(ErrorCode.INVALID_ARGS, msg)
+    trimmed = raw.strip()
+    if not _SECRET_SHA256_PATTERN.fullmatch(trimmed):
+        msg = "token: 'secret_sha256' must be 64 lowercase hex characters"
+        raise CommandError(ErrorCode.INVALID_ARGS, msg)
+    return trimmed
 
 
 def _summarise_token(token: StoredToken) -> TokenSummary:
@@ -569,6 +606,50 @@ class RemoteBuildController:
         """
         return self._tokens_by_id.get(token_id)
 
+    async def bind_token_first_use(self, token_id: str, dashboard_id: str) -> StoredToken | None:
+        """
+        Atomically bind ``token_id`` to ``dashboard_id`` on first authenticated use.
+
+        Returns the post-write :class:`StoredToken` (with
+        ``bound_dashboard_id`` populated), or ``None`` if the
+        token has been removed in the meantime.
+
+        Idempotent: if the token is already bound, the existing
+        ``bound_dashboard_id`` is preserved and the call is a
+        no-op write. Two concurrent first-use requests with
+        different ``dashboard_id`` values race for the slot; the
+        winner's id sticks, the loser's call returns the
+        winner-bound token. Callers compare the returned
+        ``bound_dashboard_id`` against the value they presented
+        to detect a race-loss → 403 mismatch.
+
+        Phase-3b2's auth middleware is the only caller. The
+        write hops through ``run_in_executor`` because the
+        underlying ``metadata_transaction`` is sync filesystem
+        I/O.
+        """
+
+        def _bind(settings: RemoteBuildSettings) -> StoredToken | None:
+            for token in settings.tokens:
+                if token.token_id != token_id:
+                    continue
+                if token.bound_dashboard_id is None:
+                    token.bound_dashboard_id = dashboard_id
+                return token
+            return None
+
+        captured: list[StoredToken | None] = []
+
+        def _capture(settings: RemoteBuildSettings) -> None:
+            captured.append(_bind(settings))
+
+        # ``_modify_settings`` either runs the mutator exactly
+        # once and returns, or it raises (which propagates).
+        # Either way ``captured`` has length 1 on the success
+        # path; ``[0]`` is safe.
+        await self._modify_settings(_capture)
+        return captured[0]
+
     @api_command("remote_build/set_settings")
     async def set_settings(self, *, enabled: bool, **kwargs: Any) -> RemoteBuildSettingsView:
         """
@@ -677,11 +758,12 @@ class RemoteBuildController:
         Return every issued bearer token, by ``TokenSummary``.
 
         ``TokenSummary`` rows never carry the secret hash; the
-        cleartext bearer flashes through ``add_token``'s response
-        once at create time and isn't recoverable from disk after
-        that. The frontend renders the token_id + label + bound
-        dashboard_id (if any) so the operator can audit which
-        peers are paired.
+        cleartext bearer is generated client-side at
+        ``add_token`` time and never crosses the wire to the
+        backend, so this list intentionally has no path to
+        recover it. The frontend renders the token_id + label +
+        bound dashboard_id (if any) so the operator can audit
+        which peers are paired.
         """
         loop = asyncio.get_running_loop()
         settings = await loop.run_in_executor(
@@ -690,23 +772,38 @@ class RemoteBuildController:
         return [_summarise_token(token) for token in settings.tokens]
 
     @api_command("remote_build/add_token")
-    async def add_token(self, *, label: str, **kwargs: Any) -> TokenCreateResult:
+    async def add_token(
+        self, *, label: str, token_id: str, secret_sha256: str, **kwargs: Any
+    ) -> TokenSummary:
         """
-        Issue a fresh bearer token under the given label.
+        Register a client-generated bearer token under *label*.
 
-        Returns :class:`TokenCreateResult` with the cleartext
-        ``bearer`` field; that's the ONE chance the user has to
-        copy the cleartext to the offloader. A subsequent
-        ``list_tokens`` returns ``TokenSummary`` rows that don't
-        carry the secret. If the operator loses the bearer, the
-        only recovery is to remove the token and issue a new one.
+        The CLIENT generates ``token_id`` + the cleartext secret,
+        computes ``SHA-256(secret)`` locally, and submits
+        ``{label, token_id, secret_sha256}``. The cleartext bearer
+        never crosses the wire to the backend; only the hash is
+        persisted. The frontend keeps the cleartext on screen
+        long enough for the user to copy it into the offloader,
+        then discards it.
+
+        This wire shape closes the leak that would otherwise
+        occur on plain-HTTP standalone deployments: the bearer
+        is never present in any backend log, response, or stored
+        request body. ``list_tokens`` returns
+        :class:`TokenSummary` rows that don't carry the hash;
+        if the user loses the cleartext, the only recovery is
+        to remove the token and register a fresh one.
 
         Duplicate labels are allowed (``token_id`` is the unique
         key); a user may legitimately want two tokens both
-        labelled "Green" or "phone".
+        labelled "Green". Duplicate ``token_id`` is rejected
+        with ``ALREADY_EXISTS`` — the client should retry with a
+        freshly-generated id (collision is improbable at 64
+        bits but not impossible at the soft cap).
         """
         clean_label = _validate_label(label)
-        token_id, secret, secret_sha256 = _generate_token()
+        clean_token_id = _validate_token_id(token_id)
+        clean_secret_sha256 = _validate_secret_sha256(secret_sha256)
         created_at = time.time()
 
         def _add(settings: RemoteBuildSettings) -> None:
@@ -716,21 +813,27 @@ class RemoteBuildController:
                     "remove an unused token before issuing a new one"
                 )
                 raise CommandError(ErrorCode.INVALID_ARGS, msg)
+            for existing in settings.tokens:
+                if existing.token_id == clean_token_id:
+                    # Don't echo the token_id (already in the
+                    # caller's hand; not a credential, but no
+                    # need to mirror it back through error logs).
+                    msg = "token_id collides with an existing token; retry with a fresh id"
+                    raise CommandError(ErrorCode.ALREADY_EXISTS, msg)
             settings.tokens.append(
                 StoredToken(
-                    token_id=token_id,
+                    token_id=clean_token_id,
                     label=clean_label,
-                    secret_sha256=secret_sha256,
+                    secret_sha256=clean_secret_sha256,
                     created_at=created_at,
                 )
             )
 
         await self._modify_settings(_add)
-        return TokenCreateResult(
-            token_id=token_id,
+        return TokenSummary(
+            token_id=clean_token_id,
             label=clean_label,
             created_at=created_at,
-            bearer=f"{token_id}.{secret}",
         )
 
     @api_command("remote_build/remove_token")
