@@ -60,6 +60,7 @@ from ...helpers.peer_link_noise import (
     pin_sha256_for_pubkey,
 )
 from ...models import (
+    PAIRING_VERSION_MAX_LEN,
     ArtifactsChunkFrameData,
     ArtifactsEndFrameData,
     ArtifactsStartFrameData,
@@ -189,6 +190,42 @@ class InitiatorRoundTrip:
     intent_response: str
     remote_static_pub: bytes
     response: dict[str, Any]
+
+
+def _extract_receiver_esphome_version(response: dict[str, Any]) -> str:
+    """Lift ``esphome_version`` off the post-handshake response.
+
+    The receiver populates the field on every ``intent_response``
+    payload (see :func:`controllers.remote_build.peer_link._send_response`)
+    so the offloader can land it on
+    :attr:`StoredPairing.esphome_version` and pick_build_path's
+    deferred version-compat gate (7a-2) can read it without an
+    extra round-trip.
+
+    Returns:
+        The receiver's ``esphome.const.__version__`` as a string,
+        or ``""`` when the field is missing (older receiver
+        predating this wire change), not a string (malformed
+        response from a buggy peer), or exceeds
+        :data:`PAIRING_VERSION_MAX_LEN` (a malicious / buggy
+        peer trying to poison the sidecar — the
+        :class:`StoredPairing` validator caps at the same length
+        on disk-load, so a longer value would persist through
+        the in-memory mutation path and then fail the next load
+        of the persisted sidecar). The cap mirrors the validator
+        so the wire seam and the disk seam can't drift apart.
+
+    Empty flows through as "unknown" — pick_build_path's gate
+    treats unknown as compatible (silent-fallback semantic; the
+    operator opted in to remote builds, refusing on the unknown
+    case would be more surprising than the alternative).
+    """
+    value = response.get("esphome_version", "")
+    if not isinstance(value, str):
+        return ""
+    if len(value) > PAIRING_VERSION_MAX_LEN:
+        return ""
+    return value
 
 
 def _build_ws_url(hostname: str, port: int) -> URL:
@@ -1493,6 +1530,9 @@ class PeerLinkClient:
                     )
                     self._last_connect_error = "auth rejected"
                     return _LOCAL_CLOSE_AUTH_REJECTED
+                # Lift the receiver's ``esphome_version`` off the
+                # response so OPENED carries it onto the bus.
+                receiver_version = _extract_receiver_esphome_version(response)
                 # Session is live — build the shared channel
                 # over (noise, ws), fire OPENED, park on the
                 # receive loop with a heartbeat task running
@@ -1511,7 +1551,7 @@ class PeerLinkClient:
                 )
                 self._session_was_opened = True
                 self._last_connect_error = ""
-                self._fire_opened()
+                self._fire_opened(esphome_version=receiver_version)
                 try:
                     return await self._run_session_loops(channel)
                 except asyncio.CancelledError:
@@ -1969,11 +2009,12 @@ class PeerLinkClient:
             DownloadArtifactsResult(tarball=tarball, firmware_offset=state.firmware_offset)
         )
 
-    def _fire_opened(self) -> None:
+    def _fire_opened(self, *, esphome_version: str = "") -> None:
         payload: OffloaderPeerLinkOpenedData = {
             "receiver_hostname": self._hostname,
             "receiver_port": self._port,
             "pin_sha256": self._pin_sha256,
+            "esphome_version": esphome_version,
         }
         self._bus.fire(EventType.OFFLOADER_PEER_LINK_OPENED, payload)
 

@@ -57,6 +57,7 @@ from esphome_device_builder.controllers.remote_build.peer_link_client import (
     SubmitJobTimeoutError,
     _build_ws_url,
     _DownloadArtifactsState,
+    _extract_receiver_esphome_version,
     drive_initiator_round_trip,
     preview_pair,
     request_pair,
@@ -78,6 +79,7 @@ from esphome_device_builder.helpers.peer_link_noise import (
     pin_sha256_for_pubkey,
 )
 from esphome_device_builder.models import (
+    PAIRING_VERSION_MAX_LEN,
     ErrorCode,
     EventType,
     IntentResponse,
@@ -1114,6 +1116,7 @@ async def test_offloader_peer_link_event_listeners_update_open_set(
         "receiver_hostname": "host.local",
         "receiver_port": 6055,
         "pin_sha256": pin,
+        "esphome_version": "",
     }
     offloader._on_offloader_peer_link_opened(MagicMock(data=opened))
     assert pin in offloader._open_peer_links
@@ -1133,6 +1136,156 @@ async def test_offloader_peer_link_event_listeners_update_open_set(
     # listener is ready.
     offloader._on_offloader_peer_link_closed(MagicMock(data=closed))
     assert pin not in offloader._open_peer_links
+
+
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        ({"esphome_version": "2026.5.0"}, "2026.5.0"),
+        # Older receiver predating the wire change.
+        ({}, ""),
+        # Malformed: non-string value. Defense-in-depth gate
+        # returns empty rather than letting a type error propagate
+        # into StoredPairing's validator.
+        ({"esphome_version": 12345}, ""),
+        ({"esphome_version": None}, ""),
+        ({"esphome_version": {"nested": "shape"}}, ""),
+        # At the cap: 64-char version exactly matches the
+        # validator's max; flows through unchanged.
+        ({"esphome_version": "x" * PAIRING_VERSION_MAX_LEN}, "x" * PAIRING_VERSION_MAX_LEN),
+        # One past the cap: a buggy / malicious receiver trying
+        # to poison the sidecar. The wire seam returns empty
+        # rather than firing OPENED with an oversize value that
+        # would survive the in-memory mutation path and then
+        # fail the next StoredPairing.from_dict on a real disk
+        # load.
+        ({"esphome_version": "x" * (PAIRING_VERSION_MAX_LEN + 1)}, ""),
+    ],
+)
+def test_extract_receiver_esphome_version_branches(response: dict[str, Any], expected: str) -> None:
+    """Helper handles missing / non-string / oversize / valid response shapes.
+
+    Pins the post-handshake response → ``StoredPairing.esphome_version``
+    seam: a valid string flows through unchanged; missing field
+    (older receiver), malformed shapes (non-string from a buggy
+    peer), and oversize strings (peer-controlled wire data that
+    exceeds the validator's cap) all fall back to empty so
+    pick_build_path's compat gate sees "unknown" rather than
+    propagating into the next StoredPairing load and poisoning
+    the sidecar.
+    """
+    assert _extract_receiver_esphome_version(response) == expected
+
+
+@pytest.mark.asyncio
+async def test_peer_link_opened_refreshes_stored_pairing_version(
+    offloader_controller_dir: Path,
+) -> None:
+    """``OFFLOADER_PEER_LINK_OPENED`` payload's ``esphome_version`` lands on the pairing.
+
+    Pins the unblocker for pick_build_path's deferred
+    version-compat gate: the receiver advertises its
+    :data:`esphome.const.__version__` on the post-handshake
+    ``intent_response`` body, the offloader's
+    :class:`PeerLinkClient` lifts it onto the OPENED event,
+    and the controller's listener updates
+    :attr:`StoredPairing.esphome_version` for the matching
+    pin. A subsequent OPENED with a different version
+    (receiver upgraded between reconnects) overwrites; an
+    OPENED carrying empty ``esphome_version`` (older receiver
+    predating this wire change) leaves the stored value alone
+    so a mixed-version rollout doesn't lose the captured
+    version on a reconnect from the older half.
+    """
+    offloader = _make_offloader_controller(config_dir=offloader_controller_dir)
+    offloader._db.bus = MagicMock()
+    pin = "a" * 64
+    pairing = _stub_pairing(
+        receiver_hostname="rcv.local",
+        receiver_port=6055,
+        pin_sha256=pin,
+        status=PeerStatus.APPROVED,
+    )
+    offloader._pairings[pin] = pairing
+    offloader._pairings_save_scheduled = False
+
+    # Mock the save scheduler so the test doesn't have to
+    # stand up the Store; we just want to see it was called
+    # when a real update happens, and NOT called on a no-op.
+    save_calls: list[None] = []
+    offloader._schedule_pairings_save = lambda: save_calls.append(None)  # type: ignore[method-assign]
+
+    def _opened(version: str) -> Any:
+        payload: OffloaderPeerLinkOpenedData = {
+            "receiver_hostname": "rcv.local",
+            "receiver_port": 6055,
+            "pin_sha256": pin,
+            "esphome_version": version,
+        }
+        return MagicMock(data=payload)
+
+    # First OPENED: captures the receiver's version + schedules a save.
+    offloader._on_offloader_peer_link_opened(_opened("2026.5.0"))
+    assert pairing.esphome_version == "2026.5.0"
+    assert len(save_calls) == 1
+
+    # Same-version reconnect: cache-hit, no redundant save.
+    offloader._on_offloader_peer_link_opened(_opened("2026.5.0"))
+    assert pairing.esphome_version == "2026.5.0"
+    assert len(save_calls) == 1
+
+    # Receiver upgrade: new version overwrites + schedules save.
+    offloader._on_offloader_peer_link_opened(_opened("2026.6.0"))
+    assert pairing.esphome_version == "2026.6.0"
+    assert len(save_calls) == 2
+
+    # Older receiver (or malformed response) reconnect with
+    # empty version: leave the stored value alone so a mixed-
+    # version rollout doesn't lose the captured version.
+    offloader._on_offloader_peer_link_opened(_opened(""))
+    assert pairing.esphome_version == "2026.6.0"
+    assert len(save_calls) == 2
+
+    # Oversize version (peer-controlled wire data exceeding the
+    # StoredPairing validator's cap): the listener-side guard
+    # rejects so the in-memory mutation path can't persist a
+    # value that the disk-load validator would reject on the
+    # next start. Wire seam already filters in
+    # _extract_receiver_esphome_version; the listener gate is
+    # defense-in-depth for any other future fire site of the
+    # same event.
+    offloader._on_offloader_peer_link_opened(_opened("x" * (PAIRING_VERSION_MAX_LEN + 1)))
+    assert pairing.esphome_version == "2026.6.0"
+    assert len(save_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_peer_link_opened_for_unknown_pin_is_silent_no_op(
+    offloader_controller_dir: Path,
+) -> None:
+    """An OPENED event for a pin not in ``_pairings`` doesn't raise or schedule a save.
+
+    Defense-in-depth: an OPENED firing after the matching
+    pairing was just removed (operator unpair concurrent with
+    a session-open the WS layer hadn't torn down yet) would
+    otherwise blow up on the ``_pairings.get(pin)`` lookup
+    returning ``None``. The listener's ``is None`` gate
+    short-circuits silently — same shape the CLOSED handler
+    uses ``set.discard`` for.
+    """
+    offloader = _make_offloader_controller(config_dir=offloader_controller_dir)
+    offloader._db.bus = MagicMock()
+    save_calls: list[None] = []
+    offloader._schedule_pairings_save = lambda: save_calls.append(None)  # type: ignore[method-assign]
+
+    payload: OffloaderPeerLinkOpenedData = {
+        "receiver_hostname": "rcv.local",
+        "receiver_port": 6055,
+        "pin_sha256": "a" * 64,
+        "esphome_version": "2026.5.0",
+    }
+    offloader._on_offloader_peer_link_opened(MagicMock(data=payload))
+    assert len(save_calls) == 0
 
 
 @pytest.mark.asyncio
