@@ -377,6 +377,83 @@ class _PairLabelField(StrEnum):
     OFFLOADER_LABEL = "offloader_label"
 
 
+class _RebindProbeOutcome(StrEnum):
+    """Typed outcome of :meth:`RemoteBuildController._probe_pairing_endpoint`.
+
+    The probe is shared between mDNS-driven auto-rebind (4a-o
+    part 7) and user-driven manual edit (8b); each caller maps
+    the outcome onto its own surface (silent log + cooldown for
+    auto, typed :class:`CommandError` for the WS-driven user
+    path). The enum factors out the four distinct probe
+    failure modes so the surface mapping lives at the call site
+    instead of in a per-caller bespoke probe body.
+    """
+
+    OK = "ok"
+    UNREACHABLE = "unreachable"
+    PIN_MISMATCH = "pin_mismatch"
+    PAIRING_REPLACED = "pairing_replaced"
+    STATUS_CHANGED = "status_changed"
+
+
+@_dataclass(frozen=True, slots=True)
+class _RebindProbeResult:
+    """Result of :meth:`RemoteBuildController._probe_pairing_endpoint`.
+
+    *observed_pin* is populated only on
+    :attr:`_RebindProbeOutcome.PIN_MISMATCH` (so the caller's
+    error surface can name which identity answered at the
+    candidate endpoint); *transport_error* is populated only
+    on :attr:`_RebindProbeOutcome.UNREACHABLE` (the
+    :class:`PeerLinkClientError` instance, kept as the
+    exception itself so the auto-rebind path's debug log can
+    pass it as ``exc_info=`` to preserve the traceback while
+    the user-driven path can ``str()`` it for the
+    :class:`CommandError` message).
+    """
+
+    outcome: _RebindProbeOutcome
+    observed_pin: str = ""
+    transport_error: PeerLinkClientError | None = None
+
+
+# Dispatch table mapping a non-OK probe outcome to the typed
+# :class:`CommandError` shape :meth:`edit_pairing_endpoint`
+# raises for it. Each entry is ``(error_code, message_template)``;
+# the template uses ``str.format`` with the keyword args
+# ``host`` / ``port`` / ``pin`` / ``observed`` / ``error`` (all
+# pre-formatted at call time so the templates stay declarative).
+# Keeps the four probe-failure raise sites in
+# :meth:`edit_pairing_endpoint` collapsed to one ``raise`` instead
+# of four near-identical ``if … raise`` blocks.
+_EDIT_PAIRING_PROBE_ERRORS: dict[_RebindProbeOutcome, tuple[ErrorCode, str]] = {
+    _RebindProbeOutcome.UNREACHABLE: (
+        ErrorCode.UNAVAILABLE,
+        "edit_pairing_endpoint: {host}:{port} unreachable: {error}",
+    ),
+    _RebindProbeOutcome.PIN_MISMATCH: (
+        # Different identity at the new coords. Leaves the
+        # stored pairing untouched — the user's existing trust
+        # is keyed on the original pin; substituting a fresh
+        # pubkey under that trust is the case 8a's re-auth
+        # wizard exists specifically to gate. The message
+        # carries both observed and stored pin so the dialog
+        # can render the "different identity at this endpoint"
+        # copy and route the user to re-pair.
+        ErrorCode.PRECONDITION_FAILED,
+        "edit_pairing_endpoint: {host}:{port} answers with pin {observed!r}, not stored {pin!r}",
+    ),
+    _RebindProbeOutcome.PAIRING_REPLACED: (
+        ErrorCode.NOT_FOUND,
+        "edit_pairing_endpoint: pairing for pin_sha256={pin!r} changed during probe; please retry",
+    ),
+    _RebindProbeOutcome.STATUS_CHANGED: (
+        ErrorCode.PRECONDITION_FAILED,
+        "edit_pairing_endpoint: pairing status changed during probe",
+    ),
+}
+
+
 def _validate_hostname(
     raw: object, *, context: _HostFieldContext = _HostFieldContext.RECEIVER
 ) -> str:
@@ -1999,6 +2076,87 @@ class RemoteBuildController:
             self._serialize_pairings, delay=_PAIRINGS_SAVE_DELAY_SECONDS
         )
 
+    async def _probe_pairing_endpoint(
+        self,
+        *,
+        pairing: StoredPairing,
+        new_hostname: str,
+        new_port: int,
+    ) -> _RebindProbeResult:
+        """Probe + identity-verify a candidate endpoint without mutating state.
+
+        Caller-agnostic primitive shared by
+        :meth:`_probe_and_rebind_endpoint` (mDNS-driven
+        auto-rebind, 4a-o part 7) and :meth:`edit_pairing_endpoint`
+        (user-driven manual rebind, 8b). Each caller maps the
+        typed outcome onto its own surface — silent log + cooldown
+        for the auto path, typed :class:`CommandError` for the
+        WS-driven user path.
+
+        The probe runs one ``intent="preview"`` Noise XX
+        round-trip via :func:`peer_link_preview_pair`. Three
+        roles in a single network call:
+
+        * **Reachability check** — TCP connect + Noise handshake
+          completing means the new endpoint is up. Any connect /
+          timeout / decode error returns
+          :attr:`_RebindProbeOutcome.UNREACHABLE`.
+        * **Identity verification** — Noise XX binds the
+          responder's static X25519 pubkey into the handshake
+          transcript. A mismatch against the stored pin returns
+          :attr:`_RebindProbeOutcome.PIN_MISMATCH`.
+        * **Race-safe re-check** — the dict entry may have
+          been replaced by a concurrent ``unpair`` / ``request_pair``
+          while the probe was in flight. Identity-equality check
+          on the captured ``pairing`` reference returns
+          :attr:`_RebindProbeOutcome.PAIRING_REPLACED` if the
+          dict no longer points at the same object, or
+          :attr:`_RebindProbeOutcome.STATUS_CHANGED` if the
+          row's ``status`` flipped away from APPROVED.
+
+        Callers pre-check ``self._offloader_peer_link_priv is
+        not None``; the assert here narrows for the type
+        checker.
+        """
+        assert self._offloader_peer_link_priv is not None
+        try:
+            observed_pin = await peer_link_preview_pair(
+                hostname=new_hostname,
+                port=new_port,
+                identity_priv=self._offloader_peer_link_priv,
+            )
+        except PeerLinkClientError as exc:
+            return _RebindProbeResult(_RebindProbeOutcome.UNREACHABLE, transport_error=exc)
+        if observed_pin != pairing.pin_sha256:
+            return _RebindProbeResult(_RebindProbeOutcome.PIN_MISMATCH, observed_pin=observed_pin)
+        current = self._pairings.get(pairing.pin_sha256)
+        if current is not pairing:
+            return _RebindProbeResult(_RebindProbeOutcome.PAIRING_REPLACED)
+        if current.status is not PeerStatus.APPROVED:
+            return _RebindProbeResult(_RebindProbeOutcome.STATUS_CHANGED)
+        return _RebindProbeResult(_RebindProbeOutcome.OK)
+
+    def _commit_endpoint_rebind(self, pairing: StoredPairing, *, hostname: str, port: int) -> None:
+        """Mutate *pairing* to (*hostname*, *port*) and run the rebind epilogue.
+
+        Same epilogue both rebind callers (auto-rebind / user-
+        driven edit) use: schedule the debounced save, cancel +
+        respawn the peer-link client, fire
+        :attr:`EventType.OFFLOADER_PAIR_ENDPOINT_REBOUND`, and
+        clear any per-pin auto-probe cooldown that an earlier
+        failed mDNS-driven probe may have seeded — a successful
+        rebind through either path means the endpoint is live
+        again, so the next mDNS Updated for the same pin should
+        probe immediately rather than wait the cooldown out.
+        Caller is responsible for the probe + identity verify
+        before calling this — no in-helper checks.
+        """
+        pairing.receiver_hostname = hostname
+        pairing.receiver_port = port
+        self._schedule_pairings_save()
+        self._respawn_peer_link_at_new_endpoint(pairing)
+        self._rebind_probe_until.pop(pairing.pin_sha256, None)
+
     def _respawn_peer_link_at_new_endpoint(self, pairing: StoredPairing) -> None:
         """Cancel + respawn the peer-link client and announce the new endpoint.
 
@@ -2105,49 +2263,40 @@ class RemoteBuildController:
         """
         pin = pairing.pin_sha256
         with self._clear_cooldown_on_unexpected_exit(pin):
-            assert self._offloader_peer_link_priv is not None  # narrowed by caller
-            try:
-                observed_pin = await peer_link_preview_pair(
-                    hostname=new_hostname,
-                    port=new_port,
-                    identity_priv=self._offloader_peer_link_priv,
-                )
-            except PeerLinkClientError:
+            result = await self._probe_pairing_endpoint(
+                pairing=pairing, new_hostname=new_hostname, new_port=new_port
+            )
+            if result.outcome is _RebindProbeOutcome.UNREACHABLE:
+                # Pass the captured ``PeerLinkClientError`` as
+                # ``exc_info=`` so the debug log carries the
+                # full traceback for diagnosing handshake /
+                # connect failures in the field — same shape
+                # the inline ``except`` block had before this
+                # path was factored into ``_probe_pairing_endpoint``.
                 _LOGGER.debug(
                     "rebind probe %s -> %s:%d failed (unreachable / handshake error)",
                     pin,
                     new_hostname,
                     new_port,
-                    exc_info=True,
+                    exc_info=result.transport_error,
                 )
                 return
-            if observed_pin != pin:
+            if result.outcome is _RebindProbeOutcome.PIN_MISMATCH:
                 _LOGGER.warning(
                     "rebind probe %s -> %s:%d observed pin %s; ignoring (spoof or rotation)",
                     pin,
                     new_hostname,
                     new_port,
-                    observed_pin,
+                    result.observed_pin,
                 )
                 return
-            # Identity check on the dict entry, not just presence:
-            # ``unpair`` may have dropped the row, or a fresh
-            # ``request_pair`` against the same pin (re-pair under
-            # the same identity) replaces the entry with a new
-            # :class:`StoredPairing` object via
-            # :meth:`_upsert_pairing`. Either way the probe
-            # outcome is stale relative to what's now in the dict;
-            # mutating it would clobber the user's current state.
-            current = self._pairings.get(pin)
-            if current is not pairing:
+            if result.outcome is not _RebindProbeOutcome.OK:
+                # PAIRING_REPLACED / STATUS_CHANGED — silent skip;
+                # cooldown stays in place so a burst of mDNS
+                # Updated callbacks doesn't re-fire the probe
+                # against state that's already moved on.
                 return
-            if current.status is not PeerStatus.APPROVED:
-                return
-            current.receiver_hostname = new_hostname
-            current.receiver_port = new_port
-            self._schedule_pairings_save()
-            self._respawn_peer_link_at_new_endpoint(current)
-            self._rebind_probe_until.pop(pin, None)
+            self._commit_endpoint_rebind(pairing, hostname=new_hostname, port=new_port)
             _LOGGER.info("rebound pairing %s to %s:%d", pin, new_hostname, new_port)
 
     @contextmanager
@@ -2696,6 +2845,132 @@ class RemoteBuildController:
         # present (PENDING removal, never-connected APPROVED).
         self._open_peer_links.discard(key)
         return {"removed": True}
+
+    @api_command("remote_build/edit_pairing_endpoint")
+    async def edit_pairing_endpoint(
+        self,
+        *,
+        pin_sha256: str,
+        hostname: str,
+        port: int,
+        **kwargs: Any,
+    ) -> PairingSummary:
+        """Manually rebind *pin_sha256*'s pairing onto new (*hostname*, *port*) coords.
+
+        User-driven analog of 4a-o part 7's mDNS auto-rebind, for
+        the cases the auto-rebind can't catch: cross-subnet
+        receivers (no mDNS path), mDNS disabled on the
+        receiver's host, the receiver moved to a hostname the
+        offloader's network can resolve but mDNS doesn't
+        broadcast.
+
+        Same trust model as the auto-rebind: a one-shot
+        :func:`peer_link_preview_pair` probe verifies the new
+        endpoint is reachable AND answers with the same pin
+        :class:`StoredPairing` was paired against. The probe
+        replaces the entire identity-verification gate — we
+        deliberately don't fall through to the normal peer-link
+        client retry loop on a pin mismatch, since accepting a
+        new identity under the user's existing trust is
+        precisely what 8a's re-auth wizard is for.
+
+        Args:
+            pin_sha256: Identity of the existing pairing — RAM
+                key (not the routing coordinates, which are what
+                we're updating).
+            hostname: New routing host (validated as for manual
+                hosts via :func:`_validate_hostname`: non-empty,
+                ≤255 chars, trimmed + ``str.lower``-normalised
+                so the stored value's case is consistent. The
+                trailing-dot / FQDN-form folding the
+                no-op-edit guard cares about happens inside
+                :func:`_endpoints_equal`'s
+                :func:`normalize_hostname` call at compare time
+                only; the value persisted on
+                :class:`StoredPairing.receiver_hostname` keeps
+                the trim + lowercase shape the validator
+                returned, matching what :meth:`request_pair`
+                writes.
+            port: New peer-link port (1-65535, non-bool).
+
+        Returns:
+            Updated :class:`PairingSummary` projection of the
+            re-routed row. ``connected`` typically reads
+            ``False`` at return time — the new
+            :class:`PeerLinkClient` task spawned by
+            :meth:`_respawn_peer_link_at_new_endpoint` is still
+            running its handshake; the
+            :attr:`EventType.OFFLOADER_PEER_LINK_OPENED` event
+            that follows flips it to ``True`` once the session
+            opens.
+
+        Raises:
+            :class:`CommandError(INVALID_ARGS)` for bad inputs.
+            :class:`CommandError(NOT_FOUND)` if no pairing
+                exists for *pin_sha256*, or the pairing dropped
+                mid-probe.
+            :class:`CommandError(PRECONDITION_FAILED)` if the
+                pairing isn't APPROVED, the offloader-side
+                identity hasn't loaded yet, the new endpoint
+                matches the current one (no-op), or the probe
+                lands at a different identity (pin mismatch:
+                the user must re-pair through the regular pair
+                flow if they actually want to switch identities).
+            :class:`CommandError(UNAVAILABLE)` if the new
+                endpoint is unreachable / the Noise XX
+                handshake fails — leaves the stored pairing
+                untouched so a retry against the correct coords
+                lands cleanly.
+        """
+        pin = _validate_pin_sha256(pin_sha256)
+        clean_host = _validate_hostname(hostname, context=_HostFieldContext.RECEIVER)
+        clean_port = _validate_port(port, context=_HostFieldContext.RECEIVER)
+
+        pairing = self._pairings.get(pin)
+        if pairing is None:
+            msg = f"edit_pairing_endpoint: no pairing for pin_sha256={pin!r}"
+            raise CommandError(ErrorCode.NOT_FOUND, msg)
+        if pairing.status is not PeerStatus.APPROVED:
+            msg = f"edit_pairing_endpoint: pairing status is {pairing.status.value!r}, not APPROVED"
+            raise CommandError(ErrorCode.PRECONDITION_FAILED, msg)
+        # System-readiness check before user-input semantics:
+        # surface "identity not loaded yet" distinctly rather
+        # than a confusing "matches current" error when a user
+        # happens to hit Save with unchanged coords during
+        # startup.
+        if self._offloader_peer_link_priv is None:
+            msg = "edit_pairing_endpoint: offloader peer-link identity not loaded yet"
+            raise CommandError(ErrorCode.PRECONDITION_FAILED, msg)
+        if _endpoints_equal(
+            pairing.receiver_hostname, pairing.receiver_port, clean_host, clean_port
+        ):
+            msg = f"edit_pairing_endpoint: new endpoint matches current ({clean_host}:{clean_port})"
+            raise CommandError(ErrorCode.PRECONDITION_FAILED, msg)
+
+        result = await self._probe_pairing_endpoint(
+            pairing=pairing, new_hostname=clean_host, new_port=clean_port
+        )
+        if result.outcome is not _RebindProbeOutcome.OK:
+            # Table-driven dispatch: every non-OK probe outcome
+            # maps to a typed :class:`CommandError` via
+            # :data:`_EDIT_PAIRING_PROBE_ERRORS`. Templates take
+            # all five format keys; unused ones are ignored by
+            # :meth:`str.format`. Keeps the rationale for each
+            # failure mode at the table site instead of buried
+            # in a four-branch chain.
+            code, template = _EDIT_PAIRING_PROBE_ERRORS[result.outcome]
+            raise CommandError(
+                code,
+                template.format(
+                    host=clean_host,
+                    port=clean_port,
+                    pin=pin,
+                    observed=result.observed_pin,
+                    error=result.transport_error,
+                ),
+            )
+        self._commit_endpoint_rebind(pairing, hostname=clean_host, port=clean_port)
+        return self._pairing_summary_for(pairing)
 
     async def _validate_submit_job_config(self, configuration: object) -> tuple[str, Path]:
         """Validate the WS *configuration* arg, return ``(name, yaml_path)``.
