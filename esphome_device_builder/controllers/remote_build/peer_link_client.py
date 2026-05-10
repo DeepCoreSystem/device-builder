@@ -56,6 +56,7 @@ from ...helpers.peer_link_noise import (
     pin_sha256_for_pubkey,
 )
 from ...models import (
+    CancelJobFrameData,
     EventType,
     IntentResponse,
     JobOutputFrameData,
@@ -697,15 +698,24 @@ _JOB_STATE_CHANGED_VALID_STATUS: frozenset[str] = frozenset(
 _JOB_OUTPUT_VALID_STREAM: frozenset[str] = frozenset({"stdout", "stderr"})
 
 
-class SubmitJobNoSessionError(RuntimeError):
-    """Raised by :meth:`PeerLinkClient.submit_job` when no live session exists.
+class PeerLinkNoSessionError(RuntimeError):
+    """Raised when a peer-link application send needs a live session and there isn't one.
 
-    The peer-link session must be open (post-handshake, dispatch
-    loop parked) before any ``submit_job`` flow can fire. The WS
-    command on the controller side maps this to a typed
-    ``CommandError`` so the frontend can branch on
-    "peer is paired but currently disconnected" vs. "submit
-    rejected by the receiver."
+    Used by every :class:`PeerLinkClient` sender that requires
+    the post-handshake dispatch loop to be parked:
+    :meth:`PeerLinkClient.submit_job` (phase 5c-3) and
+    :meth:`PeerLinkClient.cancel_job` (phase 5d). The check
+    funnels through :meth:`PeerLinkClient._require_open_channel`,
+    so a future application-message sender that calls
+    ``_require_open_channel`` inherits the same exception
+    automatically.
+
+    The WS command on the controller side maps this to a typed
+    ``CommandError(PRECONDITION_FAILED)`` so the frontend can
+    branch on "peer is paired but currently disconnected" vs.
+    "send rejected by the receiver." Same error code at every
+    call site — the user's recovery (wait for reconnect, retry)
+    doesn't depend on which sender raised.
     """
 
 
@@ -845,7 +855,7 @@ class PeerLinkClient:
         # parks, cleared in the same method's ``finally`` after
         # the loop exits. :meth:`submit_job` reads this to know
         # whether a session is live (raising
-        # :class:`SubmitJobNoSessionError` if not) and to drive
+        # :class:`PeerLinkNoSessionError` if not) and to drive
         # the chunk send through the same channel the receive
         # loop is parked on. Only one writer (the run task) and
         # one reader (the controller's WS submit handler), both
@@ -929,7 +939,7 @@ class PeerLinkClient:
         (:mod:`controllers.remote_build.submit_job`):
 
         1. Validate a session is live; raise
-           :class:`SubmitJobNoSessionError` if not.
+           :class:`PeerLinkNoSessionError` if not.
         2. Compute the bundle's SHA-256 + chunk count.
         3. Register a per-``job_id`` ack future on
            :attr:`_submit_job_acks` BEFORE the header goes out
@@ -958,7 +968,7 @@ class PeerLinkClient:
         ack futures separate, and :class:`PeerLinkChannel` holds
         the send lock that serialises wire encrypts. Same-
         ``job_id`` re-entry inside one session is rejected as
-        :class:`SubmitJobNoSessionError` (a leftover ack future
+        :class:`PeerLinkNoSessionError` (a leftover ack future
         signals the previous flow hasn't completed); the WS
         layer should generate a fresh ``job_id`` per submit.
 
@@ -983,20 +993,47 @@ class PeerLinkClient:
         finally:
             self._submit_job_acks.pop(job_id, None)
 
-    def _require_open_channel(self, *, label: str) -> PeerLinkChannel:
-        """Return the live :class:`PeerLinkChannel` or raise :class:`SubmitJobNoSessionError`.
+    async def cancel_job(self, *, job_id: str) -> bool:
+        """Send a ``cancel_job`` frame for *job_id* over the live session (5d).
 
-        ``label`` is folded into the exception message so the
-        caller (today: ``submit_job``) names itself in the
-        no-session log line. Lifted out of :meth:`submit_job`
-        so future application-message senders that need the
-        same "session live or fail fast" check share one
-        implementation.
+        Fire-and-forget — the receiver's :class:`JobFanout`
+        will fan out the resulting ``JOB_CANCELLED`` event as a
+        ``job_state_changed{status: cancelled}`` frame, which
+        the offloader's existing
+        :attr:`OFFLOADER_JOB_STATE_CHANGED` listener handles.
+        No per-call ack future, no timeout state on
+        :class:`PeerLinkClient` — the next ``job_state_changed``
+        on the inbound stream is the confirmation. A cancel-
+        of-already-terminal or unknown job is silently dropped
+        at the receiver (debug-logged); the offloader UI shows
+        the most recent ``status`` regardless.
+
+        Returns ``True`` if the frame made it onto the wire,
+        ``False`` on a same-tick channel failure (Noise encrypt
+        / WS send returned ``False``). Raises
+        :class:`PeerLinkNoSessionError` when no live session
+        exists; the WS layer maps that to
+        ``CommandError(PRECONDITION_FAILED)``.
+        """
+        channel = self._require_open_channel(label="cancel_job")
+        frame: CancelJobFrameData = {"type": "cancel_job", "job_id": job_id}
+        return await channel.send_frame(cast(dict[str, Any], frame))
+
+    def _require_open_channel(self, *, label: str) -> PeerLinkChannel:
+        """Return the live :class:`PeerLinkChannel` or raise :class:`PeerLinkNoSessionError`.
+
+        ``label`` is folded into the exception message so each
+        caller (``submit_job`` from 5c-3, ``cancel_job`` from
+        5d) names itself in the no-session log line. Every
+        application-message sender that needs a live session
+        flows through this single check; a future sender
+        inherits the same exception class + WS-layer mapping
+        without duplicating the channel-presence test.
         """
         channel = self._active_channel
         if channel is None:
             msg = f"{label}: no live peer-link session to {self._hostname}:{self._port}"
-            raise SubmitJobNoSessionError(msg)
+            raise PeerLinkNoSessionError(msg)
         return channel
 
     def _register_submit_job_ack_future(self, job_id: str) -> asyncio.Future[SubmitJobAckFrameData]:
@@ -1008,7 +1045,7 @@ class PeerLinkClient:
         on the same event loop; pre-registering avoids the
         race regardless). A second call for the same *job_id*
         while the first is still pending raises
-        :class:`SubmitJobNoSessionError` — same exception class
+        :class:`PeerLinkNoSessionError` — same exception class
         the WS layer maps to "refuse the submit, ask the caller
         to retry under a fresh id."
         """
@@ -1017,7 +1054,7 @@ class PeerLinkClient:
                 f"submit_job: ack future already registered for job_id={job_id!r} "
                 f"(duplicate submit on the same session)"
             )
-            raise SubmitJobNoSessionError(msg)
+            raise PeerLinkNoSessionError(msg)
         ack_fut: asyncio.Future[SubmitJobAckFrameData] = asyncio.get_running_loop().create_future()
         self._submit_job_acks[job_id] = ack_fut
         return ack_fut
@@ -1340,7 +1377,7 @@ class PeerLinkClient:
         # Expose the channel to :meth:`submit_job` for the
         # duration of the receive loop. Cleared in ``finally``
         # so a post-session :meth:`submit_job` raises
-        # :class:`SubmitJobNoSessionError` instead of writing
+        # :class:`PeerLinkNoSessionError` instead of writing
         # into a stale channel.
         self._active_channel = channel
         # Bound the synchronous-dispatch lookup table once per

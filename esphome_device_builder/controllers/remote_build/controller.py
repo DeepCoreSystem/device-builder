@@ -86,6 +86,7 @@ from ...helpers.event_bus import Event
 from ...helpers.hostname import normalize_hostname
 from ...helpers.json import dumps as json_dumps
 from ...helpers.json import loads as json_loads
+from ...helpers.peer_link_frames import validate_frame_shape
 from ...helpers.peer_link_identity import get_or_create_peer_link_identity
 from ...helpers.storage import ShutdownCallback, Store
 from ...models import (
@@ -139,7 +140,7 @@ from .peer_link_client import (
     PairStatusResult,
     PeerLinkClient,
     PeerLinkClientError,
-    SubmitJobNoSessionError,
+    PeerLinkNoSessionError,
     SubmitJobSessionLostError,
     SubmitJobTimeoutError,
 )
@@ -599,6 +600,15 @@ _SUBMIT_JOB_VALID_TARGETS: frozenset[str] = frozenset({"compile", "upload"})
 _OFFLOADER_REMOTE_JOB_TERMINAL_STATUSES: frozenset[str] = frozenset(
     {"completed", "failed", "cancelled"}
 )
+
+
+# Required fields on inbound ``cancel_job`` peer-link frames
+# (5d). The frame is offloader → receiver direction; the
+# receiver's :meth:`RemoteBuildController.handle_cancel_job`
+# validates this shape before reaching into the
+# :class:`JobFanout` correlation cache. Same defensive idiom
+# the 5c-2 / 5c-3 dispatchers use.
+_CANCEL_JOB_FIELDS: dict[str, type] = {"job_id": str}
 
 
 def _validate_submit_job_target(raw: object) -> Literal["compile", "upload"]:
@@ -1574,6 +1584,77 @@ class RemoteBuildController:
                     EventType.RECEIVER_PEER_LINK_SESSION_CLOSED,
                     ReceiverPeerLinkSessionClosedData(dashboard_id=session.dashboard_id),
                 )
+
+    async def handle_cancel_job(self, session: PeerLinkSession, frame: dict[str, Any]) -> None:
+        """Receiver-side dispatch for inbound ``cancel_job`` frames (5d).
+
+        Resolves the offloader-supplied ``job_id`` to the
+        receiver-local :class:`FirmwareJob` via
+        :meth:`JobFanout.resolve_firmware_job_id`, then routes
+        the cancel through the firmware controller's existing
+        :meth:`FirmwareController.cancel` primitive — same path
+        as a local operator-driven cancel. No ack on the wire:
+        the firmware queue fires ``JOB_CANCELLED`` once the
+        cancel lands, :class:`JobFanout` fans that out as a
+        ``job_state_changed{status: cancelled}`` frame, and the
+        offloader's existing ``OFFLOADER_JOB_STATE_CHANGED``
+        plumbing surfaces it without any new bus event type.
+
+        Silent drops (debug-logged only) for:
+
+        * Malformed frame shape — peer is off-contract;
+          dropping matches the read-loop's behaviour for the
+          other peer-controlled frames. The terminate-on-
+          malformed escalation lives in
+          :func:`parse_app_frame` for decrypt / JSON failures;
+          a structurally-bad cancel doesn't warrant tearing
+          the session down.
+        * Unknown ``(remote_peer, remote_job_id)`` correlation
+          — typically a race between the offloader's send and
+          a receiver-side terminal transition that already
+          evicted the entry. The offloader will see the
+          earlier terminal ``job_state_changed`` regardless;
+          no action needed.
+        * :class:`CommandError` from
+          :meth:`FirmwareController.cancel` (already-terminal
+          job, race with a parallel cancel) — best-effort
+          semantics; the offloader's UI rendered the cancel
+          intent on click and the next observed state is
+          authoritative.
+        """
+        if not validate_frame_shape(frame, _CANCEL_JOB_FIELDS):
+            _LOGGER.debug(
+                "peer-link cancel_job from %s: malformed frame; dropping: %r",
+                session.dashboard_id,
+                frame,
+            )
+            return
+        if self._job_fanout is None or self._db.firmware is None:
+            _LOGGER.debug(
+                "peer-link cancel_job from %s before controller fully started; dropping",
+                session.dashboard_id,
+            )
+            return
+        remote_job_id = cast(str, frame["job_id"])
+        firmware_job_id = self._job_fanout.resolve_firmware_job_id(
+            session.dashboard_id, remote_job_id
+        )
+        if firmware_job_id is None:
+            _LOGGER.debug(
+                "peer-link cancel_job from %s: no firmware job for remote_job_id=%r; dropping",
+                session.dashboard_id,
+                remote_job_id,
+            )
+            return
+        try:
+            await self._db.firmware.cancel(job_id=firmware_job_id)
+        except CommandError as exc:
+            _LOGGER.debug(
+                "peer-link cancel_job from %s: firmware refused cancel for job %s: %s",
+                session.dashboard_id,
+                firmware_job_id,
+                exc.message,
+            )
 
     def get_submit_job_receiver(self) -> SubmitJobReceiver:
         """Receiver-side ``submit_job`` flow handler (5c-2).
@@ -2594,7 +2675,7 @@ class RemoteBuildController:
         yaml_path = await loop.run_in_executor(None, self._db.settings.rel_path, configuration)
         return configuration, yaml_path
 
-    def _lookup_open_peer_link_client(self, pin_sha256: str) -> PeerLinkClient:
+    def _lookup_open_peer_link_client(self, pin_sha256: str, *, label: str) -> PeerLinkClient:
         """Return the live :class:`PeerLinkClient` for *pin_sha256*, raising on miss.
 
         Two error codes the frontend branches on: ``NOT_FOUND``
@@ -2605,10 +2686,16 @@ class RemoteBuildController:
         folded into one raise — the user's recovery is the
         same (wait + retry); the distinguishing detail is for
         the operator's log line, not a UI branch.
+
+        ``label`` names the calling operation in the
+        :class:`CommandError` message (``"submit_job"`` /
+        ``"cancel_job"`` / future senders) so the user-facing
+        text identifies which WS command failed rather than
+        always saying ``"submit_job: ..."``.
         """
         pairing = self._pairings.get(pin_sha256)
         if pairing is None:
-            msg = f"submit_job: no pairing for pin_sha256={pin_sha256!r}"
+            msg = f"{label}: no pairing for pin_sha256={pin_sha256!r}"
             raise CommandError(ErrorCode.NOT_FOUND, msg)
         if pairing.status is not PeerStatus.APPROVED:
             reason = f"status is {pairing.status.value!r}, not APPROVED"
@@ -2620,7 +2707,7 @@ class RemoteBuildController:
             reason = "session not connected (mid-reconnect / receiver offline)"
         else:
             return handle.client
-        msg = f"submit_job: peer-link to {pairing.label!r} not ready ({reason})"
+        msg = f"{label}: peer-link to {pairing.label!r} not ready ({reason})"
         raise CommandError(ErrorCode.PRECONDITION_FAILED, msg)
 
     async def _build_submit_job_bundle(self, configuration: str, yaml_path: Path) -> bytes:
@@ -2737,7 +2824,7 @@ class RemoteBuildController:
         clean_pin = _validate_pin_sha256(pin_sha256)
         clean_target = _validate_submit_job_target(target)
         clean_config, yaml_path = await self._validate_submit_job_config(configuration)
-        client = self._lookup_open_peer_link_client(clean_pin)
+        client = self._lookup_open_peer_link_client(clean_pin, label="submit_job")
         # Build the bundle off the event loop. Any
         # ``BundleBuildError`` (CLI schema failure, missing
         # include, malformed secret) maps to INVALID_ARGS so the
@@ -2752,7 +2839,7 @@ class RemoteBuildController:
                 target=clean_target,
                 bundle_bytes=bundle_bytes,
             )
-        except SubmitJobNoSessionError as exc:
+        except PeerLinkNoSessionError as exc:
             raise CommandError(ErrorCode.PRECONDITION_FAILED, str(exc)) from exc
         except (SubmitJobTimeoutError, SubmitJobSessionLostError) as exc:
             raise CommandError(ErrorCode.UNAVAILABLE, str(exc)) from exc
@@ -2763,6 +2850,52 @@ class RemoteBuildController:
         if "reason" in ack:
             result["reason"] = ack["reason"]
         return result
+
+    @api_command("remote_build/cancel_job")
+    async def cancel_job(
+        self,
+        *,
+        pin_sha256: str,
+        job_id: str,
+        **kwargs: Any,
+    ) -> dict[str, bool]:
+        """Send a ``cancel_job`` frame to the receiver behind *pin_sha256* (5d).
+
+        Cooperative cancellation for a previously-submitted
+        remote-driven job. *job_id* is the offloader-local id
+        the original :meth:`submit_job` returned. The handler
+        validates the pairing + session, then fires the frame
+        through :meth:`PeerLinkClient.cancel_job` — fire-and-
+        forget; the receiver's resulting
+        ``job_state_changed{status: cancelled}`` frame is the
+        confirmation, surfaced through the existing
+        :attr:`EventType.OFFLOADER_JOB_STATE_CHANGED` plumbing.
+
+        Returns ``{"sent": <bool>}`` reflecting whether the
+        frame made it onto the wire. ``sent=false`` means a
+        same-tick channel failure (Noise encrypt / WS send);
+        the caller should treat it the same as a typed error
+        — the cancel didn't reach the receiver.
+
+        Raises:
+            :class:`CommandError(INVALID_ARGS)` for bad inputs
+                (pin / empty job_id).
+            :class:`CommandError(NOT_FOUND)` if no pairing
+                exists for *pin_sha256*.
+            :class:`CommandError(PRECONDITION_FAILED)` if the
+                pairing isn't APPROVED, or the peer-link
+                session isn't currently live.
+        """
+        clean_pin = _validate_pin_sha256(pin_sha256)
+        if not isinstance(job_id, str) or not job_id:
+            msg = "job_id must be a non-empty string"
+            raise CommandError(ErrorCode.INVALID_ARGS, msg)
+        client = self._lookup_open_peer_link_client(clean_pin, label="cancel_job")
+        try:
+            sent = await client.cancel_job(job_id=job_id)
+        except PeerLinkNoSessionError as exc:
+            raise CommandError(ErrorCode.PRECONDITION_FAILED, str(exc)) from exc
+        return {"sent": sent}
 
     def pairings_snapshot(self) -> list[PairingSummary]:
         """Return the in-memory pairings snapshot (PENDING + APPROVED).

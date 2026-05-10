@@ -47,8 +47,8 @@ from esphome_device_builder.controllers.remote_build.peer_link_client import (
     PairStatusResult,
     PeerLinkClient,
     PeerLinkClientError,
+    PeerLinkNoSessionError,
     RequestPairResult,
-    SubmitJobNoSessionError,
     SubmitJobSessionLostError,
     SubmitJobTimeoutError,
     _build_ws_url,
@@ -3743,10 +3743,10 @@ async def test_run_session_loops_finally_drains_pending_submit_acks(
 
 @pytest.mark.asyncio
 async def test_submit_job_raises_no_session_error_when_session_closed() -> None:
-    """:meth:`submit_job` without a live session raises :class:`SubmitJobNoSessionError`."""
+    """:meth:`submit_job` without a live session raises :class:`PeerLinkNoSessionError`."""
     client = _make_offloader_client(EventBus())
     assert not client.is_session_open
-    with pytest.raises(SubmitJobNoSessionError):
+    with pytest.raises(PeerLinkNoSessionError):
         await client.submit_job(
             job_id="j-1",
             configuration_filename="kitchen.yaml",
@@ -3875,7 +3875,7 @@ async def test_submit_job_rejects_duplicate_job_id() -> None:
     )
     # Pre-register a future under the id we'll re-submit against.
     client._submit_job_acks["j-dup"] = asyncio.get_running_loop().create_future()
-    with pytest.raises(SubmitJobNoSessionError):
+    with pytest.raises(PeerLinkNoSessionError):
         await client.submit_job(
             job_id="j-dup",
             configuration_filename="kitchen.yaml",
@@ -4494,7 +4494,7 @@ async def test_controller_submit_job_session_closed_branch_in_lookup(
 async def test_controller_submit_job_no_session_during_send_maps_to_precondition_failed(
     offloader_controller_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``SubmitJobNoSessionError`` raised mid-send → CommandError(PRECONDITION_FAILED).
+    """``PeerLinkNoSessionError`` raised mid-send → CommandError(PRECONDITION_FAILED).
 
     Race-window coverage: the lookup succeeded
     (``is_session_open`` was True at lookup time), but by the
@@ -4517,7 +4517,7 @@ async def test_controller_submit_job_no_session_during_send_maps_to_precondition
         return b"bundle-bytes"
 
     async def _stub_submit_job(**kwargs: Any) -> dict[str, Any]:
-        raise SubmitJobNoSessionError("session lost between lookup and send")
+        raise PeerLinkNoSessionError("session lost between lookup and send")
 
     monkeypatch.setattr(
         "esphome_device_builder.helpers.config_bundle.build_yaml_bundle",
@@ -4624,3 +4624,125 @@ async def test_offloader_remote_jobs_cache_cleared_on_unpair(
     remaining = offloader.offloader_remote_jobs_snapshot()
     assert len(remaining) == 1
     assert remaining[0]["job_id"] == "j-pin-b"
+
+
+# ---------------------------------------------------------------------------
+# Phase 5d: cancel_job (offloader → receiver cooperative cancel)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_peer_link_client_cancel_job_sends_frame_through_channel() -> None:
+    """:meth:`PeerLinkClient.cancel_job` writes a ``cancel_job`` frame on the wire."""
+    initiator, responder = _build_handshake_pair()
+    captured: list[dict[str, Any]] = []
+
+    class _RecordingWs(_ParkingWs):
+        async def send_bytes(self, data: bytes) -> None:
+            payload = _json.loads(responder.decrypt(data))
+            captured.append(payload)
+
+    closed_event = asyncio.Event()
+    ws = _RecordingWs(closed_event)
+    client = _make_offloader_client(EventBus())
+    client._active_channel = PeerLinkChannel(noise=initiator, ws=ws, log_label="127.0.0.1:6055")
+
+    sent = await client.cancel_job(job_id="j-1")
+    assert sent is True
+    assert captured == [{"type": "cancel_job", "job_id": "j-1"}]
+
+
+@pytest.mark.asyncio
+async def test_peer_link_client_cancel_job_raises_when_session_closed() -> None:
+    """``cancel_job`` without a live session raises :class:`PeerLinkNoSessionError`."""
+    client = _make_offloader_client(EventBus())
+    assert not client.is_session_open
+    with pytest.raises(PeerLinkNoSessionError):
+        await client.cancel_job(job_id="j-1")
+
+
+@pytest.mark.asyncio
+async def test_controller_cancel_job_dispatches_via_client(
+    offloader_controller_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Happy path: validates input, looks up the client, calls cancel_job."""
+    offloader = _make_offloader_controller(config_dir=offloader_controller_dir)
+    offloader._db.bus = MagicMock()
+    pairing = _stub_pairing(
+        receiver_hostname="rcv.local",
+        receiver_port=6055,
+        status=PeerStatus.APPROVED,
+    )
+    offloader._pairings[pairing.pin_sha256] = pairing
+    client = _seed_open_peer_link_client(offloader, pairing)
+
+    captured_kwargs: dict[str, Any] = {}
+
+    async def _stub_cancel(*, job_id: str) -> bool:
+        captured_kwargs["job_id"] = job_id
+        return True
+
+    monkeypatch.setattr(client, "cancel_job", _stub_cancel)
+
+    try:
+        result = await offloader.cancel_job(pin_sha256=pairing.pin_sha256, job_id="j-1")
+    finally:
+        offloader._peer_link_clients[pairing.pin_sha256].task.cancel()
+        await asyncio.gather(
+            offloader._peer_link_clients[pairing.pin_sha256].task,
+            return_exceptions=True,
+        )
+    assert result == {"sent": True}
+    assert captured_kwargs == {"job_id": "j-1"}
+
+
+@pytest.mark.asyncio
+async def test_controller_cancel_job_empty_job_id_raises_invalid_args(
+    offloader_controller_dir: Path,
+) -> None:
+    """An empty ``job_id`` arg gets rejected upfront."""
+    offloader = _make_offloader_controller(config_dir=offloader_controller_dir)
+    offloader._db.bus = MagicMock()
+    with pytest.raises(CommandError) as exc_info:
+        await offloader.cancel_job(pin_sha256="a" * 64, job_id="")
+    assert exc_info.value.code == ErrorCode.INVALID_ARGS
+
+
+@pytest.mark.asyncio
+async def test_controller_cancel_job_unknown_pairing_raises_not_found(
+    offloader_controller_dir: Path,
+) -> None:
+    """No pairing under the given pin → NOT_FOUND."""
+    offloader = _make_offloader_controller(config_dir=offloader_controller_dir)
+    offloader._db.bus = MagicMock()
+    with pytest.raises(CommandError) as exc_info:
+        await offloader.cancel_job(pin_sha256="b" * 64, job_id="j-1")
+    assert exc_info.value.code == ErrorCode.NOT_FOUND
+
+
+@pytest.mark.asyncio
+async def test_controller_cancel_job_no_session_raises_precondition_failed(
+    offloader_controller_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``PeerLinkNoSessionError`` from the client → PRECONDITION_FAILED."""
+    offloader = _make_offloader_controller(config_dir=offloader_controller_dir)
+    offloader._db.bus = MagicMock()
+    pairing = _stub_pairing(receiver_hostname="rcv.local", status=PeerStatus.APPROVED)
+    offloader._pairings[pairing.pin_sha256] = pairing
+    client = _seed_open_peer_link_client(offloader, pairing)
+
+    async def _stub_cancel(**_kwargs: Any) -> bool:
+        raise PeerLinkNoSessionError("session vanished between lookup and send")
+
+    monkeypatch.setattr(client, "cancel_job", _stub_cancel)
+
+    try:
+        with pytest.raises(CommandError) as exc_info:
+            await offloader.cancel_job(pin_sha256=pairing.pin_sha256, job_id="j-1")
+    finally:
+        offloader._peer_link_clients[pairing.pin_sha256].task.cancel()
+        await asyncio.gather(
+            offloader._peer_link_clients[pairing.pin_sha256].task,
+            return_exceptions=True,
+        )
+    assert exc_info.value.code == ErrorCode.PRECONDITION_FAILED
