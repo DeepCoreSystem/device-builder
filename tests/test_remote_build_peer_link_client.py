@@ -65,6 +65,8 @@ from esphome_device_builder.models import (
     ErrorCode,
     EventType,
     IntentResponse,
+    OffloaderPeerLinkClosedData,
+    OffloaderPeerLinkOpenedData,
     PeerLinkIntent,
     PeerStatus,
     StoredPairing,
@@ -1028,6 +1030,87 @@ async def test_pairings_snapshot_returns_ram_dict(
     by_host = {row.receiver_hostname: row for row in rows}
     assert by_host["pending.local"].status is PeerStatus.PENDING
     assert by_host["approved.local"].status is PeerStatus.APPROVED
+
+
+@pytest.mark.asyncio
+async def test_pairings_snapshot_marks_open_link_as_connected(
+    offloader_controller_dir: Path,
+) -> None:
+    """An APPROVED row whose ``pin_sha256`` is in ``_open_peer_links`` reports ``connected=True``.
+
+    Mirror of the receiver-side
+    ``test_peers_snapshot_marks_approved_with_active_session_connected``;
+    pin the snapshot semantic so a future refactor that splits
+    the open-link tracking from the snapshot read can't
+    silently drop the membership check.
+    """
+    offloader = _make_offloader_controller(config_dir=offloader_controller_dir)
+    offloader._db.bus = MagicMock()
+    pin_a = "a" * 64
+    pin_b = "b" * 64
+    a = _stub_pairing(
+        receiver_hostname="a.local",
+        receiver_port=6055,
+        label="a",
+        pin_sha256=pin_a,
+        status=PeerStatus.APPROVED,
+    )
+    b = _stub_pairing(
+        receiver_hostname="b.local",
+        receiver_port=6055,
+        label="b",
+        pin_sha256=pin_b,
+        status=PeerStatus.APPROVED,
+    )
+    offloader._pairings[pin_a] = a
+    offloader._pairings[pin_b] = b
+    # Only ``a`` has an open peer-link session.
+    offloader._open_peer_links.add(pin_a)
+
+    rows = {row.receiver_hostname: row for row in offloader.pairings_snapshot()}
+
+    assert rows["a.local"].connected is True
+    assert rows["b.local"].connected is False
+
+
+@pytest.mark.asyncio
+async def test_offloader_peer_link_event_listeners_update_open_set(
+    offloader_controller_dir: Path,
+) -> None:
+    """OPENED adds + CLOSED discards from ``_open_peer_links``.
+
+    The two callbacks are wired on real bus subscriptions in
+    :meth:`start`, but the listeners themselves are sync and
+    can be exercised directly with synthesised ``Event``
+    payloads — that keeps the test focused on the set-mutation
+    contract without standing up the full controller startup.
+    """
+    offloader = _make_offloader_controller(config_dir=offloader_controller_dir)
+    pin = "a" * 64
+
+    opened: OffloaderPeerLinkOpenedData = {
+        "receiver_hostname": "host.local",
+        "receiver_port": 6055,
+        "pin_sha256": pin,
+    }
+    offloader._on_offloader_peer_link_opened(MagicMock(data=opened))
+    assert pin in offloader._open_peer_links
+
+    closed: OffloaderPeerLinkClosedData = {
+        "receiver_hostname": "host.local",
+        "receiver_port": 6055,
+        "pin_sha256": pin,
+        "reason": "peer_hung_up",
+    }
+    offloader._on_offloader_peer_link_closed(MagicMock(data=closed))
+    assert pin not in offloader._open_peer_links
+
+    # ``discard`` semantics: a CLOSED for a key we never saw
+    # OPENED is a no-op rather than raising. Covers the
+    # cold-start race where a stale CLOSED arrives before the
+    # listener is ready.
+    offloader._on_offloader_peer_link_closed(MagicMock(data=closed))
+    assert pin not in offloader._open_peer_links
 
 
 @pytest.mark.asyncio
