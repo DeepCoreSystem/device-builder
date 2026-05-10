@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from contextlib import suppress
+from dataclasses import dataclass
 from typing import Any
 
 # 4 KB is a reasonable chunk size — large enough to amortise the
@@ -40,6 +42,93 @@ async def create_subprocess_exec(
     """
     kwargs["close_fds"] = False
     return await asyncio.create_subprocess_exec(*args, **kwargs)
+
+
+def kill_quietly(proc: asyncio.subprocess.Process) -> None:
+    """
+    Best-effort ``proc.kill()`` that swallows ``ProcessLookupError``.
+
+    There's a TOCTOU race in every kill site: between a
+    ``proc.returncode is None`` check and ``proc.kill()`` firing,
+    the child can exit on its own — and ``Process.kill()`` then
+    raises ``ProcessLookupError`` because the pid's already
+    reaped. Wrap the kill with this helper instead of repeating
+    the suppress block at every call site.
+    """
+    with suppress(ProcessLookupError):
+        proc.kill()
+
+
+@dataclass(frozen=True)
+class CapturedSubprocess:
+    """Result of :func:`run_subprocess_capture`.
+
+    ``returncode`` is ``None`` only when the subprocess hadn't yet
+    been waited at the moment the helper returned — in practice we
+    always ``wait`` after a timeout, so ``returncode`` is the
+    underlying ``Process.returncode`` once the helper returns.
+    ``stdout`` is the captured stdout (which includes stderr when
+    the caller passed ``stderr=subprocess.STDOUT``). ``timed_out``
+    is ``True`` iff the subprocess didn't finish within the
+    *timeout* and we killed it.
+    """
+
+    returncode: int | None
+    stdout: bytes
+    timed_out: bool
+
+
+async def run_subprocess_capture(
+    *args: str,
+    timeout: float,
+) -> CapturedSubprocess:
+    """Spawn *args*, await completion (or *timeout*), capture stdout+stderr.
+
+    Shared shape between every "run a command to completion and
+    inspect its exit code + output" caller (currently
+    :func:`controllers.firmware.helpers._verify_esphome_importable`
+    and :func:`helpers.config_bundle.build_yaml_bundle`). Stderr is
+    redirected onto stdout so callers see a unified output stream;
+    if a future caller needs them split, lift this to take the
+    redirect flag as a parameter.
+
+    Timeout handling: :func:`asyncio.wait_for` raises
+    :class:`TimeoutError`; we :func:`kill_quietly` the process,
+    await its ``wait()`` so the OS resources release, and return
+    a :class:`CapturedSubprocess` with ``timed_out=True``. Caller
+    inspects ``timed_out`` rather than handling a raised
+    exception, which keeps the common shape "one return, check
+    flags" instead of try/except at every call site.
+
+    No retry, no streaming — callers that need either pattern
+    use :func:`create_subprocess_exec` directly.
+
+    Cancellation-safe: if the awaiting task is cancelled while
+    ``proc.communicate()`` is in flight, ``kill_quietly`` fires
+    SIGKILL and the :class:`CancelledError` re-raises
+    immediately. The dead subprocess is reaped by asyncio's
+    child watcher in the background — we deliberately don't
+    ``await proc.wait()`` here because that would either swallow
+    the second cancellation (violating
+    ``feedback_no_suppress_cancelled_error``) or stall the
+    propagation. SIGKILL'd processes exit within microseconds
+    and the watcher cleans up regardless.
+    """
+    proc = await create_subprocess_exec(
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    try:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except TimeoutError:
+        kill_quietly(proc)
+        await proc.wait()
+        return CapturedSubprocess(returncode=proc.returncode, stdout=b"", timed_out=True)
+    except asyncio.CancelledError:
+        kill_quietly(proc)
+        raise
+    return CapturedSubprocess(returncode=proc.returncode, stdout=stdout, timed_out=False)
 
 
 async def iter_lines_with_progress(stream: asyncio.StreamReader) -> AsyncIterator[str]:

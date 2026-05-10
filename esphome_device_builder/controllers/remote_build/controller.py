@@ -65,7 +65,8 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass as _dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
+from uuid import uuid4
 
 from esphome.const import __version__ as esphome_version
 from yarl import URL
@@ -94,6 +95,7 @@ from ...models import (
     IdentityView,
     IntentResponse,
     OffloaderAlertSnapshotEntry,
+    OffloaderJobStateChangedData,
     OffloaderPairAlertDismissedData,
     OffloaderPairEndpointReboundData,
     OffloaderPairPeerRevokedData,
@@ -105,6 +107,7 @@ from ...models import (
     OffloaderPinMismatchAlert,
     OffloaderQueueStatusChangedData,
     OffloaderRemoteBuildSettings,
+    OffloaderRemoteJobSnapshotEntry,
     PairingSummary,
     PairingWindowState,
     PeerQueueStatusSnapshotEntry,
@@ -136,6 +139,9 @@ from .peer_link_client import (
     PairStatusResult,
     PeerLinkClient,
     PeerLinkClientError,
+    SubmitJobNoSessionError,
+    SubmitJobSessionLostError,
+    SubmitJobTimeoutError,
 )
 from .peer_link_client import (
     await_pair_status as peer_link_await_pair_status,
@@ -196,6 +202,24 @@ _RESOLVE_TIMEOUT_MS = 3000
 # pin without rushing" against "short enough that an idle tab
 # isn't an attack surface". See issue #106 design choice (c).
 _PAIRING_WINDOW_DURATION_SECONDS = 300.0
+
+
+@_dataclass(frozen=True)
+class _PeerLinkClientHandle:
+    """Bundle a :class:`PeerLinkClient` with its run task.
+
+    The client exposes the per-session API
+    (:meth:`PeerLinkClient.submit_job`,
+    :attr:`PeerLinkClient.is_session_open`); the task carries
+    the cancellation handle the controller's lifecycle wiring
+    needs (cancel on unpair, drain in :meth:`stop`). Held in
+    :attr:`RemoteBuildController._peer_link_clients` so a single
+    lookup yields both, instead of two parallel dicts that
+    could drift.
+    """
+
+    client: PeerLinkClient
+    task: asyncio.Task[None]
 
 
 @_dataclass
@@ -554,6 +578,35 @@ def _validate_pair_label(raw: object, *, field: _PairLabelField) -> str:
         msg = f"{field} must contain only printable characters"
         raise CommandError(ErrorCode.INVALID_ARGS, msg)
     return cleaned
+
+
+# Allowed values of ``submit_job``'s ``target`` arg. Wire-side
+# the receiver enforces the same set
+# (:data:`controllers.remote_build.submit_job._TARGET_TO_JOB_TYPE`);
+# rejecting unknown targets here means a typo lands as a clean
+# ``INVALID_ARGS`` for the frontend to render inline rather than a
+# ``submit_job_ack{accepted: false, reason: "invalid_header"}``
+# only after the bundle's been built and shipped.
+_SUBMIT_JOB_VALID_TARGETS: frozenset[str] = frozenset({"compile", "upload"})
+
+
+# Terminal ``status`` values on
+# :class:`OffloaderJobStateChangedData` — drives the
+# offloader-side remote-job cache's drop-on-terminal logic so
+# the snapshot only carries actively-running rows. Same literal
+# set the wire-frame ``Literal`` enumerates; pinned as a
+# ``frozenset`` for O(1) membership.
+_OFFLOADER_REMOTE_JOB_TERMINAL_STATUSES: frozenset[str] = frozenset(
+    {"completed", "failed", "cancelled"}
+)
+
+
+def _validate_submit_job_target(raw: object) -> Literal["compile", "upload"]:
+    """Validate the WS *target* arg for ``remote_build/submit_job``."""
+    if not isinstance(raw, str) or raw not in _SUBMIT_JOB_VALID_TARGETS:
+        msg = f"target must be one of {sorted(_SUBMIT_JOB_VALID_TARGETS)}; got {raw!r}"
+        raise CommandError(ErrorCode.INVALID_ARGS, msg)
+    return cast(Literal["compile", "upload"], raw)
 
 
 # Maps non-success ``IntentResponse`` values from a peer-link
@@ -924,17 +977,23 @@ class RemoteBuildController:
         # operator-driven compiles never reach a peer-link
         # session.
         self._job_fanout: JobFanout | None = None
-        # Offloader-side long-lived peer-link client tasks, one
-        # per APPROVED ``StoredPairing``, keyed on the
-        # receiver's ``pin_sha256``. Spawned by
+        # Offloader-side long-lived peer-link clients, one per
+        # APPROVED ``StoredPairing``, keyed on the receiver's
+        # ``pin_sha256``. Spawned by
         # :meth:`_spawn_peer_link_client` from :meth:`start`'s
         # cold-start path and from
         # :meth:`_apply_pair_status_result` flipping a row to
         # APPROVED. Cancelled by :meth:`_cancel_peer_link_client`
-        # on ``unpair``; drained in :meth:`stop`. Each task runs
+        # on ``unpair``; drained in :meth:`stop`. The task runs
         # the connect-handshake-park-reconnect loop in
-        # :meth:`PeerLinkClient.run`.
-        self._peer_link_clients: dict[str, asyncio.Task[None]] = {}
+        # :meth:`PeerLinkClient.run`. The client object is
+        # retained alongside its task so the
+        # ``remote_build/submit_job`` WS command (5c-3) can
+        # reach :meth:`PeerLinkClient.submit_job` to drive a
+        # bundle through the live session — the task itself
+        # exposes only ``cancel`` / ``done``, not the per-flow
+        # send API.
+        self._peer_link_clients: dict[str, _PeerLinkClientHandle] = {}
         # RAM-only set of ``pin_sha256`` strings whose
         # offloader-side peer-link sessions are currently open.
         # Mutated by listeners on ``OFFLOADER_PEER_LINK_OPENED``
@@ -1019,6 +1078,20 @@ class RemoteBuildController:
         # doesn't surface stale data for a pairing the user
         # removed.
         self._peer_queue_status: dict[str, PeerQueueStatusSnapshotEntry] = {}
+        # Offloader-side cache of remote-driven jobs we submitted
+        # that haven't reached a terminal state. Keyed on the
+        # offloader-local ``job_id`` (the one we generated for
+        # the ``submit_job`` header). Populated by the listener
+        # on ``OFFLOADER_JOB_STATE_CHANGED`` and cleared on the
+        # matching terminal transition. Surfaced via
+        # ``subscribe_events.initial_state.remote_jobs`` so a
+        # late-subscribing tab sees in-flight jobs without
+        # waiting for the next event — same pattern
+        # ``_peer_queue_status`` uses for queue depth. RAM-only;
+        # terminal jobs drop here so a page reload after a
+        # build completes shows no entry (the frontend keeps
+        # its own history if it wants one).
+        self._offloader_remote_jobs: dict[str, OffloaderRemoteJobSnapshotEntry] = {}
         # ``Store`` registers itself with this list at construction
         # (via ``shutdown_register=...append``); the controller's
         # :meth:`stop` walks the list to flush any debounced save
@@ -1211,6 +1284,18 @@ class RemoteBuildController:
                 self._on_offloader_queue_status_changed,
             )
         )
+        # Offloader-side: mirror inbound ``job_state_changed``
+        # frames into ``_offloader_remote_jobs`` so a late
+        # ``subscribe_events`` snapshot carries every in-flight
+        # remote-driven job. The cache shape matches the wire
+        # frame; terminal transitions drop the entry so the
+        # snapshot only ever surfaces actively-running rows.
+        self._listeners.callback(
+            self._db.bus.add_listener(
+                EventType.OFFLOADER_JOB_STATE_CHANGED,
+                self._on_offloader_job_state_changed,
+            )
+        )
         # Mirror :class:`PeerLinkClient`-fired pin-mismatch
         # events into the RAM-only ``_offloader_alerts`` dict so
         # the snapshot path
@@ -1326,6 +1411,40 @@ class RemoteBuildController:
         paired receiver.
         """
         return list(self._peer_queue_status.values())
+
+    def _on_offloader_job_state_changed(self, event: Event[OffloaderJobStateChangedData]) -> None:
+        """Maintain the offloader-side in-flight remote-job cache.
+
+        Upserts the entry on ``queued`` / ``running``; drops on
+        terminal (``completed`` / ``failed`` / ``cancelled``)
+        so the snapshot only ever carries actively-running
+        rows. The :class:`PeerLinkClient` receive loop already
+        validated the wire shape before firing this event.
+        """
+        data = event.data
+        if data["status"] in _OFFLOADER_REMOTE_JOB_TERMINAL_STATUSES:
+            self._offloader_remote_jobs.pop(data["job_id"], None)
+            return
+        self._offloader_remote_jobs[data["job_id"]] = OffloaderRemoteJobSnapshotEntry(
+            receiver_hostname=data["receiver_hostname"],
+            receiver_port=data["receiver_port"],
+            pin_sha256=data["pin_sha256"],
+            job_id=data["job_id"],
+            status=data["status"],
+            error_message=data["error_message"],
+        )
+
+    def offloader_remote_jobs_snapshot(self) -> list[OffloaderRemoteJobSnapshotEntry]:
+        """Return the offloader-side in-flight remote-job snapshot.
+
+        Pure sync read of the in-memory cache. Seeded into
+        ``subscribe_events.initial_state.remote_jobs`` so a
+        tab subscribing AFTER a job transitioned to ``running``
+        still renders it without waiting for the next event.
+        Terminal jobs are dropped on the matching event, so the
+        snapshot never includes completed builds.
+        """
+        return list(self._offloader_remote_jobs.values())
 
     def _on_firmware_queue_transition(self, event: Event[Any]) -> None:
         """Bus listener: broadcast ``queue_status`` to paired offloaders.
@@ -1530,10 +1649,13 @@ class RemoteBuildController:
         # in its ``CancelledError`` handler before unwinding, so
         # the receiver's session loop exits cleanly without
         # waiting for its heartbeat to time out.
-        for task in self._peer_link_clients.values():
-            task.cancel()
+        for handle in self._peer_link_clients.values():
+            handle.task.cancel()
         if self._peer_link_clients:
-            await asyncio.gather(*self._peer_link_clients.values(), return_exceptions=True)
+            await asyncio.gather(
+                *(h.task for h in self._peer_link_clients.values()),
+                return_exceptions=True,
+            )
             self._peer_link_clients.clear()
         if self._pairing_window_handle is not None:
             self._pairing_window_handle.cancel()
@@ -1573,6 +1695,7 @@ class RemoteBuildController:
         # receiver-visible row), so silent clear is fine here.
         self._pairings.clear()
         self._peer_queue_status.clear()
+        self._offloader_remote_jobs.clear()
         self._open_peer_links.clear()
         self._rebind_probe_until.clear()
         self._peers.clear()
@@ -2432,6 +2555,14 @@ class RemoteBuildController:
         # frontend is expected to drop derived per-peer state
         # in step.
         self._peer_queue_status.pop(key, None)
+        # Drop any in-flight remote-job snapshot entries for the
+        # unpaired peer — the peer-link client is being torn
+        # down, so no more lifecycle events will arrive for
+        # these jobs and the snapshot must not surface them as
+        # "still running" forever.
+        for job_id, entry in list(self._offloader_remote_jobs.items()):
+            if entry["pin_sha256"] == key:
+                self._offloader_remote_jobs.pop(job_id, None)
         # Same rationale for ``_open_peer_links`` — the row is
         # gone, so any stale "true" carried over the removal
         # would land a phantom indicator on a re-pair before
@@ -2440,6 +2571,198 @@ class RemoteBuildController:
         # present (PENDING removal, never-connected APPROVED).
         self._open_peer_links.discard(key)
         return {"removed": True}
+
+    async def _validate_submit_job_config(self, configuration: object) -> tuple[str, Path]:
+        """Validate the WS *configuration* arg, return ``(name, yaml_path)``.
+
+        Validates the path-traversal boundary via
+        :meth:`DashboardSettings.rel_path` and returns the
+        resolved :class:`Path` so the downstream bundle build
+        doesn't have to redo the executor hop. ``rel_path`` is
+        blocking (``Path.resolve`` = ``os.path.abspath``
+        syscall) so the call lives inside an executor.
+        Mirrors
+        :meth:`FirmwareController._validate_configuration_boundary`'s
+        shape; lifted as a private helper so the future
+        bulk-submit variant (multi-config offload) can reuse
+        the same gate.
+        """
+        if not isinstance(configuration, str) or not configuration:
+            msg = "configuration must be a non-empty string"
+            raise CommandError(ErrorCode.INVALID_ARGS, msg)
+        loop = asyncio.get_running_loop()
+        yaml_path = await loop.run_in_executor(None, self._db.settings.rel_path, configuration)
+        return configuration, yaml_path
+
+    def _lookup_open_peer_link_client(self, pin_sha256: str) -> PeerLinkClient:
+        """Return the live :class:`PeerLinkClient` for *pin_sha256*, raising on miss.
+
+        Two error codes the frontend branches on: ``NOT_FOUND``
+        for a missing pairing (typo / row removed concurrently),
+        ``PRECONDITION_FAILED`` for any of the
+        not-ready-for-traffic states (PENDING, client not
+        spawned, orphaned, mid-reconnect). The latter four are
+        folded into one raise — the user's recovery is the
+        same (wait + retry); the distinguishing detail is for
+        the operator's log line, not a UI branch.
+        """
+        pairing = self._pairings.get(pin_sha256)
+        if pairing is None:
+            msg = f"submit_job: no pairing for pin_sha256={pin_sha256!r}"
+            raise CommandError(ErrorCode.NOT_FOUND, msg)
+        if pairing.status is not PeerStatus.APPROVED:
+            reason = f"status is {pairing.status.value!r}, not APPROVED"
+        elif (handle := self._peer_link_clients.get(pin_sha256)) is None:
+            reason = "client not yet spawned"
+        elif handle.task.done():
+            reason = "client orphaned (pin mismatch / superseded)"
+        elif not handle.client.is_session_open:
+            reason = "session not connected (mid-reconnect / receiver offline)"
+        else:
+            return handle.client
+        msg = f"submit_job: peer-link to {pairing.label!r} not ready ({reason})"
+        raise CommandError(ErrorCode.PRECONDITION_FAILED, msg)
+
+    async def _build_submit_job_bundle(self, configuration: str, yaml_path: Path) -> bytes:
+        """Build the bundle bytes for *yaml_path*.
+
+        Wraps :func:`helpers.config_bundle.build_yaml_bundle`
+        (which spawns the ``esphome bundle`` CLI). Maps the
+        two structured failure modes
+        (:class:`FileNotFoundError`, :class:`BundleBuildError`)
+        to typed :class:`CommandError`; anything else
+        propagates and lands as ``INTERNAL_ERROR`` via the WS
+        dispatcher's outer ``except Exception``.
+
+        *configuration* is the original wire-arg, used only for
+        diagnostic messages; *yaml_path* is the resolved path
+        :meth:`_validate_submit_job_config` already produced.
+        """
+        from ...helpers.config_bundle import (  # noqa: PLC0415
+            BundleBuildError,
+            build_yaml_bundle,
+        )
+
+        try:
+            return await build_yaml_bundle(yaml_path)
+        except FileNotFoundError as exc:
+            raise CommandError(
+                ErrorCode.NOT_FOUND, f"submit_job: YAML not found: {configuration}"
+            ) from exc
+        except BundleBuildError as exc:
+            raise CommandError(
+                ErrorCode.INVALID_ARGS,
+                f"submit_job: bundle build failed for {configuration}: {exc.output or exc}",
+            ) from exc
+
+    @api_command("remote_build/submit_job")
+    async def submit_job(
+        self,
+        *,
+        pin_sha256: str,
+        configuration: str,
+        target: str,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Bundle *configuration* and dispatch a build to the receiver behind *pin_sha256*.
+
+        Offloader-side counterpart of the receiver's
+        :class:`SubmitJobReceiver` accept path. Validates the
+        request, packs the config + every referenced file
+        (includes, secrets, fonts, images, …) into a gzipped
+        tarball via the ``esphome bundle`` CLI subprocess
+        (:func:`helpers.config_bundle.build_yaml_bundle`), and
+        streams the bytes over the existing peer-link session.
+        Returns the receiver's ``submit_job_ack`` shape so the
+        frontend can render success / rejection inline; live
+        job lifecycle + output are pushed asynchronously
+        through ``OFFLOADER_JOB_STATE_CHANGED`` /
+        ``OFFLOADER_JOB_OUTPUT`` events on the
+        ``subscribe_events`` stream.
+
+        Validation gates (in order, so the cheapest user-input
+        errors short-circuit before we touch disk or the wire):
+
+        1. ``pin_sha256`` shape (lowercase 64-hex).
+        2. ``target`` value (one of ``compile`` / ``upload``).
+        3. ``configuration`` shape + path-traversal boundary
+           (resolves to a leaf YAML under ``config_dir``).
+        4. Pairing exists, status is APPROVED.
+        5. Peer-link client exists and a session is currently
+           live.
+
+        After validation, build the bundle by spawning
+        ``esphome bundle <yaml> -o <tmp.tar.gz>`` with a 60s
+        timeout (see
+        :func:`helpers.config_bundle.build_yaml_bundle`).
+        Subprocess instead of in-process because the CLI is the
+        stable upstream contract (the in-process
+        ``read_config`` + ``ConfigBundleCreator`` would couple
+        us to ``CORE.config_path`` + the validation pipeline,
+        both of which shift across ESPHome releases). Generate
+        a fresh ``job_id`` and hand off to
+        :meth:`PeerLinkClient.submit_job`. The bundle is
+        rebuilt every call: a stale cache would ship the wrong
+        source after the user edits a YAML.
+
+        Returns:
+            ``{"job_id": <our id>, "accepted": <bool>,
+              "reason": <str>}`` — ``reason`` only present on
+              rejection (matches :class:`SubmitJobAckFrameData`'s
+              ``NotRequired[str]``).
+
+        Raises:
+            :class:`CommandError(INVALID_ARGS)` for bad inputs
+                (pin / target / configuration shape) or a
+                ``esphome bundle`` non-zero exit (schema-
+                invalid YAML, missing include, malformed
+                secret — the CLI's stdout is inlined into
+                the message).
+            :class:`CommandError(NOT_FOUND)` if no pairing
+                exists for *pin_sha256* or the YAML is missing
+                from ``config_dir``.
+            :class:`CommandError(PRECONDITION_FAILED)` if the
+                pairing isn't APPROVED, or the peer-link
+                session isn't currently live (orphaned client,
+                receiver unreachable, mid-reconnect).
+            :class:`CommandError(UNAVAILABLE)` if the wire-side
+                send fails mid-flow or the ack times out (the
+                session may have died between the open check
+                and the send; the receiver may have been
+                slow under load).
+            :class:`CommandError(INTERNAL_ERROR)` for
+                unexpected failures inside the bundle
+                subprocess (e.g. ``esphome`` not on PATH).
+        """
+        clean_pin = _validate_pin_sha256(pin_sha256)
+        clean_target = _validate_submit_job_target(target)
+        clean_config, yaml_path = await self._validate_submit_job_config(configuration)
+        client = self._lookup_open_peer_link_client(clean_pin)
+        # Build the bundle off the event loop. Any
+        # ``BundleBuildError`` (CLI schema failure, missing
+        # include, malformed secret) maps to INVALID_ARGS so the
+        # user gets the validator's stdout verbatim; any other
+        # exception lands as INTERNAL_ERROR.
+        bundle_bytes = await self._build_submit_job_bundle(clean_config, yaml_path)
+        job_id = uuid4().hex[:12]
+        try:
+            ack = await client.submit_job(
+                job_id=job_id,
+                configuration_filename=clean_config,
+                target=clean_target,
+                bundle_bytes=bundle_bytes,
+            )
+        except SubmitJobNoSessionError as exc:
+            raise CommandError(ErrorCode.PRECONDITION_FAILED, str(exc)) from exc
+        except (SubmitJobTimeoutError, SubmitJobSessionLostError) as exc:
+            raise CommandError(ErrorCode.UNAVAILABLE, str(exc)) from exc
+        result: dict[str, Any] = {
+            "job_id": ack["job_id"],
+            "accepted": ack["accepted"],
+        }
+        if "reason" in ack:
+            result["reason"] = ack["reason"]
+        return result
 
     def pairings_snapshot(self) -> list[PairingSummary]:
         """Return the in-memory pairings snapshot (PENDING + APPROVED).
@@ -2596,7 +2919,7 @@ class RemoteBuildController:
             return
         key = pairing.pin_sha256
         existing = self._peer_link_clients.get(key)
-        if existing is not None and not existing.done():
+        if existing is not None and not existing.task.done():
             return
         client = PeerLinkClient(
             receiver_hostname=pairing.receiver_hostname,
@@ -2613,16 +2936,17 @@ class RemoteBuildController:
             receiver_label=pairing.label,
             bus=self._db.bus,
         )
-        self._peer_link_clients[key] = asyncio.create_task(
+        task = asyncio.create_task(
             client.run(),
             name=f"peer-link-client-{pairing.receiver_hostname}:{pairing.receiver_port}",
         )
+        self._peer_link_clients[key] = _PeerLinkClientHandle(client=client, task=task)
 
     def _cancel_peer_link_client(self, pin_sha256: str) -> None:
         """Cancel the peer-link client for *pin_sha256*. No-op if none running."""
-        task = self._peer_link_clients.pop(pin_sha256, None)
-        if task is not None and not task.done():
-            task.cancel()
+        handle = self._peer_link_clients.pop(pin_sha256, None)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
 
     def _sweep_stale_pairings_at_endpoint(
         self, hostname: str, port: int, *, keep_pin_sha256: str

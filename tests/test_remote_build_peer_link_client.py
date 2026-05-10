@@ -20,9 +20,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import secrets
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock
 
 import aiohttp
@@ -47,6 +48,9 @@ from esphome_device_builder.controllers.remote_build.peer_link_client import (
     PeerLinkClient,
     PeerLinkClientError,
     RequestPairResult,
+    SubmitJobNoSessionError,
+    SubmitJobSessionLostError,
+    SubmitJobTimeoutError,
     _build_ws_url,
     drive_initiator_round_trip,
     preview_pair,
@@ -67,6 +71,7 @@ from esphome_device_builder.models import (
     ErrorCode,
     EventType,
     IntentResponse,
+    OffloaderJobStateChangedData,
     OffloaderPeerLinkClosedData,
     OffloaderPeerLinkOpenedData,
     PeerLinkIntent,
@@ -75,7 +80,12 @@ from esphome_device_builder.models import (
     StoredPeer,
 )
 
-from .conftest import cancel_and_drain, capture_events, make_remote_build_controller
+from .conftest import (
+    MakeSettingsFactory,
+    cancel_and_drain,
+    capture_events,
+    make_remote_build_controller,
+)
 
 
 def _make_controller(*, config_dir: Path) -> RemoteBuildController:
@@ -2256,6 +2266,108 @@ class _ParkingWs:
         raise StopAsyncIteration
 
 
+class _DeliverFramesWs(_ParkingWs):
+    """Deliver each entry in *frames* on consecutive ``__anext__`` calls, then park.
+
+    Every dispatcher test on the offloader-side receive loop
+    needs the same shape: encrypt one (or a few) frame dicts
+    with the receiver-side ``PeerLinkNoiseSession``, deliver
+    them through an async WS iterator, then park until the
+    test signals the close. Inlining a dedicated ``_XxxWs``
+    subclass per test was ~12 lines x 6 tests of duplicate
+    boilerplate; this helper takes a list of plaintext frame
+    dicts and a ``responder`` session to encrypt them with.
+    """
+
+    def __init__(
+        self,
+        closed_event: asyncio.Event,
+        responder: PeerLinkNoiseSession,
+        frames: list[dict[str, Any]],
+    ) -> None:
+        super().__init__(closed_event)
+        self._responder = responder
+        self._frames = list(frames)
+        self._index = 0
+
+    async def __anext__(self) -> Any:
+        if self._index < len(self._frames):
+            frame = self._responder.encrypt(_json.dumps(self._frames[self._index]))
+            self._index += 1
+            return WSMessage(type=WSMsgType.BINARY, data=frame, extra="")
+        await self._closed_event.wait()
+        raise StopAsyncIteration
+
+
+def _make_offloader_client(
+    bus: EventBus | Any,
+    *,
+    receiver_hostname: str = "receiver.local",
+    receiver_port: int = 6055,
+    pinned_static_x25519_pub: bytes = b"\x00" * 32,
+    pin_sha256: str = "a" * 64,
+    receiver_label: str = "test-receiver",
+    dashboard_id: str = "alpha",
+) -> PeerLinkClient:
+    """Build a :class:`PeerLinkClient` with the defaults every offloader test uses.
+
+    Every constructor-arg has a default; tests that need a
+    non-default ``receiver_hostname`` / ``pin_sha256`` /
+    ``pinned_static_x25519_pub`` pass overrides. The 8-line
+    construction was repeated ~30 times across the file before
+    this helper.
+    """
+    return PeerLinkClient(
+        receiver_hostname=receiver_hostname,
+        receiver_port=receiver_port,
+        identity_priv=secrets.token_bytes(32),
+        dashboard_id=dashboard_id,
+        pinned_static_x25519_pub=pinned_static_x25519_pub,
+        pin_sha256=pin_sha256,
+        receiver_label=receiver_label,
+        bus=bus,
+    )
+
+
+@asynccontextmanager
+async def _drive_session_with_frames(
+    client: PeerLinkClient,
+    monkeypatch: pytest.MonkeyPatch,
+    frames: list[dict[str, Any]],
+) -> AsyncIterator[None]:
+    """Park ``client._run_session_loops`` against synthetic *frames* for the with-block.
+
+    Folds the receive-loop scaffolding every offloader-side
+    dispatcher test repeats: Noise handshake pair, single-shot
+    deliver-then-park WS, stubbed heartbeat, kicked-off
+    :meth:`PeerLinkClient._run_session_loops` task. On context
+    exit the close event fires and the drive task is awaited
+    so test teardown deterministically unwinds.
+
+    The client is constructed by the caller (via
+    :func:`_make_offloader_client`) so test code can mutate it
+    before the session opens — e.g., pre-register an entry on
+    :attr:`PeerLinkClient._submit_job_acks` so an inbound
+    ``submit_job_ack`` frame finds the matching future.
+    """
+    initiator, responder = _build_handshake_pair()
+    closed_event = asyncio.Event()
+    ws = _DeliverFramesWs(closed_event, responder, frames)
+    channel = PeerLinkChannel(noise=initiator, ws=ws, log_label="127.0.0.1:6055")
+
+    async def _idle_heartbeat(**_kwargs: Any) -> None:
+        await closed_event.wait()
+
+    monkeypatch.setattr(remote_build_peer_link_client, "run_peer_link_heartbeat", _idle_heartbeat)
+
+    drive_task = asyncio.create_task(client._run_session_loops(channel))
+    try:
+        yield
+    finally:
+        closed_event.set()
+        await drive_task
+
+
 async def _seed_approved_peer_for_initiator(
     receiver_controller: RemoteBuildController,
     *,
@@ -3240,14 +3352,14 @@ async def test_spawn_peer_link_client_idempotent_when_task_running(
 
     offloader._spawn_peer_link_client(pairing)
     await asyncio.sleep(0)
-    first_task = offloader._peer_link_clients["a" * 64]
+    first_handle = offloader._peer_link_clients["a" * 64]
 
     offloader._spawn_peer_link_client(pairing)
     await asyncio.sleep(0)
 
-    assert offloader._peer_link_clients["a" * 64] is first_task
+    assert offloader._peer_link_clients["a" * 64] is first_handle
     park.set()
-    await cancel_and_drain(first_task)
+    await cancel_and_drain(first_handle.task)
 
 
 @pytest.mark.asyncio
@@ -3277,13 +3389,13 @@ async def test_cancel_peer_link_client_cancels_running_task(
     )
     offloader._spawn_peer_link_client(pairing)
     await asyncio.sleep(0)
-    task = offloader._peer_link_clients["a" * 64]
+    handle = offloader._peer_link_clients["a" * 64]
 
     offloader._cancel_peer_link_client("a" * 64)
 
     assert "a" * 64 not in offloader._peer_link_clients
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await handle.task
 
 
 @pytest.mark.asyncio
@@ -3320,7 +3432,7 @@ async def test_stop_drains_peer_link_clients(
             )
         )
     await asyncio.sleep(0)
-    tasks = list(offloader._peer_link_clients.values())
+    tasks = [h.task for h in offloader._peer_link_clients.values()]
     assert len(tasks) == 2
 
     await offloader.stop()
@@ -3482,3 +3594,1033 @@ async def test_run_session_loops_drops_malformed_queue_status(
 
     assert reason == "peer_hung_up"
     assert len(captured) == 0
+
+
+# ---------------------------------------------------------------------------
+# Phase 5c-3: offloader-side submit_job + ack/state/output dispatch
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_session_loops_fires_offloader_job_state_changed_on_inbound_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``job_state_changed`` frame fires ``OFFLOADER_JOB_STATE_CHANGED`` with peer coords."""
+    bus = EventBus()
+    captured = capture_events(bus, EventType.OFFLOADER_JOB_STATE_CHANGED)
+    client = _make_offloader_client(bus)
+    frame = {
+        "type": "job_state_changed",
+        "job_id": "j-001",
+        "status": "running",
+        "error_message": "",
+    }
+    async with _drive_session_with_frames(client, monkeypatch, [frame]):
+        await asyncio.wait_for(captured.received.wait(), timeout=2.0)
+
+    assert len(captured) == 1
+    assert captured[0] == {
+        "receiver_hostname": "receiver.local",
+        "receiver_port": 6055,
+        "pin_sha256": "a" * 64,
+        "job_id": "j-001",
+        "status": "running",
+        "error_message": "",
+    }
+
+
+@pytest.mark.parametrize(
+    "frame_body",
+    [
+        # invalid status literal
+        {
+            "type": "job_state_changed",
+            "job_id": "j-001",
+            "status": "garbage",
+            "error_message": "",
+        },
+        # missing error_message
+        {"type": "job_state_changed", "job_id": "j-001", "status": "running"},
+        # job_id wrong type
+        {
+            "type": "job_state_changed",
+            "job_id": 42,
+            "status": "running",
+            "error_message": "",
+        },
+    ],
+    ids=["invalid-status", "missing-error_message", "non-string-job_id"],
+)
+@pytest.mark.asyncio
+async def test_run_session_loops_drops_malformed_job_state_changed(
+    monkeypatch: pytest.MonkeyPatch,
+    frame_body: dict[str, Any],
+) -> None:
+    """Malformed ``job_state_changed`` frames are dropped without firing the event."""
+    bus = EventBus()
+    captured = capture_events(bus, EventType.OFFLOADER_JOB_STATE_CHANGED)
+    client = _make_offloader_client(bus)
+    async with _drive_session_with_frames(client, monkeypatch, [frame_body]):
+        # Yield long enough for the malformed-frame branch to run
+        # and drop the frame; the context manager handles close.
+        for _ in range(10):
+            await asyncio.sleep(0)
+    assert len(captured) == 0
+
+
+@pytest.mark.asyncio
+async def test_run_session_loops_fires_offloader_job_output_on_inbound_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``job_output`` frame fires ``OFFLOADER_JOB_OUTPUT`` and preserves the terminator."""
+    bus = EventBus()
+    captured = capture_events(bus, EventType.OFFLOADER_JOB_OUTPUT)
+    client = _make_offloader_client(bus)
+    frame = {
+        "type": "job_output",
+        "job_id": "j-002",
+        "stream": "stdout",
+        "line": "Compiling kitchen.cpp\n",
+    }
+    async with _drive_session_with_frames(client, monkeypatch, [frame]):
+        await asyncio.wait_for(captured.received.wait(), timeout=2.0)
+
+    assert len(captured) == 1
+    assert captured[0] == {
+        "receiver_hostname": "receiver.local",
+        "receiver_port": 6055,
+        "pin_sha256": "a" * 64,
+        "job_id": "j-002",
+        "stream": "stdout",
+        "line": "Compiling kitchen.cpp\n",
+    }
+
+
+@pytest.mark.asyncio
+async def test_run_session_loops_resolves_submit_job_ack_future(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``submit_job_ack`` frame fires the matching ack future with the parsed payload."""
+    bus = EventBus()
+    client = _make_offloader_client(bus)
+    # Pre-register the ack future under the same job_id the
+    # synthetic frame carries — mirrors what
+    # :meth:`PeerLinkClient.submit_job` does just before sending.
+    ack_fut: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+    client._submit_job_acks["j-acked"] = ack_fut
+
+    frame = {
+        "type": "submit_job_ack",
+        "job_id": "j-acked",
+        "accepted": False,
+        "reason": "queue_rejected",
+    }
+    async with _drive_session_with_frames(client, monkeypatch, [frame]):
+        ack = await asyncio.wait_for(ack_fut, timeout=2.0)
+
+    assert ack == frame
+
+
+@pytest.mark.asyncio
+async def test_run_session_loops_finally_drains_pending_submit_acks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pending ack futures are completed with :class:`SubmitJobSessionLostError` on session end."""
+    bus = EventBus()
+    client = _make_offloader_client(bus)
+    pending: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+    client._submit_job_acks["abandoned"] = pending
+
+    async with _drive_session_with_frames(client, monkeypatch, []):
+        # Let the receive loop park and set ``_active_channel``;
+        # context exit closes the iterator so the ``finally``
+        # drains the pending future.
+        await asyncio.sleep(0)
+
+    with pytest.raises(SubmitJobSessionLostError):
+        await pending
+
+
+@pytest.mark.asyncio
+async def test_submit_job_raises_no_session_error_when_session_closed() -> None:
+    """:meth:`submit_job` without a live session raises :class:`SubmitJobNoSessionError`."""
+    client = _make_offloader_client(EventBus())
+    assert not client.is_session_open
+    with pytest.raises(SubmitJobNoSessionError):
+        await client.submit_job(
+            job_id="j-1",
+            configuration_filename="kitchen.yaml",
+            target="compile",
+            bundle_bytes=b"some-bundle-bytes",
+        )
+
+
+@pytest.mark.asyncio
+async def test_submit_job_sends_header_chunks_and_returns_ack(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end: :meth:`submit_job` sends header + chunks and resolves on ack."""
+    initiator, responder = _build_handshake_pair()
+    closed_event = asyncio.Event()
+    sent_frames: list[dict[str, Any]] = []
+    ack_event = asyncio.Event()
+
+    class _AckOnLastChunkWs(_ParkingWs):
+        async def send_bytes(self, data: bytes) -> None:
+            # Decrypt sent frames so the test asserts on
+            # plaintext payloads (not Noise ciphertexts).
+            plaintext = responder.decrypt(data)
+            payload = _json.loads(plaintext)
+            sent_frames.append(payload)
+            if payload.get("type") == "submit_job_chunk" and payload.get("is_last") is True:
+                ack_event.set()
+
+        async def __anext__(self) -> Any:
+            await ack_event.wait()
+            # After all chunks are received, deliver an ack.
+            if not getattr(self, "_acked", False):
+                self._acked = True
+                ack_frame = responder.encrypt(
+                    _json.dumps(
+                        {
+                            "type": "submit_job_ack",
+                            "job_id": "j-success",
+                            "accepted": True,
+                        }
+                    )
+                )
+                return WSMessage(type=WSMsgType.BINARY, data=ack_frame, extra="")
+            await self._closed_event.wait()
+            raise StopAsyncIteration
+
+    ws = _AckOnLastChunkWs(closed_event)
+    channel = PeerLinkChannel(noise=initiator, ws=ws, log_label="127.0.0.1:6055")
+
+    async def _idle_heartbeat(*, send_ping: Any, last_pong_at: Any, on_dead: Any) -> None:
+        await closed_event.wait()
+
+    monkeypatch.setattr(remote_build_peer_link_client, "run_peer_link_heartbeat", _idle_heartbeat)
+
+    bus = EventBus()
+    client = _make_offloader_client(bus)
+    drive_task = asyncio.create_task(client._run_session_loops(channel))
+    # Wait for the receive loop to park (sets ``_active_channel``).
+    while not client.is_session_open:
+        await asyncio.sleep(0)
+    bundle = b"x" * (32 * 1024 * 2 + 17)  # 2 full chunks + a tail
+    ack = await client.submit_job(
+        job_id="j-success",
+        configuration_filename="kitchen.yaml",
+        target="compile",
+        bundle_bytes=bundle,
+    )
+    closed_event.set()
+    await drive_task
+
+    assert ack == {
+        "type": "submit_job_ack",
+        "job_id": "j-success",
+        "accepted": True,
+    }
+    # First frame: the header.
+    assert sent_frames[0]["type"] == "submit_job"
+    assert sent_frames[0]["job_id"] == "j-success"
+    assert sent_frames[0]["configuration_filename"] == "kitchen.yaml"
+    assert sent_frames[0]["target"] == "compile"
+    assert sent_frames[0]["total_bundle_bytes"] == len(bundle)
+    assert sent_frames[0]["num_chunks"] == 3
+    assert sent_frames[0]["bundle_sha256"] == hashlib.sha256(bundle).hexdigest()
+    # Remaining frames: 3 chunks, with monotonic indices and is_last on the tail.
+    chunks = [f for f in sent_frames if f.get("type") == "submit_job_chunk"]
+    assert [c["chunk_index"] for c in chunks] == [0, 1, 2]
+    assert [c["is_last"] for c in chunks] == [False, False, True]
+
+
+@pytest.mark.asyncio
+async def test_submit_job_times_out_when_no_ack_arrives(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without an ack, :meth:`submit_job` raises :class:`SubmitJobTimeoutError`.
+
+    The timeout constant is monkeypatched down so the test
+    finishes quickly; production keeps the 60s wall.
+    """
+    monkeypatch.setattr(remote_build_peer_link_client, "_SUBMIT_JOB_ACK_TIMEOUT_SECONDS", 0.05)
+    bus = EventBus()
+    client = _make_offloader_client(bus)
+    # No frames delivered — the receive loop parks immediately,
+    # the chunk sends land on the no-op send_bytes, and
+    # ``submit_job`` waits for an ack that never arrives.
+    async with _drive_session_with_frames(client, monkeypatch, []):
+        while not client.is_session_open:
+            await asyncio.sleep(0)
+        with pytest.raises(SubmitJobTimeoutError):
+            await client.submit_job(
+                job_id="j-timeout",
+                configuration_filename="kitchen.yaml",
+                target="compile",
+                bundle_bytes=b"data",
+            )
+
+
+@pytest.mark.asyncio
+async def test_submit_job_rejects_duplicate_job_id() -> None:
+    """A second :meth:`submit_job` with an in-flight ``job_id`` raises immediately."""
+    client = _make_offloader_client(EventBus())
+    # Spoof an open session so the no-session branch is skipped.
+    initiator, _responder = _build_handshake_pair()
+    closed_event = asyncio.Event()
+    client._active_channel = PeerLinkChannel(
+        noise=initiator, ws=_ParkingWs(closed_event), log_label="127.0.0.1:6055"
+    )
+    # Pre-register a future under the id we'll re-submit against.
+    client._submit_job_acks["j-dup"] = asyncio.get_running_loop().create_future()
+    with pytest.raises(SubmitJobNoSessionError):
+        await client.submit_job(
+            job_id="j-dup",
+            configuration_filename="kitchen.yaml",
+            target="compile",
+            bundle_bytes=b"data",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Phase 5c-3: controller WS command (remote_build/submit_job)
+# ---------------------------------------------------------------------------
+
+
+def _seed_open_peer_link_client(
+    offloader: RemoteBuildController, pairing: StoredPairing
+) -> PeerLinkClient:
+    """Seed *offloader* with a fake open peer-link client for *pairing*.
+
+    Skips the actual ``run`` task — installs a stub
+    :class:`PeerLinkClient` with ``is_session_open=True`` and
+    parks a ``done`` task on the handle so
+    ``_lookup_open_peer_link_client`` finds it. Returns the
+    client object so the caller can monkeypatch ``submit_job``.
+    """
+    client = _make_offloader_client(
+        MagicMock(),
+        receiver_hostname=pairing.receiver_hostname,
+        receiver_port=pairing.receiver_port,
+        pinned_static_x25519_pub=pairing.static_x25519_pub,
+        pin_sha256=pairing.pin_sha256,
+        receiver_label=pairing.label,
+    )
+    # Spoof a live session — passes ``is_session_open``.
+    initiator, _responder = _build_handshake_pair()
+    closed = asyncio.Event()
+    client._active_channel = PeerLinkChannel(
+        noise=initiator,
+        ws=_ParkingWs(closed),
+        log_label=f"{pairing.receiver_hostname}:{pairing.receiver_port}",
+    )
+    # Use a no-op task so handle.task.done() is False (we want
+    # the lookup to consider the client live).
+    park = asyncio.Event()
+
+    async def _park() -> None:
+        await park.wait()
+
+    task: asyncio.Task[None] = asyncio.create_task(_park())
+    offloader._peer_link_clients[pairing.pin_sha256] = rb._PeerLinkClientHandle(
+        client=client, task=task
+    )
+    # Caller is responsible for cancelling ``task`` at end-of-test.
+    return client
+
+
+@pytest.mark.asyncio
+async def test_controller_submit_job_returns_ack_on_accept(
+    offloader_controller_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Happy path: validates input, builds bundle, sends, and returns the ack shape."""
+    offloader = _make_offloader_controller(config_dir=offloader_controller_dir)
+    offloader._db.bus = MagicMock()
+    pairing = _stub_pairing(
+        receiver_hostname="rcv.local",
+        receiver_port=6055,
+        status=PeerStatus.APPROVED,
+    )
+    offloader._pairings[pairing.pin_sha256] = pairing
+    # Drop a stub YAML at the expected path so ``rel_path`` resolves.
+    yaml_path = Path(offloader._db.settings.config_dir) / "kitchen.yaml"
+    yaml_path.write_text("esphome:\n  name: kitchen\n", encoding="utf-8")
+    client = _seed_open_peer_link_client(offloader, pairing)
+
+    async def _stub_build_bundle(_path: Path) -> bytes:
+        return b"bundle-bytes"
+
+    captured_args: dict[str, Any] = {}
+
+    async def _stub_submit_job(
+        *,
+        job_id: str,
+        configuration_filename: str,
+        target: Any,
+        bundle_bytes: bytes,
+    ) -> dict[str, Any]:
+        captured_args["job_id"] = job_id
+        captured_args["configuration_filename"] = configuration_filename
+        captured_args["target"] = target
+        captured_args["bundle_bytes"] = bundle_bytes
+        return {"type": "submit_job_ack", "job_id": job_id, "accepted": True}
+
+    monkeypatch.setattr(
+        "esphome_device_builder.helpers.config_bundle.build_yaml_bundle",
+        _stub_build_bundle,
+    )
+    monkeypatch.setattr(client, "submit_job", _stub_submit_job)
+
+    try:
+        result = await offloader.submit_job(
+            pin_sha256=pairing.pin_sha256,
+            configuration="kitchen.yaml",
+            target="compile",
+        )
+    finally:
+        # Drain the parked task spun up by ``_seed_open_peer_link_client``.
+        offloader._peer_link_clients[pairing.pin_sha256].task.cancel()
+        await asyncio.gather(
+            offloader._peer_link_clients[pairing.pin_sha256].task,
+            return_exceptions=True,
+        )
+
+    assert result == {"job_id": captured_args["job_id"], "accepted": True}
+    assert captured_args["configuration_filename"] == "kitchen.yaml"
+    assert captured_args["target"] == "compile"
+    assert captured_args["bundle_bytes"] == b"bundle-bytes"
+
+
+@pytest.mark.asyncio
+async def test_controller_submit_job_passes_through_reject_reason(
+    offloader_controller_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-accepted ack lands as ``{accepted: False, reason: ...}`` to the WS caller."""
+    offloader = _make_offloader_controller(config_dir=offloader_controller_dir)
+    offloader._db.bus = MagicMock()
+    pairing = _stub_pairing(
+        receiver_hostname="rcv.local",
+        receiver_port=6055,
+        status=PeerStatus.APPROVED,
+    )
+    offloader._pairings[pairing.pin_sha256] = pairing
+    (Path(offloader._db.settings.config_dir) / "kitchen.yaml").write_text(
+        "esphome:\n  name: kitchen\n", encoding="utf-8"
+    )
+    client = _seed_open_peer_link_client(offloader, pairing)
+
+    async def _stub_build_bundle(_path: Path) -> bytes:
+        return b"bundle-bytes"
+
+    async def _stub_submit_job(**kwargs: Any) -> dict[str, Any]:
+        return {
+            "type": "submit_job_ack",
+            "job_id": kwargs["job_id"],
+            "accepted": False,
+            "reason": "queue_rejected",
+        }
+
+    monkeypatch.setattr(
+        "esphome_device_builder.helpers.config_bundle.build_yaml_bundle",
+        _stub_build_bundle,
+    )
+    monkeypatch.setattr(client, "submit_job", _stub_submit_job)
+
+    try:
+        result = await offloader.submit_job(
+            pin_sha256=pairing.pin_sha256,
+            configuration="kitchen.yaml",
+            target="upload",
+        )
+    finally:
+        offloader._peer_link_clients[pairing.pin_sha256].task.cancel()
+        await asyncio.gather(
+            offloader._peer_link_clients[pairing.pin_sha256].task,
+            return_exceptions=True,
+        )
+
+    assert result["accepted"] is False
+    assert result["reason"] == "queue_rejected"
+
+
+@pytest.mark.asyncio
+async def test_controller_submit_job_invalid_target_raises_invalid_args(
+    offloader_controller_dir: Path,
+) -> None:
+    """A bad ``target`` value short-circuits with INVALID_ARGS before any wire activity."""
+    offloader = _make_offloader_controller(config_dir=offloader_controller_dir)
+    offloader._db.bus = MagicMock()
+    with pytest.raises(CommandError) as exc_info:
+        await offloader.submit_job(
+            pin_sha256="a" * 64,
+            configuration="kitchen.yaml",
+            target="install",  # not in {compile, upload}
+        )
+    assert exc_info.value.code == ErrorCode.INVALID_ARGS
+
+
+@pytest.mark.asyncio
+async def test_controller_submit_job_unknown_pairing_raises_not_found(
+    offloader_controller_dir: Path,
+) -> None:
+    """No pairing under the given pin → NOT_FOUND."""
+    offloader = _make_offloader_controller(config_dir=offloader_controller_dir)
+    offloader._db.bus = MagicMock()
+    (Path(offloader._db.settings.config_dir) / "kitchen.yaml").write_text(
+        "esphome:\n  name: kitchen\n", encoding="utf-8"
+    )
+    with pytest.raises(CommandError) as exc_info:
+        await offloader.submit_job(
+            pin_sha256="b" * 64,
+            configuration="kitchen.yaml",
+            target="compile",
+        )
+    assert exc_info.value.code == ErrorCode.NOT_FOUND
+
+
+@pytest.mark.asyncio
+async def test_controller_submit_job_pending_pairing_raises_precondition_failed(
+    offloader_controller_dir: Path,
+) -> None:
+    """A PENDING pairing rejects with PRECONDITION_FAILED."""
+    offloader = _make_offloader_controller(config_dir=offloader_controller_dir)
+    offloader._db.bus = MagicMock()
+    pairing = _stub_pairing(receiver_hostname="rcv.local", status=PeerStatus.PENDING)
+    offloader._pairings[pairing.pin_sha256] = pairing
+    (Path(offloader._db.settings.config_dir) / "kitchen.yaml").write_text(
+        "esphome:\n  name: kitchen\n", encoding="utf-8"
+    )
+    with pytest.raises(CommandError) as exc_info:
+        await offloader.submit_job(
+            pin_sha256=pairing.pin_sha256,
+            configuration="kitchen.yaml",
+            target="compile",
+        )
+    assert exc_info.value.code == ErrorCode.PRECONDITION_FAILED
+
+
+@pytest.mark.asyncio
+async def test_controller_submit_job_no_session_raises_precondition_failed(
+    offloader_controller_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Approved pairing but no live session → PRECONDITION_FAILED."""
+    offloader = _make_offloader_controller(config_dir=offloader_controller_dir)
+    offloader._db.bus = MagicMock()
+    pairing = _stub_pairing(
+        receiver_hostname="rcv.local",
+        status=PeerStatus.APPROVED,
+    )
+    offloader._pairings[pairing.pin_sha256] = pairing
+    (Path(offloader._db.settings.config_dir) / "kitchen.yaml").write_text(
+        "esphome:\n  name: kitchen\n", encoding="utf-8"
+    )
+    # No client spawned at all → PRECONDITION_FAILED before bundling.
+    with pytest.raises(CommandError) as exc_info:
+        await offloader.submit_job(
+            pin_sha256=pairing.pin_sha256,
+            configuration="kitchen.yaml",
+            target="compile",
+        )
+    assert exc_info.value.code == ErrorCode.PRECONDITION_FAILED
+
+
+@pytest.mark.asyncio
+async def test_controller_submit_job_timeout_maps_to_unavailable(
+    offloader_controller_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A :class:`SubmitJobTimeoutError` raised by the client → CommandError(UNAVAILABLE)."""
+    offloader = _make_offloader_controller(config_dir=offloader_controller_dir)
+    offloader._db.bus = MagicMock()
+    pairing = _stub_pairing(
+        receiver_hostname="rcv.local",
+        status=PeerStatus.APPROVED,
+    )
+    offloader._pairings[pairing.pin_sha256] = pairing
+    (Path(offloader._db.settings.config_dir) / "kitchen.yaml").write_text(
+        "esphome:\n  name: kitchen\n", encoding="utf-8"
+    )
+    client = _seed_open_peer_link_client(offloader, pairing)
+
+    async def _stub_build_bundle(_path: Path) -> bytes:
+        return b"bundle-bytes"
+
+    async def _stub_submit_job(**kwargs: Any) -> dict[str, Any]:
+        raise SubmitJobTimeoutError("ack timed out")
+
+    monkeypatch.setattr(
+        "esphome_device_builder.helpers.config_bundle.build_yaml_bundle",
+        _stub_build_bundle,
+    )
+    monkeypatch.setattr(client, "submit_job", _stub_submit_job)
+
+    try:
+        with pytest.raises(CommandError) as exc_info:
+            await offloader.submit_job(
+                pin_sha256=pairing.pin_sha256,
+                configuration="kitchen.yaml",
+                target="compile",
+            )
+    finally:
+        offloader._peer_link_clients[pairing.pin_sha256].task.cancel()
+        await asyncio.gather(
+            offloader._peer_link_clients[pairing.pin_sha256].task,
+            return_exceptions=True,
+        )
+    assert exc_info.value.code == ErrorCode.UNAVAILABLE
+
+
+@pytest.mark.asyncio
+async def test_controller_submit_job_empty_configuration_raises_invalid_args(
+    offloader_controller_dir: Path,
+) -> None:
+    """An empty ``configuration`` arg gets rejected upfront."""
+    offloader = _make_offloader_controller(config_dir=offloader_controller_dir)
+    offloader._db.bus = MagicMock()
+    with pytest.raises(CommandError) as exc_info:
+        await offloader.submit_job(
+            pin_sha256="a" * 64,
+            configuration="",
+            target="compile",
+        )
+    assert exc_info.value.code == ErrorCode.INVALID_ARGS
+
+
+@pytest.mark.asyncio
+async def test_controller_submit_job_rejects_path_traversal(
+    make_settings: MakeSettingsFactory,
+) -> None:
+    """Path-traversal ``configuration`` arg rejected by ``rel_path`` as INVALID_ARGS.
+
+    Uses the real :class:`DashboardSettings` (not the
+    :class:`MagicMock` stub from ``_make_offloader_controller``)
+    so :meth:`DashboardSettings.rel_path` actually performs its
+    ``relative_to(absolute_config_dir)`` check. The MagicMock-
+    stubbed Settings lets ``rel_path`` return a ``MagicMock``
+    silently — fine for tests that don't care about the
+    boundary, dangerous if those were the only tests covering
+    the boundary.
+    """
+    settings = make_settings()
+    db = MagicMock()
+    db.devices = MagicMock()
+    db.devices.zeroconf = None
+    db._dashboard_advertiser = None
+    db.settings = settings
+    offloader = RemoteBuildController(db)
+    offloader._db.bus = MagicMock()
+
+    with pytest.raises(CommandError) as exc_info:
+        await offloader.submit_job(
+            pin_sha256="a" * 64,
+            configuration="../etc/passwd",
+            target="compile",
+        )
+    assert exc_info.value.code == ErrorCode.INVALID_ARGS
+
+
+@pytest.mark.parametrize(
+    "frame_body",
+    [
+        # missing accepted
+        {"type": "submit_job_ack", "job_id": "j-1"},
+        # accepted is wrong type
+        {"type": "submit_job_ack", "job_id": "j-1", "accepted": "yes"},
+        # job_id missing
+        {"type": "submit_job_ack", "accepted": True},
+    ],
+    ids=["missing-accepted", "non-bool-accepted", "missing-job_id"],
+)
+@pytest.mark.asyncio
+async def test_dispatch_submit_job_ack_drops_malformed(
+    monkeypatch: pytest.MonkeyPatch,
+    frame_body: dict[str, Any],
+) -> None:
+    """Malformed ``submit_job_ack`` is dropped without firing a future."""
+    bus = EventBus()
+    client = _make_offloader_client(bus)
+    fut: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+    client._submit_job_acks["j-1"] = fut
+    client._dispatch_submit_job_ack(frame_body)
+    assert not fut.done()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_submit_job_ack_drops_with_no_pending_future() -> None:
+    """An ack frame with no matching future is dropped silently."""
+    bus = EventBus()
+    client = _make_offloader_client(bus)
+    client._dispatch_submit_job_ack(
+        {"type": "submit_job_ack", "job_id": "unknown", "accepted": True}
+    )
+    # No future got registered, no exception raised — the
+    # branch is exercised; absence of a raise is the assertion.
+
+
+@pytest.mark.asyncio
+async def test_dispatch_submit_job_ack_drops_already_done_future() -> None:
+    """An ack frame for an already-resolved future is dropped silently."""
+    bus = EventBus()
+    client = _make_offloader_client(bus)
+    fut: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+    fut.set_result({"type": "submit_job_ack", "job_id": "j-1", "accepted": True})
+    client._submit_job_acks["j-1"] = fut
+    client._dispatch_submit_job_ack(
+        {"type": "submit_job_ack", "job_id": "j-1", "accepted": False, "reason": "late"}
+    )
+    # First result wins; the second ack does not raise InvalidStateError.
+    assert fut.result()["accepted"] is True
+
+
+@pytest.mark.asyncio
+async def test_dispatch_job_output_drops_malformed_frame() -> None:
+    """Missing required field on job_output is dropped silently."""
+    bus = EventBus()
+    captured = capture_events(bus, EventType.OFFLOADER_JOB_OUTPUT)
+    client = PeerLinkClient(
+        receiver_hostname="receiver.local",
+        receiver_port=6055,
+        identity_priv=secrets.token_bytes(32),
+        dashboard_id="alpha",
+        pinned_static_x25519_pub=b"\x00" * 32,
+        pin_sha256="a" * 64,
+        receiver_label="test-receiver",
+        bus=bus,
+    )
+    # Missing "line" field
+    client._dispatch_job_output({"type": "job_output", "job_id": "j-1", "stream": "stdout"})
+    assert len(captured) == 0
+
+
+@pytest.mark.asyncio
+async def test_dispatch_job_output_drops_invalid_stream_literal() -> None:
+    """A stream value outside ``{stdout, stderr}`` is dropped."""
+    bus = EventBus()
+    captured = capture_events(bus, EventType.OFFLOADER_JOB_OUTPUT)
+    client = PeerLinkClient(
+        receiver_hostname="receiver.local",
+        receiver_port=6055,
+        identity_priv=secrets.token_bytes(32),
+        dashboard_id="alpha",
+        pinned_static_x25519_pub=b"\x00" * 32,
+        pin_sha256="a" * 64,
+        receiver_label="test-receiver",
+        bus=bus,
+    )
+    client._dispatch_job_output(
+        {"type": "job_output", "job_id": "j-1", "stream": "weird", "line": "x\n"}
+    )
+    assert len(captured) == 0
+
+
+@pytest.mark.asyncio
+async def test_controller_submit_job_yaml_invalid_maps_to_invalid_args(
+    offloader_controller_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``BundleBuildError`` from ``build_yaml_bundle`` lands as INVALID_ARGS."""
+    from esphome_device_builder.helpers.config_bundle import (  # noqa: PLC0415
+        BundleBuildError,
+    )
+
+    offloader = _make_offloader_controller(config_dir=offloader_controller_dir)
+    offloader._db.bus = MagicMock()
+    pairing = _stub_pairing(receiver_hostname="rcv.local", status=PeerStatus.APPROVED)
+    offloader._pairings[pairing.pin_sha256] = pairing
+    (Path(offloader._db.settings.config_dir) / "kitchen.yaml").write_text(
+        "esphome:\n  name: kitchen\n", encoding="utf-8"
+    )
+    _seed_open_peer_link_client(offloader, pairing)
+
+    async def _stub_build_bundle(_path: Path) -> bytes:
+        raise BundleBuildError("subprocess exited 1", output="schema validation failed")
+
+    monkeypatch.setattr(
+        "esphome_device_builder.helpers.config_bundle.build_yaml_bundle",
+        _stub_build_bundle,
+    )
+
+    try:
+        with pytest.raises(CommandError) as exc_info:
+            await offloader.submit_job(
+                pin_sha256=pairing.pin_sha256,
+                configuration="kitchen.yaml",
+                target="compile",
+            )
+    finally:
+        offloader._peer_link_clients[pairing.pin_sha256].task.cancel()
+        await asyncio.gather(
+            offloader._peer_link_clients[pairing.pin_sha256].task,
+            return_exceptions=True,
+        )
+    assert exc_info.value.code == ErrorCode.INVALID_ARGS
+
+
+@pytest.mark.asyncio
+async def test_controller_submit_job_missing_yaml_maps_to_not_found(
+    offloader_controller_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``FileNotFoundError`` from ``build_yaml_bundle`` lands as NOT_FOUND."""
+    offloader = _make_offloader_controller(config_dir=offloader_controller_dir)
+    offloader._db.bus = MagicMock()
+    pairing = _stub_pairing(receiver_hostname="rcv.local", status=PeerStatus.APPROVED)
+    offloader._pairings[pairing.pin_sha256] = pairing
+    (Path(offloader._db.settings.config_dir) / "kitchen.yaml").write_text(
+        "esphome:\n  name: kitchen\n", encoding="utf-8"
+    )
+    _seed_open_peer_link_client(offloader, pairing)
+
+    async def _stub_build_bundle(_path: Path) -> bytes:
+        raise FileNotFoundError("yaml gone")
+
+    monkeypatch.setattr(
+        "esphome_device_builder.helpers.config_bundle.build_yaml_bundle",
+        _stub_build_bundle,
+    )
+
+    try:
+        with pytest.raises(CommandError) as exc_info:
+            await offloader.submit_job(
+                pin_sha256=pairing.pin_sha256,
+                configuration="kitchen.yaml",
+                target="compile",
+            )
+    finally:
+        offloader._peer_link_clients[pairing.pin_sha256].task.cancel()
+        await asyncio.gather(
+            offloader._peer_link_clients[pairing.pin_sha256].task,
+            return_exceptions=True,
+        )
+    assert exc_info.value.code == ErrorCode.NOT_FOUND
+
+
+@pytest.mark.asyncio
+async def test_controller_submit_job_orphaned_client_raises_precondition_failed(
+    offloader_controller_dir: Path,
+) -> None:
+    """A handle whose task is .done() (orphaned) → PRECONDITION_FAILED with reason."""
+    offloader = _make_offloader_controller(config_dir=offloader_controller_dir)
+    offloader._db.bus = MagicMock()
+    pairing = _stub_pairing(receiver_hostname="rcv.local", status=PeerStatus.APPROVED)
+    offloader._pairings[pairing.pin_sha256] = pairing
+    # Build a handle whose task is already finished (orphaned).
+    bus = MagicMock()
+    client = PeerLinkClient(
+        receiver_hostname=pairing.receiver_hostname,
+        receiver_port=pairing.receiver_port,
+        identity_priv=secrets.token_bytes(32),
+        dashboard_id="alpha",
+        pinned_static_x25519_pub=pairing.static_x25519_pub,
+        pin_sha256=pairing.pin_sha256,
+        receiver_label=pairing.label,
+        bus=bus,
+    )
+
+    async def _exit_immediately() -> None:
+        return
+
+    finished_task = asyncio.create_task(_exit_immediately())
+    await asyncio.sleep(0)
+    assert finished_task.done()
+    offloader._peer_link_clients[pairing.pin_sha256] = rb._PeerLinkClientHandle(
+        client=client, task=finished_task
+    )
+
+    with pytest.raises(CommandError) as exc_info:
+        await offloader.submit_job(
+            pin_sha256=pairing.pin_sha256,
+            configuration="kitchen.yaml",
+            target="compile",
+        )
+    assert exc_info.value.code == ErrorCode.PRECONDITION_FAILED
+    assert "orphaned" in exc_info.value.message
+
+
+@pytest.mark.asyncio
+async def test_controller_submit_job_session_closed_branch_in_lookup(
+    offloader_controller_dir: Path,
+) -> None:
+    """A handle whose client has no live session lands as PRECONDITION_FAILED.
+
+    Distinct from the no-handle branch (covered by
+    ``test_controller_submit_job_no_session_raises_precondition_failed``)
+    and the orphaned-task branch (covered by
+    ``test_controller_submit_job_orphaned_client_raises_precondition_failed``).
+    Exercises the third "not ready" sub-branch — handle
+    present, task alive, but the peer-link is mid-reconnect /
+    receiver offline so ``is_session_open`` is False.
+    """
+    offloader = _make_offloader_controller(config_dir=offloader_controller_dir)
+    offloader._db.bus = MagicMock()
+    pairing = _stub_pairing(receiver_hostname="rcv.local", status=PeerStatus.APPROVED)
+    offloader._pairings[pairing.pin_sha256] = pairing
+    bus = MagicMock()
+    client = PeerLinkClient(
+        receiver_hostname=pairing.receiver_hostname,
+        receiver_port=pairing.receiver_port,
+        identity_priv=secrets.token_bytes(32),
+        dashboard_id="alpha",
+        pinned_static_x25519_pub=pairing.static_x25519_pub,
+        pin_sha256=pairing.pin_sha256,
+        receiver_label=pairing.label,
+        bus=bus,
+    )
+    # Don't set ``_active_channel`` — ``is_session_open`` returns False.
+    park = asyncio.Event()
+
+    async def _park() -> None:
+        await park.wait()
+
+    task: asyncio.Task[None] = asyncio.create_task(_park())
+    offloader._peer_link_clients[pairing.pin_sha256] = rb._PeerLinkClientHandle(
+        client=client, task=task
+    )
+
+    try:
+        with pytest.raises(CommandError) as exc_info:
+            await offloader.submit_job(
+                pin_sha256=pairing.pin_sha256,
+                configuration="kitchen.yaml",
+                target="compile",
+            )
+        assert exc_info.value.code == ErrorCode.PRECONDITION_FAILED
+        assert "session not connected" in exc_info.value.message
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_controller_submit_job_no_session_during_send_maps_to_precondition_failed(
+    offloader_controller_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``SubmitJobNoSessionError`` raised mid-send → CommandError(PRECONDITION_FAILED).
+
+    Race-window coverage: the lookup succeeded
+    (``is_session_open`` was True at lookup time), but by the
+    time ``client.submit_job`` actually drives the send the
+    session has gone away. The WS layer maps the exception
+    class to PRECONDITION_FAILED rather than UNAVAILABLE
+    because the operator's resolution is the same as for the
+    lookup-time branch (wait for reconnect, retry).
+    """
+    offloader = _make_offloader_controller(config_dir=offloader_controller_dir)
+    offloader._db.bus = MagicMock()
+    pairing = _stub_pairing(receiver_hostname="rcv.local", status=PeerStatus.APPROVED)
+    offloader._pairings[pairing.pin_sha256] = pairing
+    (Path(offloader._db.settings.config_dir) / "kitchen.yaml").write_text(
+        "esphome:\n  name: kitchen\n", encoding="utf-8"
+    )
+    client = _seed_open_peer_link_client(offloader, pairing)
+
+    async def _stub_build_bundle(_path: Path) -> bytes:
+        return b"bundle-bytes"
+
+    async def _stub_submit_job(**kwargs: Any) -> dict[str, Any]:
+        raise SubmitJobNoSessionError("session lost between lookup and send")
+
+    monkeypatch.setattr(
+        "esphome_device_builder.helpers.config_bundle.build_yaml_bundle",
+        _stub_build_bundle,
+    )
+    monkeypatch.setattr(client, "submit_job", _stub_submit_job)
+
+    try:
+        with pytest.raises(CommandError) as exc_info:
+            await offloader.submit_job(
+                pin_sha256=pairing.pin_sha256,
+                configuration="kitchen.yaml",
+                target="compile",
+            )
+    finally:
+        offloader._peer_link_clients[pairing.pin_sha256].task.cancel()
+        await asyncio.gather(
+            offloader._peer_link_clients[pairing.pin_sha256].task,
+            return_exceptions=True,
+        )
+    assert exc_info.value.code == ErrorCode.PRECONDITION_FAILED
+
+
+# ---------------------------------------------------------------------------
+# Phase 5c-3: offloader-side in-flight remote-job cache
+# ---------------------------------------------------------------------------
+
+
+def _fire_offloader_job_state(
+    offloader: RemoteBuildController,
+    *,
+    pin_sha256: str = "a" * 64,
+    receiver_hostname: str = "rcv.local",
+    receiver_port: int = 6055,
+    job_id: str,
+    status: str,
+    error_message: str = "",
+) -> None:
+    """Invoke the cache listener directly with a synthetic event payload.
+
+    The listener is wired on the real bus in :meth:`start`,
+    but startup also depends on zeroconf availability. Calling
+    the sync listener directly is the established pattern in
+    this file (see
+    ``test_offloader_peer_link_event_listeners_update_open_set``)
+    — keeps the test focused on the cache contract without
+    standing up the full controller.
+    """
+    data: OffloaderJobStateChangedData = {
+        "receiver_hostname": receiver_hostname,
+        "receiver_port": receiver_port,
+        "pin_sha256": pin_sha256,
+        "job_id": job_id,
+        "status": cast(Any, status),
+        "error_message": error_message,
+    }
+    offloader._on_offloader_job_state_changed(MagicMock(data=data))
+
+
+@pytest.mark.asyncio
+async def test_offloader_remote_jobs_cache_seeded_on_running_event(
+    offloader_controller_dir: Path,
+) -> None:
+    """A ``running`` event populates the cache so late tabs see the in-flight job."""
+    offloader = _make_offloader_controller(config_dir=offloader_controller_dir)
+    _fire_offloader_job_state(offloader, job_id="j-1", status="running")
+    snapshot = offloader.offloader_remote_jobs_snapshot()
+    assert len(snapshot) == 1
+    assert snapshot[0]["job_id"] == "j-1"
+    assert snapshot[0]["status"] == "running"
+
+
+@pytest.mark.parametrize("status", ["completed", "failed", "cancelled"])
+@pytest.mark.asyncio
+async def test_offloader_remote_jobs_cache_drops_on_terminal_event(
+    offloader_controller_dir: Path,
+    status: str,
+) -> None:
+    """A terminal ``status`` drops the cache entry."""
+    offloader = _make_offloader_controller(config_dir=offloader_controller_dir)
+    _fire_offloader_job_state(offloader, job_id="j-1", status="running")
+    assert len(offloader.offloader_remote_jobs_snapshot()) == 1
+    _fire_offloader_job_state(offloader, job_id="j-1", status=status)
+    assert offloader.offloader_remote_jobs_snapshot() == []
+
+
+@pytest.mark.asyncio
+async def test_offloader_remote_jobs_cache_cleared_on_unpair(
+    offloader_controller_dir: Path,
+) -> None:
+    """Unpairing a peer drops in-flight job entries for that pin."""
+    offloader = _make_offloader_controller(config_dir=offloader_controller_dir)
+    offloader._db.bus = MagicMock()
+    pairing = _stub_pairing(receiver_hostname="rcv.local", status=PeerStatus.APPROVED)
+    offloader._pairings[pairing.pin_sha256] = pairing
+    _fire_offloader_job_state(
+        offloader, pin_sha256=pairing.pin_sha256, job_id="j-pin-a", status="running"
+    )
+    # And a job under a different pin — should NOT be dropped.
+    _fire_offloader_job_state(offloader, pin_sha256="b" * 64, job_id="j-pin-b", status="running")
+    assert len(offloader.offloader_remote_jobs_snapshot()) == 2
+
+    await offloader.unpair(pin_sha256=pairing.pin_sha256)
+    remaining = offloader.offloader_remote_jobs_snapshot()
+    assert len(remaining) == 1
+    assert remaining[0]["job_id"] == "j-pin-b"
