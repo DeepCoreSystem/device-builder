@@ -393,6 +393,44 @@ async def _await_terminal(
                 reason = closed["reason"]
                 detail = closed["error_detail"]
                 text = f"{reason}: {detail}" if detail else reason
+                # Push a synthetic output line BEFORE firing
+                # JOB_FAILED so the live log stream ends with a
+                # clear explanation of what cut the build off,
+                # not the half-rendered compile line the receiver
+                # had streamed before the link dropped.
+                # ``job.error`` carries the same text for the
+                # error banner; the log line makes the cause
+                # visible in the dialog's main scroll buffer
+                # without requiring the user to read the (often
+                # truncated) red error toast.
+                #
+                # ``reason`` covers more than just transport drops:
+                # ``transport_error`` is a network cut, but the
+                # receiver can also push ``server_shutting_down``
+                # (graceful restart), ``superseded`` (a fresh
+                # session displaced this one), ``pin_mismatch`` /
+                # ``peer_revoked`` (security), and the offloader
+                # itself can close with ``client_stopped``. Use
+                # "session closed" as the umbrella wording and
+                # let the embedded ``text`` carry the specific
+                # cause, instead of falsely framing every close
+                # as a connection loss.
+                #
+                # Leading-newline avoidance: only insert a
+                # separator newline when the previous buffered
+                # output line doesn't already end with one. The
+                # receiver-side compile streams ``\n``-terminated
+                # lines, so the common case skips the prefix and
+                # the synthetic line lands flush against the
+                # last compile output rather than adding a blank
+                # line.
+                prefix = "" if job.output and job.output[-1].endswith(("\n", "\r")) else "\n"
+                _ingest_output_line(
+                    job,
+                    controller.bus,
+                    f"{prefix}*** remote build session closed ({text}); "
+                    "the build was aborted ***\n",
+                )
                 _fail_locally(
                     controller,
                     job,
