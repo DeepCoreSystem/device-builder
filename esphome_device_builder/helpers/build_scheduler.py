@@ -12,14 +12,15 @@ receiver.
 
 The decision function is intentionally side-effect-free: no
 controller references, no event-bus interaction, no I/O. The
-caller (eventually the ``firmware/install`` WS handler in 7a-3)
+caller (the ``firmware/install`` WS handler in 7a-3)
 gathers the state and threads it in. Two reasons for that shape:
 
 * **Unit-testability.** The candidate-filter rules
-  (PENDING vs APPROVED, connected vs not, idle vs running) all
-  flow through one function with simple inputs; the test suite
-  covers them without standing up the controllers or the event
-  bus.
+  (PENDING vs APPROVED, connected vs not) and the two-tier
+  pick (idle preference then queue-on-busy fallback) all
+  flow through one function with simple inputs; the test
+  suite covers them without standing up the controllers or
+  the event bus.
 * **Lifetime.** The state the function reads is RAM-canonical
   and lives on :class:`RemoteBuildController` (``_pairings``,
   ``_open_peer_links``, ``_peer_queue_status``). Passing it in
@@ -38,16 +39,21 @@ What this module *does not* do:
   through the pair-time handshake into the persisted row. Wiring
   that needs a separate piece of work; the placeholder is
   documented inline at the filter site so the gate's home is
-  obvious when the value lands. Until then, every connected +
-  idle APPROVED pairing is a candidate regardless of receiver
+  obvious when the value lands. Until then, every connected
+  APPROVED pairing is a candidate regardless of receiver
   version.
-* **Load-balancing across multiple candidates.** Picks the
-  first connected + idle pairing in the dict-iteration order
-  the caller passes in (insertion-order = ``paired_at``-order
-  for ``RemoteBuildController._pairings``). Round-robin /
-  least-loaded / cache-hot-affinity are 7a-3+ concerns; the
-  design doc explicitly puts the picking policy beyond this
-  first cut.
+* **Load-balancing across multiple candidates.** Pick policy
+  is two-tier: first pass walks eligible pairings sorted by
+  oldest ``paired_at`` and picks the first one whose
+  ``queue_status`` snapshot reports ``idle=True``; second
+  pass picks the oldest eligible pairing regardless of idle
+  state. Concurrent installs fan out across idle remotes
+  (first pass), and when every paired remote is busy the
+  oldest queues a job behind whatever's running (second
+  pass) rather than silently falling back to LOCAL.
+  Round-robin / least-loaded / cache-hot-affinity are
+  later-iteration concerns; the design doc explicitly puts
+  richer picking policy beyond this first cut.
 * **Caller integration.** The ``firmware/install`` WS handler
   route-through lands in 7a-3 alongside the event-stream
   bridge that re-fires ``OFFLOADER_JOB_*`` as local-shaped
@@ -204,19 +210,36 @@ def pick_build_path(inputs: BuildSchedulerInputs) -> BuildPathDecision:
       ``OFFLOADER_PEER_LINK_OPENED`` / ``_CLOSED`` events. An
       APPROVED pairing whose session is reconnecting (or
       orphaned via ``pin_mismatch`` / ``superseded``) doesn't
-      qualify; the design doc's "silent fallback to local"
-      stance is what falls out here.
-    * **Idle queue.** ``inputs.peer_queue_status`` carries the
-      most recent 5b ``queue_status`` snapshot per pin. A busy
-      receiver isn't a candidate today — first-cut policy is
-      "idle or fall back to local"; future iterations may
-      queue work onto a non-idle pairing if every candidate is
-      busy and the local fallback is more expensive than
-      waiting (cf. design doc edge case 4 — local cache hot).
-      Missing entry (no snapshot received yet) also disqualifies
-      the pairing: we have no signal that the receiver can
-      actually accept work, so falling through to local is the
-      safe move.
+      qualify and falls through to LOCAL when no other
+      eligible pairing exists.
+
+    The pick is **two-tier**:
+
+    1. **First pass — idle preference.** Walk pairings in
+       oldest-``paired_at`` order; pick the first APPROVED +
+       connected pairing whose ``queue_status`` snapshot
+       reports ``idle=True``. This fans new installs out
+       across multiple idle remotes (request 1 lands on
+       remote A, A's snapshot flips to running, request 2
+       lands on the next idle remote B) so the fleet's
+       compile capacity is actually used.
+    2. **Second pass — busy fallback.** If no idle candidate
+       qualified, walk again and pick the first
+       APPROVED + connected pairing regardless of queue
+       state (busy or missing snapshot). The receiver runs
+       its own firmware queue, so the dispatch lands behind
+       whatever's currently building and runs when the
+       queue drains. Silent fallback to LOCAL here used to
+       split the fleet across two compile contexts (warm
+       receiver toolchain vs cold local) and re-flash from
+       a different build than the first Install — confusing
+       and surprising for the user who didn't pick a build
+       location.
+
+    Falls back to LOCAL only when **no** APPROVED + connected
+    pairing exists. A future per-install "Force local"
+    override link in the install dialog is the user-facing
+    way to opt out when the scheduler picks REMOTE.
 
     The status gate uses ``is PeerStatus.APPROVED`` rather than
     a negative match against the current PENDING enum value, so
@@ -251,21 +274,31 @@ def pick_build_path(inputs: BuildSchedulerInputs) -> BuildPathDecision:
         inputs.pairings.items(),
         key=lambda item: (item[1].paired_at, item[0]),
     )
-    for pin_sha256, pairing in ordered:
-        if pairing.status is not PeerStatus.APPROVED:
-            continue
-        if not pairing.enabled:
-            # 7b per-pairing toggle off — operator wants this
-            # receiver paired (Send-builds power-user surface
-            # still works) but doesn't want transparent
-            # install to route here.
-            continue
-        if pin_sha256 not in inputs.open_peer_links:
-            continue
+    # Collect eligible pairings once so both passes walk the
+    # same filtered set. Filtering here (rather than inside
+    # each pass) keeps the eligible-set definition in one
+    # place — a future PeerStatus addition or peer-link gate
+    # added below lands once. ``pairing.enabled`` is the 7b
+    # per-pairing toggle: operator wants this receiver paired
+    # (Send-builds power-user surface still works) but doesn't
+    # want transparent install to route here.
+    eligible: list[tuple[str, StoredPairing]] = [
+        (pin_sha256, pairing)
+        for pin_sha256, pairing in ordered
+        if pairing.status is PeerStatus.APPROVED
+        and pairing.enabled
+        and pin_sha256 in inputs.open_peer_links
+    ]
+    # First pass: pick the oldest idle pairing so multiple
+    # concurrent installs fan out across all idle remotes
+    # before any of them queue.
+    for pin_sha256, _pairing in eligible:
         snapshot = inputs.peer_queue_status.get(pin_sha256)
-        if snapshot is None:
-            continue
-        if not snapshot["idle"]:
-            continue
+        if snapshot is not None and snapshot["idle"]:
+            return BuildPathDecision.remote(pin_sha256)
+    # Second pass: no idle candidate; queue on the oldest
+    # busy receiver rather than falling back to LOCAL.
+    if eligible:
+        pin_sha256, _pairing = eligible[0]
         return BuildPathDecision.remote(pin_sha256)
     return BuildPathDecision.local()
