@@ -13,11 +13,9 @@ import json
 from pathlib import Path
 
 import pytest
-from esphome.storage_json import StorageJSON, ext_storage_path
 
 from esphome_device_builder.helpers.build_artifacts import (
     _firmware_offset_for_platform,
-    _resolve_idedata_path,
     load_build_artifacts,
 )
 
@@ -27,7 +25,7 @@ from ._storage_fixtures import write_storage_json
 def _write_idedata(tmp_path: Path, name: str, payload: object) -> Path:
     """Write ``<tmp_path>/.esphome/idedata/<name>.json`` with *payload*.
 
-    Mirrors :func:`_resolve_idedata_path`'s lookup so
+    Mirrors :func:`helpers.storage_path.resolve_idedata_path`'s lookup so
     :func:`load_build_artifacts` finds it.
     """
     idedata_dir = tmp_path / ".esphome" / "idedata"
@@ -204,12 +202,3 @@ def test_load_build_artifacts_handles_non_dict_extra(tmp_path: Path) -> None:
 def test_firmware_offset_for_platform(platform: str, expected_offset: str) -> None:
     """ESP32 family → ``0x10000``; everything else → ``0x0``."""
     assert _firmware_offset_for_platform(platform) == expected_offset
-
-
-def test_resolve_idedata_path_uses_data_dir_idedata_subtree(tmp_path: Path) -> None:
-    """Idedata path resolves under ``CORE.data_dir / idedata / <name>.json``."""
-    write_storage_json(tmp_path, "kitchen.yaml")
-    storage = StorageJSON.load(ext_storage_path("kitchen.yaml"))
-    assert storage is not None
-    resolved = _resolve_idedata_path(storage)
-    assert resolved == tmp_path / ".esphome" / "idedata" / "kitchen.json"

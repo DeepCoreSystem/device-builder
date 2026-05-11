@@ -50,15 +50,25 @@ def write_storage_json(
     firmware_bin_path: Path | None = None,
     build_path: Path | None = None,
     overrides: dict[str, Any] | None = None,
+    data_dir: Path | None = None,
 ) -> Path:
     """
     Write a StorageJSON sidecar for *configuration* under *tmp_path*.
 
     Returns the sidecar path so the test can wipe it for "missing
-    sidecar" cases. Mirrors ``ext_storage_path``'s layout
-    (``<tmp_path>/.esphome/storage/<configuration>.json``) so a
-    monkeypatched redirect of ``ext_storage_path`` to ``tmp_path``
-    lands on the right file.
+    sidecar" cases. Default layout mirrors ``ext_storage_path``
+    (``<tmp_path>/.esphome/storage/<basename>.json``, keyed on the
+    YAML's basename — same shape esphome's ``storage_path()``
+    writes) so a monkeypatched redirect of ``ext_storage_path``
+    to ``tmp_path`` lands on the right file.
+
+    ``data_dir`` overrides the parent of the ``storage/`` directory
+    when set — used by the 7a-5 remote-build fixtures to mirror
+    the per-build subtree the receiver-side compile subprocess
+    writes into (``<config_dir>/.esphome/.remote_builds/<id>/<device>/``).
+    The sidecar then lands at
+    ``<data_dir>/storage/<basename>.json``; the keyspace still
+    matches esphome's ``CORE.config_filename``-keyed write.
 
     ``firmware_bin_path`` is the typical override knob — pass
     ``None`` (the default) to model "compile aborted before link",
@@ -69,9 +79,17 @@ def write_storage_json(
     ``framework``, ``board``, …) goes through *overrides* — fields
     not listed there fall through to the defaults above.
     """
-    storage_dir = tmp_path / ".esphome" / "storage"
+    storage_dir = (data_dir or tmp_path / ".esphome") / "storage"
     storage_dir.mkdir(parents=True, exist_ok=True)
-    sidecar = storage_dir / f"{configuration}.json"
+    # Key on the basename for both code paths — mirrors esphome's
+    # ``CORE.config_filename`` (which is ``Path(config_path).name``)
+    # so the sidecar lands at ``storage/<basename>.json`` regardless
+    # of whether the caller passed a bare ``kitchen.yaml`` or a
+    # nested ``.esphome/.remote_builds/<id>/kitchen/kitchen.yaml``.
+    # Without this, a non-basename configuration would try to write
+    # to ``storage/<segments>/<base>.json`` and fail on the absent
+    # intermediate dir.
+    sidecar = storage_dir / f"{Path(configuration).name}.json"
 
     stem = Path(configuration).stem
     payload = dict(_STORAGE_DEFAULTS)

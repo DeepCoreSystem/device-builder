@@ -52,10 +52,10 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
-from esphome.core import CORE
-from esphome.storage_json import StorageJSON, ext_storage_path
+from esphome.storage_json import StorageJSON
 
 from .json import loads as json_loads
+from .storage_path import resolve_idedata_path, resolve_storage_path
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -154,9 +154,10 @@ def load_build_artifacts(configuration: str) -> BuildArtifacts:
     declared it but the build target may not have emitted
     it).
     """
-    storage = StorageJSON.load(ext_storage_path(configuration))
+    storage_path = resolve_storage_path(configuration)
+    storage = StorageJSON.load(storage_path)
     if storage is None:
-        msg = f"StorageJSON sidecar missing for {configuration}"
+        msg = f"StorageJSON sidecar missing for {configuration}: {storage_path}"
         raise FileNotFoundError(msg)
     if storage.firmware_bin_path is None:
         msg = f"firmware_bin_path unset in StorageJSON for {configuration}"
@@ -166,7 +167,7 @@ def load_build_artifacts(configuration: str) -> BuildArtifacts:
         msg = f"firmware_bin_path missing for {configuration}: {firmware_bin}"
         raise FileNotFoundError(msg)
 
-    idedata_path = _resolve_idedata_path(storage)
+    idedata_path = resolve_idedata_path(configuration, name=storage.name)
     if not idedata_path.is_file():
         msg = f"idedata.json missing for {configuration}: {idedata_path}"
         raise FileNotFoundError(msg)
@@ -228,20 +229,6 @@ def load_build_artifacts(configuration: str) -> BuildArtifacts:
         flash_images.append(FlashArtifact(path=extra_path, offset=offset))
 
     return BuildArtifacts(flash_images=flash_images, idedata_bytes=idedata_bytes)
-
-
-def _resolve_idedata_path(storage: StorageJSON) -> Path:
-    """Locate the cached ``idedata/<name>.json`` for *storage*'s build.
-
-    Mirrors :func:`esphome.platformio_api._load_idedata`'s
-    path resolution: ``CORE.data_dir / "idedata" /
-    f"{name}.json"``. ``CORE.data_dir`` is the same property
-    :func:`esphome.storage_json.ext_storage_path` uses under
-    the hood, so this stays consistent across the dashboard's
-    deployment modes (default / HA addon / ESPHOME_DATA_DIR
-    override).
-    """
-    return Path(CORE.data_dir) / "idedata" / f"{storage.name}.json"
 
 
 def _firmware_offset_for_platform(target_platform: str) -> str:

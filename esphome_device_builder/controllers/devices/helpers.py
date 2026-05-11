@@ -28,10 +28,11 @@ except ImportError:  # pragma: no cover — covered by the import below
     from esphome.dashboard.util.text import friendly_name_slugify
 
 from esphome.helpers import sort_ip_addresses
-from esphome.storage_json import StorageJSON, ext_storage_path
+from esphome.storage_json import StorageJSON
 
 from ...helpers.api import CommandError
 from ...helpers.hostname import is_local_hostname, normalize_hostname
+from ...helpers.storage_path import resolve_storage_path
 from ...helpers.yaml import read_yaml_scalar, rewrite_name_or_substitution
 from ...models import ConfigEntryType, Device, ErrorCode
 from ..config import clear_volatile_device_metadata, remove_device_metadata
@@ -122,7 +123,7 @@ def _wipe_device_build_dir(configuration: str) -> None:
     sidecar is gone or the device has never been built. Used by
     archive and delete; both treat compile output as dead weight.
     """
-    storage_path = ext_storage_path(configuration)
+    storage_path = resolve_storage_path(configuration)
     storage = StorageJSON.load(storage_path)
     if storage is not None and storage.build_path:
         shutil.rmtree(storage.build_path, ignore_errors=True)
@@ -142,7 +143,7 @@ def _remove_device_sidecars(config_dir: Path, configuration: str) -> None:
     ``friendly_name``, ``comment``) so an unarchive of the same
     YAML restores the user-visible state unchanged.
     """
-    storage_path = ext_storage_path(configuration)
+    storage_path = resolve_storage_path(configuration)
     try:
         storage_path.unlink(missing_ok=True)
     except OSError:
@@ -173,7 +174,7 @@ def _archive_clear_device_sidecars(config_dir: Path, configuration: str) -> None
     ``_remove_device_sidecars`` — a partial wipe doesn't block
     the YAML move that already happened upstream of this call.
     """
-    storage_path = ext_storage_path(configuration)
+    storage_path = resolve_storage_path(configuration)
     try:
         storage_path.unlink(missing_ok=True)
     except OSError:
@@ -189,11 +190,21 @@ def _validate_archive_configuration(configuration: str) -> None:
 
     Defense-in-depth at the public-command boundary for archive /
     unarchive / delete_archived. Each helper builds paths from the
-    user-supplied filename (``<config_dir>/archive/<configuration>``,
-    ``ext_storage_path(configuration)`` -> ``data_dir/storage/<configuration>.json``)
-    that don't all flow through ``Settings.rel_path`` — a value
-    containing path separators or ``..`` segments could resolve
-    outside the intended directory and be unlinked / overwritten.
+    user-supplied filename (``<config_dir>/archive/<configuration>``
+    — used directly without ``Path.name`` collapse — and
+    ``resolve_storage_path(configuration)`` which keys on
+    ``Path(configuration).name`` so it lands at
+    ``data_dir/storage/<basename>.json``). The archive path joins
+    the raw value; a configuration containing path separators or
+    ``..`` segments would resolve outside ``<config_dir>/archive``
+    and let the caller unlink / overwrite an arbitrary file. The
+    storage path is basename-collapsed by ``resolve_storage_path``
+    so the traversal can't escape ``data_dir/storage`` directly,
+    but a value like ``../etc/passwd`` would still collapse to
+    ``passwd.json`` and let a malicious caller target an
+    attacker-named sidecar inside ``data_dir/storage`` (e.g.
+    after writing a file there via another vector). Rejecting
+    non-basename inputs closes both gaps at the WS boundary.
 
     Reject anything where ``Path(value).name != value`` (catches
     ``../foo``, ``sub/foo``, backslash-separated paths on Windows),
