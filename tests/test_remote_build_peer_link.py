@@ -1074,6 +1074,13 @@ async def _drive_peer_link_session_open(
     await ws.send_bytes(msg3)
     encrypted_response = await ws.receive_bytes()
     assert _decode_intent_response(session, encrypted_response) == IntentResponse.OK
+    # The receiver pushes a one-shot ``queue_status`` frame right
+    # after registering the session (cold-connect signal for the
+    # 7a-3 install scheduler). Drain it here so callers asserting
+    # on subsequent application frames don't have to special-case
+    # the initial push at every call site.
+    initial_app_frame = await ws.receive_bytes()
+    assert _decode_app_frame(session, initial_app_frame)["type"] == "queue_status"
     return session, ws, initiator_pub
 
 
@@ -1590,6 +1597,132 @@ async def test_register_peer_link_session_kicks_existing(tmp_path: Path) -> None
     new.terminate.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_register_peer_link_session_pushes_initial_queue_status(tmp_path: Path) -> None:
+    """A freshly-registered session gets a one-shot ``queue_status`` frame.
+
+    The cold-connect signal for the 7a-3 install scheduler: the
+    transition-driven broadcast (``_on_firmware_queue_transition``)
+    only fires when the receiver's local firmware queue mutates.
+    Without the initial push, an offloader that pairs against a
+    receiver whose queue is permanently idle would never see a
+    ``_peer_queue_status`` entry, and ``pick_build_path`` would
+    silently fall back to LOCAL on every install request.
+    """
+    controller = _make_controller(config_dir=tmp_path)
+    controller._db.bus = MagicMock()
+    controller._db.firmware = MagicMock()
+    controller._db.firmware.queue_status_snapshot = MagicMock(return_value=(True, False, 0))
+
+    session = MagicMock(spec=PeerLinkSession)
+    session.dashboard_id = "alpha"
+    session.send_app_frame = AsyncMock(return_value=True)
+
+    await controller.register_peer_link_session(session)
+    # The send is dispatched as a background task; let it drain.
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    session.send_app_frame.assert_awaited_once_with(
+        {"type": "queue_status", "idle": True, "running": False, "queue_depth": 0}
+    )
+
+
+@pytest.mark.asyncio
+async def test_register_peer_link_session_skips_initial_queue_status_when_firmware_missing(
+    tmp_path: Path,
+) -> None:
+    """A controller without a firmware backend registers without a push.
+
+    Firmware queue is wired lazily by ``DeviceBuilder.start()``;
+    a session-register that races a not-yet-wired
+    :attr:`_db.firmware` must not crash. Mirror of the
+    ``self._db.firmware is None`` short-circuit in
+    :meth:`_on_firmware_queue_transition`.
+    """
+    controller = _make_controller(config_dir=tmp_path)
+    controller._db.bus = MagicMock()
+    controller._db.firmware = None  # production pre-``start`` state
+
+    session = MagicMock(spec=PeerLinkSession)
+    session.dashboard_id = "alpha"
+    session.send_app_frame = AsyncMock()
+
+    await controller.register_peer_link_session(session)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    session.send_app_frame.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_register_peer_link_session_swallows_snapshot_exception(tmp_path: Path) -> None:
+    """A ``queue_status_snapshot`` raise mustn't poison session registration.
+
+    Best-effort contract: the initial push is a cold-connect
+    optimisation, not a load-bearing step. A raise from
+    ``firmware.queue_status_snapshot`` (mock contract drift,
+    unexpected internal error, etc.) gets logged and swallowed
+    so the session still registers cleanly; the transition-
+    driven broadcast catches the offloader up on the next
+    queue change. Mirrors the swallow-and-log stance of
+    :meth:`_broadcast_queue_status` for per-session sends.
+    """
+    controller = _make_controller(config_dir=tmp_path)
+    controller._db.bus = MagicMock()
+    controller._db.firmware = MagicMock()
+    controller._db.firmware.queue_status_snapshot = MagicMock(side_effect=RuntimeError("boom"))
+
+    session = MagicMock(spec=PeerLinkSession)
+    session.dashboard_id = "alpha"
+    session.send_app_frame = AsyncMock()
+
+    # Must not raise — register completes cleanly even on a bad
+    # snapshot read.
+    await controller.register_peer_link_session(session)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    # Push skipped, but the session is registered.
+    session.send_app_frame.assert_not_called()
+    assert controller._peer_link_sessions["alpha"] is session
+
+
+@pytest.mark.asyncio
+async def test_register_peer_link_session_swallows_send_app_frame_exception(
+    tmp_path: Path,
+) -> None:
+    """A ``send_app_frame`` raise inside the background task is logged, not propagated.
+
+    ``send_app_frame`` already swallows the common transport /
+    encrypt / serialise failures and returns ``False``; the
+    inner ``except Exception`` in :meth:`_send_initial_queue_status`
+    is the catch-all for an unexpected raise (mock contract
+    drift, future code path that raises before the inner gate).
+    Pins that an unhandled raise from the send doesn't leak into
+    the background task's exception handler — the offloader
+    catches up on the next queue transition instead.
+    """
+    controller = _make_controller(config_dir=tmp_path)
+    controller._db.bus = MagicMock()
+    controller._db.firmware = MagicMock()
+    controller._db.firmware.queue_status_snapshot = MagicMock(return_value=(True, False, 0))
+
+    session = MagicMock(spec=PeerLinkSession)
+    session.dashboard_id = "alpha"
+    session.send_app_frame = AsyncMock(side_effect=RuntimeError("boom"))
+
+    await controller.register_peer_link_session(session)
+    # Drain the background task; the inner swallow must keep
+    # the raise from surfacing as an unhandled task exception.
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    session.send_app_frame.assert_awaited_once()
+    # Session still registered — the failed push doesn't roll it back.
+    assert controller._peer_link_sessions["alpha"] is session
+
+
 def test_unregister_peer_link_session_no_op_when_replaced(tmp_path: Path) -> None:
     """Unregistering a session that has already been replaced doesn't evict the new one."""
     controller = _make_controller(config_dir=tmp_path)
@@ -1993,6 +2126,16 @@ async def test_run_peer_link_session_heartbeat_closures_route_to_session(
     # the heartbeat task — the helper sets ``heartbeat_started``
     # the moment its callbacks land in ``captured``.
     await asyncio.wait_for(heartbeat_started.wait(), timeout=2.0)
+    # ``register_peer_link_session`` now schedules a one-shot
+    # ``queue_status`` push on session open (cold-connect signal
+    # for the 7a-3 install scheduler). Wait for that frame to
+    # land in ``ws.sends`` and decrypt it so the initiator's
+    # nonce counter advances; subsequent ping / terminate
+    # decrypts on the same Noise session are then aligned.
+    while not ws.sends:
+        await asyncio.sleep(0)
+    initial = _json.loads(initiator.decrypt(ws.sends[-1]))
+    assert initial["type"] == "queue_status"
 
     # Exercise ``_send_ping`` — the closure encrypts and sends a
     # ping frame through ``send_app_frame``.
