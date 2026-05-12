@@ -12,7 +12,7 @@ slipping past two unit suites that pass on the same drift.
 
 The chain:
 
-  offloader-side ``RemoteBuildController.cancel_job`` WS handler
+  offloader-side ``OffloaderController.cancel_job`` WS handler
                        →  ``PeerLinkClient.cancel_job``
                        →  peer-link ``cancel_job`` frame
                           (real Noise AEAD)
@@ -88,8 +88,10 @@ def receiver_firmware_cancel(paired_instances: PairedInstances) -> _FirmwareCanc
         called.set()
 
     cancel = AsyncMock(side_effect=_record_call)
-    paired_instances.receiver._db.firmware = MagicMock()
-    paired_instances.receiver._db.firmware.cancel = cancel
+    firmware = MagicMock()
+    firmware.cancel = cancel
+    firmware.queue_status_snapshot = MagicMock(return_value=(True, False, 0))
+    paired_instances.receiver._db.firmware = firmware
     return _FirmwareCancelStub(mock=cancel, called=called)
 
 

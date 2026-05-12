@@ -631,7 +631,7 @@ async def test_submit_job_carries_display_fields_through_to_firmware_job(
       Device list at install time, so the receiver doesn't
       re-parse the bundled YAML).
     * ``remote_peer_label`` is snapshotted at submit time via
-      :meth:`RemoteBuildController.approved_peer_label` —
+      :meth:`ReceiverController.approved_peer_label` —
       symmetric to ``source_label`` on the offloader side.
 
     A regression that drops any of the three would leave the
@@ -641,11 +641,11 @@ async def test_submit_job_carries_display_fields_through_to_firmware_job(
     """
     firmware = _make_firmware_controller()
     # Wire the receiver's peer-label lookup. The receiver
-    # routes through :meth:`RemoteBuildController.approved_peer_label`
+    # routes through :meth:`ReceiverController.approved_peer_label`
     # so stub that accessor directly rather than seeding the
     # private ``_approved_peers`` dict.
     firmware._db = MagicMock()
-    firmware._db.remote_build.approved_peer_label.return_value = "MacBook Pro"
+    firmware._db.remote_build_receiver.approved_peer_label.return_value = "MacBook Pro"
 
     receiver = _make_receiver(tmp_path, firmware)
     session = _make_session(dashboard_id="alpha-dashboard")
@@ -702,7 +702,7 @@ async def test_submit_job_malformed_display_fields_coerce_to_empty(
     """
     firmware = _make_firmware_controller()
     firmware._db = MagicMock()
-    firmware._db.remote_build.approved_peer_label.return_value = ""
+    firmware._db.remote_build_receiver.approved_peer_label.return_value = ""
     receiver = _make_receiver(tmp_path, firmware)
     session = _make_session(dashboard_id="alpha-dashboard")
     bundle = make_tar_bundle("kitchen.yaml", b"esphome:\n  name: kitchen\n")
@@ -757,7 +757,7 @@ async def test_submit_job_missing_display_fields_falls_through_to_empty_strings(
     """
     firmware = _make_firmware_controller()
     firmware._db = MagicMock()
-    firmware._db.remote_build.approved_peer_label.return_value = ""
+    firmware._db.remote_build_receiver.approved_peer_label.return_value = ""
     receiver = _make_receiver(tmp_path, firmware)
     session = _make_session(dashboard_id="alpha-dashboard")
     bundle = make_tar_bundle("kitchen.yaml", b"esphome:\n  name: kitchen\n")

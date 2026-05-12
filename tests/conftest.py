@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 from unittest.mock import AsyncMock, MagicMock
@@ -36,7 +37,10 @@ from esphome_device_builder.controllers.components import ComponentCatalog
 from esphome_device_builder.controllers.config import DashboardSettings
 from esphome_device_builder.controllers.devices import DevicesController
 from esphome_device_builder.controllers.firmware import FirmwareController
-from esphome_device_builder.controllers.remote_build import RemoteBuildController
+from esphome_device_builder.controllers.remote_build import (
+    OffloaderController,
+    ReceiverController,
+)
 from esphome_device_builder.helpers.event_bus import Event, EventBus
 from esphome_device_builder.models import AdoptableDevice, Device, DeviceState, EventType
 
@@ -188,30 +192,61 @@ def capture_events(bus: EventBus, event_type: EventType) -> _CapturedEvents:
     return captured
 
 
+@dataclass(frozen=True)
+class RemoteBuildTestHandles:
+    """Test-only bundle of the two sibling remote-build controllers.
+
+    Production code accesses the two siblings
+    (:class:`OffloaderController` and :class:`ReceiverController`)
+    as separate attributes on :class:`DeviceBuilder`. Tests model
+    that shape exactly: reach through ``handles.offloader`` for
+    outbound-side state + methods, ``handles.receiver`` for
+    inbound-side. The convenience ``start`` / ``stop`` methods
+    bring both sides up together; per-side tests can skip the
+    bundle and instantiate the relevant sibling directly.
+    """
+
+    offloader: OffloaderController
+    receiver: ReceiverController
+
+    @property
+    def _db(self) -> Any:
+        """The shared :class:`DeviceBuilder` ref both siblings hold.
+
+        Both siblings stash the same ``DeviceBuilder`` ref in
+        ``__init__``; this accessor lets test code reach
+        ``handles._db.firmware`` etc. without picking a sibling
+        arbitrarily.
+        """
+        return self.offloader._db
+
+    async def start(self) -> None:
+        """Start both siblings, in the same order ``DeviceBuilder`` does."""
+        await self.offloader.start()
+        await self.receiver.start()
+
+    async def stop(self) -> None:
+        """Stop both siblings, in the same order ``DeviceBuilder`` does."""
+        await self.offloader.stop()
+        await self.receiver.stop()
+
+
 def make_remote_build_controller(
     *,
     config_dir: Path,
     bus: EventBus | None = None,
-) -> RemoteBuildController:
-    """Build a :class:`RemoteBuildController` against a stub :class:`DeviceBuilder`.
+) -> RemoteBuildTestHandles:
+    """Build both remote-build sibling controllers against a stub :class:`DeviceBuilder`.
 
-    Single source of truth for the per-test stub-DB shape: pre-fix
-    every remote-build test file copy-pasted its own
-    ``_make_controller`` with the same MagicMock plumbing.
+    Single source of truth for the per-test stub-DB shape.
     Mounted on a real :class:`EventBus` when *bus* is provided
     (e.g. the e2e harness's two-instance setup), otherwise
-    ``MagicMock`` auto-attribute resolution gives the controller
-    a no-op ``bus.fire`` — the convention single-side tests use.
+    ``MagicMock`` auto-attribute resolution gives the controllers
+    a no-op ``bus.fire``.
 
     ``db.create_background_task`` is wired to
     :func:`asyncio.create_task` rather than left as a MagicMock so
-    coroutines passed through it actually run. Single-side tests
-    that don't drive any background-scheduled work won't notice;
-    the e2e harness needs the wiring because the receiver-side
-    fan-out (``JobFanout._dispatch``) hands its
-    ``send_app_frame`` calls through this path, and a no-op
-    background-task hook would silently drop every fan-out frame
-    without ever raising on the unawaited coroutine.
+    coroutines passed through it actually run.
     """
     db = MagicMock()
     db.devices = MagicMock()
@@ -220,17 +255,13 @@ def make_remote_build_controller(
     db.settings = MagicMock()
     db.settings.config_dir = config_dir
     db.create_background_task = asyncio.create_task
-    # ``register_peer_link_session`` calls ``firmware.queue_status_snapshot()``
-    # to push an initial idle / running / depth signal to a
-    # freshly-connected offloader (cold-connect gap fix). The
-    # default MagicMock auto-attribute returns a MagicMock that
-    # doesn't unpack as a 3-tuple, so pin a sane "fresh queue is
-    # idle" shape here — same value the production firmware
-    # controller returns on a never-built queue.
     db.firmware.queue_status_snapshot = MagicMock(return_value=(True, False, 0))
     if bus is not None:
         db.bus = bus
-    return RemoteBuildController(db)
+    return RemoteBuildTestHandles(
+        offloader=OffloaderController(db),
+        receiver=ReceiverController(db),
+    )
 
 
 async def cancel_and_drain(task: asyncio.Task[Any]) -> None:
@@ -532,12 +563,14 @@ def _hermetic_lifecycle(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(DeviceMqttCoordinator, "reconcile", AsyncMock())
     monkeypatch.setattr(DeviceMqttCoordinator, "stop", AsyncMock())
     # The remote-build feature wires a second mDNS browser
-    # behind ``RemoteBuildController.start``. The lifecycle tests use
+    # behind ``OffloaderController.start``. The lifecycle tests use
     # the same "stub start/stop on the class" trick to keep the
     # smoke test hermetic — the per-controller test file
     # ``test_remote_build_controller.py`` exercises the real browser.
-    monkeypatch.setattr(RemoteBuildController, "start", AsyncMock())
-    monkeypatch.setattr(RemoteBuildController, "stop", AsyncMock())
+    monkeypatch.setattr(OffloaderController, "start", AsyncMock())
+    monkeypatch.setattr(OffloaderController, "stop", AsyncMock())
+    monkeypatch.setattr(ReceiverController, "start", AsyncMock())
+    monkeypatch.setattr(ReceiverController, "stop", AsyncMock())
     monkeypatch.setattr(BoardCatalog, "load", lambda self: None)
     monkeypatch.setattr(ComponentCatalog, "load", lambda self: None)
     # ``CORE`` is a process-global; without restoration via

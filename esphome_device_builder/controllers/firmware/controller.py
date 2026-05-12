@@ -364,7 +364,7 @@ class FirmwareController:  # noqa: PLR0904 (grandfathered; new public methods ne
 
         Reads the remote-build controller's RAM-canonical
         ``(_pairings, _open_peer_links)`` state via
-        :meth:`RemoteBuildController.build_scheduler_snapshot`.
+        :meth:`OffloaderController.build_scheduler_snapshot`.
         Approved + connected peers get a job each; everything else
         is silently skipped (a PENDING row can't accept submits,
         a disconnected approved row would just FAIL on the runner's
@@ -378,10 +378,10 @@ class FirmwareController:  # noqa: PLR0904 (grandfathered; new public methods ne
         the fan-out shows up as "I clicked Clean but my receiver
         still has the old build".
         """
-        remote_build = self._db.remote_build
-        if remote_build is None:
+        offloader = self._db.remote_build_offloader
+        if offloader is None:
             return
-        snapshot = remote_build.build_scheduler_snapshot()
+        snapshot = offloader.build_scheduler_snapshot()
         # ``build_scheduler_snapshot`` ``dict(self._pairings)``-copies
         # on construction, so iteration is already isolated from a
         # concurrent unpair landing on a different loop tick.
@@ -1384,7 +1384,7 @@ class FirmwareController:  # noqa: PLR0904 (grandfathered; new public methods ne
 
         Step 2 has to land *before* step 3: the ``queue_status``
         broadcaster
-        (:meth:`RemoteBuildController._on_firmware_queue_transition`)
+        (:meth:`ReceiverController._on_firmware_queue_transition`)
         reads :meth:`queue_status_snapshot` *synchronously*
         inside the fire and needs to see the post-terminal idle
         state. Without the prior release the snapshot reports
@@ -1862,13 +1862,13 @@ class FirmwareController:  # noqa: PLR0904 (grandfathered; new public methods ne
         """
         if _is_serial_port(port):
             return JobSource.LOCAL, "", ""
-        remote_build = self._db.remote_build
-        if remote_build is None:
+        offloader = self._db.remote_build_offloader
+        if offloader is None:
             return JobSource.LOCAL, "", ""
-        decision = pick_build_path(remote_build.build_scheduler_snapshot())
+        decision = pick_build_path(offloader.build_scheduler_snapshot())
         if decision.path is not BuildPath.REMOTE or decision.pin_sha256 is None:
             return JobSource.LOCAL, "", ""
-        pairing = remote_build.get_pairing(decision.pin_sha256)
+        pairing = offloader.get_pairing(decision.pin_sha256)
         if pairing is None:
             # Scheduler picked a pin that's no longer paired (race
             # against an ``unpair`` on the same loop tick); silent
