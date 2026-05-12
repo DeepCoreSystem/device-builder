@@ -13,7 +13,6 @@ import contextlib
 import logging
 import os
 import shutil
-import time
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from pathlib import Path
@@ -28,7 +27,7 @@ from esphome.zeroconf import AsyncEsphomeZeroconf
 
 from ...helpers.api import CommandError, api_command
 from ...helpers.build_size import coerce_sidecar_int
-from ...helpers.config_hash import compute_yaml_config_hash, read_build_info_hash
+from ...helpers.config_hash import read_build_info_hash
 from ...helpers.device_yaml import (
     configuration_stem,
     generate_device_yaml,
@@ -38,7 +37,7 @@ from ...helpers.device_yaml import (
     parse_esphome_meta,
     parse_platform_from_yaml,
 )
-from ...helpers.event_bus import Event, StreamControls, stream_events
+from ...helpers.event_bus import Event
 from ...helpers.json import JSONDecodeError, dumps_indent, loads
 from ...helpers.mac_addresses import derive_interface_macs
 from ...helpers.process import kill_quietly
@@ -66,9 +65,6 @@ from ...models import (
     ImportableDeviceAddedData,
     ImportableDeviceRemovedData,
     JobLifecycleData,
-    JobStatus,
-    JobType,
-    ReachabilitySource,
     StreamEvent,
     UpdateDeviceResponse,
     WizardResponse,
@@ -76,7 +72,7 @@ from ...models import (
 from .._build_size_refresher import BuildSizeRefresher
 from .._device_mqtt_coordinator import DeviceMqttCoordinator
 from .._device_scanner import DeviceFileMetadata, DeviceScanner, ScanChange
-from .._device_state_monitor import _MDNS_REFRESH_PADDING_SECONDS, DeviceStateMonitor
+from .._device_state_monitor import DeviceStateMonitor
 from .._reachability_tracker import ReachabilityTracker
 from ..config import (
     get_device_metadata,
@@ -85,6 +81,7 @@ from ..config import (
     set_device_metadata,
 )
 from ..firmware.helpers import _find_esphome_cmd
+from . import firmware_sync, reachability, storage_regen
 from ._yaml_search import (
     DEFAULT_CONTEXT_LINES,
     MAX_CONTEXT_LINES,
@@ -1490,245 +1487,19 @@ class DevicesController:  # noqa: PLR0904 (grandfathered; new public methods nee
         self._schedule_storage_regenerate(configuration)
 
     def _schedule_storage_regenerate(self, configuration: str) -> None:
-        """
-        Run ``esphome compile --only-generate <yaml>`` in the background.
-
-        ``--only-generate`` walks ESPHome's full config validation
-        pipeline (resolving ``!secret`` / ``!include`` / packages /
-        ``dashboard_import``) and writes the resulting StorageJSON
-        without doing a real build. That populates ``address``,
-        ``loaded_integrations``, ``target_platform``, etc. for devices
-        that have never been compiled (the typical "wr2-test was just
-        added and shows UNKNOWN forever" path) and refreshes them
-        whenever the YAML changes.
-
-        Three guards keep this from running away:
-        * ``_regenerate_pending`` skips duplicate schedules for a
-          configuration that's already in flight.
-        * ``_regenerate_failed`` skips YAMLs whose last attempt
-          failed; entries are cleared in ``_on_scan_change`` when the
-          file's cache key changes (i.e. the user actually edited it).
-        * ``regen_failed_mtime`` + ``regen_failed_at`` in the
-          metadata sidecar is the *cross-restart* version of the
-          same skip. The previous backend stamped the YAML's
-          mtime alongside ``time.time()``; a fresh start that
-          finds those two intact and within
-          ``_REGEN_FAILURE_TTL_SECONDS`` short-circuits without
-          spawning another ``esphome compile`` on the same broken
-          config. The check itself runs in an executor so the
-          per-device ``stat()`` and metadata read don't stall the
-          event loop on a fleet-wide cold start. Two retry
-          signals release the guard:
-
-          * The user edits the YAML — its mtime moves past the
-            stamp, so the equality check fails naturally.
-          * The TTL elapses — covers transient external problems
-            (git package server flaky, DNS hiccup) where the
-            user shouldn't have to touch the YAML to recover.
-        * ``_regenerate_lock`` serialises the subprocess itself so we
-          never spawn more than one esphome compile at a time.
-
-        Fire-and-forget: a follow-up ``_scanner.reload(configuration)``
-        on success picks up the new storage and re-emits a
-        ``DEVICE_UPDATED`` event so the frontend reflects the new
-        address / integrations.
-        """
-        if not self._esphome_cmd:
-            return  # ``start()`` hasn't run yet — skip the regenerate.
-        if configuration in self._regenerate_pending:
-            return  # already scheduled, don't queue a duplicate.
-        if configuration in self._regenerate_failed:
-            # Last attempt this session failed and the YAML hasn't
-            # changed since; rerunning would produce the same error.
-            return
-
-        async def _run() -> None:
-            self._regenerate_pending.add(configuration)
-            try:
-                # Cross-restart skip: the previous backend persisted
-                # the YAML's mtime + wall-clock when the regen
-                # failed. If the file hasn't been touched since
-                # *and* the failure stamp is still within the TTL,
-                # replay would fail the same way — turn it into a
-                # no-op. The check itself batches its disk reads
-                # into one executor hop.
-                if await self._regen_already_failed_recently_async(configuration):
-                    self._regenerate_failed.add(configuration)
-                    return
-                async with self._regenerate_lock:
-                    success = await self._spawn_only_generate(configuration)
-                if success:
-                    # ``--only-generate`` writes build_info.json
-                    # with the canonical config_hash before
-                    # exiting, same as a real compile. The single
-                    # executor hop below reads that hash and
-                    # writes the sidecar in one transaction, also
-                    # clearing the regen-failure stamp now that
-                    # the YAML generates cleanly.
-                    await self._finalize_regen_success(configuration)
-                    await self._scanner.reload(configuration)
-                else:
-                    self._regenerate_failed.add(configuration)
-                    await self._stamp_regen_failure(configuration)
-            finally:
-                self._regenerate_pending.discard(configuration)
-
-        self._db.create_background_task(_run())
+        storage_regen.schedule(self, configuration)
 
     async def _spawn_only_generate(self, configuration: str) -> bool:
-        """Run ``esphome compile --only-generate`` once. Return True iff exit-0.
-
-        Both failure modes (spawn raised, or the subprocess exited
-        non-zero) get logged at debug and produce ``False`` so the
-        caller takes the same persist-failure-stamp branch in
-        either case. Pulled out of ``_run()`` so the two failure
-        paths don't have to duplicate the marker-set + persist
-        sequence.
-        """
-        config_path = str(self._db.settings.rel_path(configuration))
-        cmd = [*self._esphome_cmd, "--dashboard", "compile", "--only-generate", config_path]
-        try:
-            proc = await create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr = await proc.communicate()
-        except Exception:
-            _LOGGER.debug("Storage regenerate spawn failed for %s", configuration, exc_info=True)
-            return False
-        if proc.returncode != 0:
-            _LOGGER.debug(
-                "Storage regenerate for %s exited %s: %s",
-                configuration,
-                proc.returncode,
-                stderr.decode(errors="replace").strip()[:500],
-            )
-            return False
-        return True
+        return await storage_regen.spawn_only_generate(self, configuration)
 
     async def _regen_already_failed_recently_async(self, configuration: str) -> bool:
-        """Return True iff the persisted failure stamp is unchanged-and-fresh.
-
-        Both halves have to hold for the guard to fire:
-
-        * The YAML's current ``stat.st_mtime`` equals the cached
-          ``regen_failed_mtime`` — same file as last time (any
-          edit moves the mtime forward).
-        * Less than ``_REGEN_FAILURE_TTL_SECONDS`` has elapsed
-          since the cached ``regen_failed_at`` — covers transient
-          external causes (git package server, DNS, ESPHome
-          mid-flight) by allowing a re-check after the TTL.
-
-        Disk reads (``Path.stat``, the ``.device-builder.json``
-        parse) batch into a single executor job so a cold-start
-        fleet sweep neither stalls the event loop nor double-books
-        the default thread pool. A negative age (clock skew, NTP
-        step, future-dated stamp) clamps to zero; without that
-        clamp a bad sidecar value could lock out the regen
-        indefinitely.
-        """
-        loop = asyncio.get_running_loop()
-        config_dir = self._db.settings.config_dir
-        config_path = self._db.settings.rel_path(configuration)
-
-        def _read() -> tuple[float, dict[str, Any]] | None:
-            # One executor hop for both reads — paying for two
-            # parallel ``run_in_executor`` jobs would just consume
-            # two slots in the shared default thread pool for work
-            # that's already serial on disk anyway.
-            try:
-                mtime = config_path.stat().st_mtime
-            except OSError:
-                return None
-            return mtime, get_device_metadata(config_dir, configuration)
-
-        result = await loop.run_in_executor(None, _read)
-        if result is None:
-            return False
-        current_mtime, md = result
-        cached_mtime = md.get("regen_failed_mtime")
-        cached_at = md.get("regen_failed_at")
-        if not cached_mtime or not cached_at:
-            return False
-        try:
-            mtime_matches = float(cached_mtime) == current_mtime
-            age = max(0.0, time.time() - float(cached_at))
-        except (TypeError, ValueError):
-            return False
-        return mtime_matches and age < _REGEN_FAILURE_TTL_SECONDS
+        return await storage_regen.already_failed_recently_async(self, configuration)
 
     async def _stamp_regen_failure(self, configuration: str) -> None:
-        """Persist the cross-restart "we already tried, gave up" marker — one executor hop.
-
-        Combines the YAML ``stat()`` and the sidecar write into a
-        single closure handed to ``run_in_executor``. The earlier
-        standalone-stamp shape took two hops (one to stat, one to
-        write); on a fleet-wide cold-start each saved hop is a
-        thread-pool slot back to the pool.
-
-        The wall-clock half is sampled inside the closure too, so
-        the stamp captures the same instant the file's mtime was
-        observed instead of straddling a hop.
-        """
-        config_dir = self._db.settings.config_dir
-        config_path = self._db.settings.rel_path(configuration)
-
-        def _stamp() -> None:
-            try:
-                mtime = config_path.stat().st_mtime
-            except OSError:
-                return  # file vanished mid-regen; nothing useful to stamp
-            set_device_metadata(
-                config_dir,
-                configuration,
-                regen_failed_mtime=mtime,
-                regen_failed_at=time.time(),
-            )
-
-        await asyncio.get_running_loop().run_in_executor(None, _stamp)
+        await storage_regen.stamp_failure(self, configuration)
 
     async def _finalize_regen_success(self, configuration: str) -> None:
-        """Read the post-only-generate hash and clear the failure stamp — one executor hop.
-
-        Used to be three separate awaits — read ``build_info.json``,
-        write the hash, write the cleared regen stamp — totalling
-        three executor hops and two sidecar transactions. The
-        closure here folds them together: one ``read_build_info_hash``
-        call, one ``set_device_metadata`` transaction that writes
-        ``expected_config_hash`` and clears
-        ``regen_failed_mtime`` / ``regen_failed_at`` atomically.
-
-        See :meth:`_persist_expected_config_hash` for the rationale
-        on why the hash is read off ``build_info.json`` rather than
-        recomputed in-process — a missing / malformed file is
-        unexpected on this code path so the warning log lives there.
-        """
-        config_dir = self._db.settings.config_dir
-        yaml_path = self._db.settings.rel_path(configuration)
-
-        def _finalize() -> str | None:
-            new_hash = read_build_info_hash(yaml_path)
-            kwargs: dict[str, Any] = {
-                "regen_failed_mtime": 0.0,
-                "regen_failed_at": 0.0,
-            }
-            if new_hash:
-                kwargs["expected_config_hash"] = new_hash
-            set_device_metadata(config_dir, configuration, **kwargs)
-            return new_hash
-
-        new_hash = await asyncio.get_running_loop().run_in_executor(None, _finalize)
-        if not new_hash:
-            _LOGGER.warning(
-                "Could not read config_hash from build_info.json for %s — "
-                "the drawer's Local hash may stay stale until the next flash. "
-                "If this persists across compiles, check that ESPHome's "
-                "build_info.json schema hasn't changed.",
-                configuration,
-            )
-            return
-        _LOGGER.debug("Stored expected_config_hash for %s: %s", configuration, new_hash)
+        await storage_regen.finalize_success(self, configuration)
 
     @api_command("devices/get_api_key")
     async def get_api_key(self, *, configuration: str, **kwargs: Any) -> dict[str, str]:
@@ -2205,133 +1976,13 @@ class DevicesController:  # noqa: PLR0904 (grandfathered; new public methods nee
         broadcast ``subscribe_events`` channel for every other
         connected client. Pair with ``devices/stop_stream`` (or a
         WS disconnect) to unsubscribe.
-
-        Wire shape:
-          → ``{"command": "devices/subscribe_reachability",
-                "message_id": "<id>",
-                "args": {"device_name": "kitchen"}}``
-          ← ``{"event": "reachability_state", "message_id": "<id>",
-                "data": <ReachabilitySnapshot>}``  (initial + on every change)
-          ← ``{"result": {"subscribed": true}, "message_id": "<id>"}``
-          → ``{"command": "devices/stop_stream",
-                "args": {"stream_id": "<id>"}}``  (to end the stream)
-
-        While subscribed AND the device's active source is mDNS,
-        the backend force-refreshes the A record every 60s so a
-        stale broadcast doesn't keep the displayed "last seen" age
-        growing forever. Ping-source devices are already covered by
-        the regular ping sweep; MQTT-source by the discover-publish
-        loop. Both feed the tracker through the same path the
-        initial subscription read.
         """
-        if client is None:
-            return
-        if not device_name:
-            raise CommandError(ErrorCode.INVALID_MESSAGE, "device_name is required")
-        if self.get_reachability_snapshot(device_name) is None:
-            raise CommandError(ErrorCode.NOT_FOUND, f"No configured device named {device_name!r}")
-
-        # Register so a peer ``devices/stop_stream`` (or this client's
-        # cleanup on disconnect) cancels the running task.
-        task = asyncio.current_task()
-        assert task is not None
-        client.register_stream(message_id, task)
-
-        refresh_task: asyncio.Task | None = None
-
-        async def _send_initial(controls: StreamControls) -> None:
-            snapshot = self.get_reachability_snapshot(device_name)
-            if snapshot is not None:
-                await client.send_event(message_id, "reachability_state", snapshot)
-            await client.send_result(message_id, {"subscribed": True})
-
-        def _handle_event(event: Event[DeviceReachabilityData], controls: StreamControls) -> None:
-            data = event.data
-            if data["device"] != device_name:
-                # The bus event is broadcast (one listener for every
-                # subscriber); filter inside the closure so each
-                # subscriber only forwards the events for its device.
-                return
-            controls.push("reachability_state", data)
-
-        try:
-            # Spawn the 60s mDNS refresh loop alongside the stream
-            # so it gets cancelled together with the subscription
-            # when the WS disconnects or ``devices/stop_stream``
-            # cancels this task.
-            refresh_task = asyncio.create_task(self._reachability_refresh_loop(device_name))
-            await stream_events(
-                client=client,
-                message_id=message_id,
-                bus=self._db.bus,
-                event_types=[EventType.DEVICE_REACHABILITY],
-                handle_event=_handle_event,
-                send_initial=_send_initial,
-            )
-        finally:
-            if refresh_task is not None:
-                refresh_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await refresh_task
-            client.unregister_stream(message_id)
+        await reachability.subscribe(
+            self, device_name=device_name, client=client, message_id=message_id
+        )
 
     async def _reachability_refresh_loop(self, device_name: str) -> None:
-        """Schedule mDNS refreshes off the cached A record's expiry.
-
-        Quiet when active source is ping (the regular sweep already
-        runs every 60s) or MQTT (the discover-publish loop already
-        ticks every 2s).
-
-        Why scheduled-on-expiry rather than fixed-interval: the
-        canonical ``async_resolve_host`` short-circuits on cache
-        hit (``_load_from_cache`` returns the cached value if
-        the record is present and not expired), so a
-        fixed-interval probe within the cache's lifetime
-        wouldn't actually go on the wire — we'd just keep
-        re-reading the same cached entry until it eventually
-        ages out and the next iteration finally reaches
-        ``async_request``.
-
-        On every iteration, re-read the cached A record's
-        remaining TTL. If a fresh entry is alive, sleep until it
-        ages out (``ttl_remaining + padding``) then loop —
-        rechecking after the sleep handles the case where an
-        unrelated mDNS announce reached us during the sleep
-        window and re-armed the cache; we just sleep again for
-        the new lifetime instead of issuing a redundant query.
-        Only when the recheck shows expired / absent does the
-        wire query fire — by then ``_load_from_cache`` will fail
-        and ``async_resolve_host`` will actually go on the wire.
-        ESPHome devices are mDNS-silent except in response to
-        probes; ``ServiceBrowser`` only keeps the PTR record
-        (4500s TTL) alive, not A/AAAA (120s). Without this loop
-        the A record decays unrecoverably 120s after the most
-        recent probe.
-        """
-        while True:
-            # Use the A/AAAA-specific TTL — not the union-of-types
-            # ``get_mdns_cache_info``: PTR has a 4500s TTL and
-            # stays cached for ages, so a sleep keyed on it
-            # would never wake up to refresh A. We're driving
-            # the loop off the A record's much shorter 120s
-            # decay because that's the one we actually need to
-            # keep alive for the drawer's freshness display.
-            a_ttl_remaining = self._state_monitor.get_mdns_a_record_ttl_remaining(device_name)
-            if a_ttl_remaining is not None and a_ttl_remaining > 0:
-                # A still alive — sleep until just past expiry,
-                # then re-check rather than probing immediately.
-                # A fresh announce arriving during the sleep
-                # would re-arm the cache and the recheck spares
-                # us a redundant wire query.
-                await asyncio.sleep(a_ttl_remaining + _MDNS_REFRESH_PADDING_SECONDS)
-                continue
-            # A expired or absent — probe the wire to refresh
-            # it. The padding before the first probe also gives
-            # the subscription's initial snapshot a chance to
-            # land before we issue our first query.
-            await asyncio.sleep(_MDNS_REFRESH_PADDING_SECONDS)
-            if self._state_monitor.priority_for(device_name) is ReachabilitySource.MDNS:
-                await self.refresh_device_mdns(device_name)
+        await reachability.refresh_loop(self, device_name)
 
     # ------------------------------------------------------------------
     # Internals
@@ -2558,44 +2209,10 @@ class DevicesController:  # noqa: PLR0904 (grandfathered; new public methods nee
         return self._scanner.get_by_name(name)
 
     def _build_reachability_snapshot(self, name: str) -> DeviceReachabilityData | None:
-        """
-        Stitch state + tracker fields into the reachability wire shape.
-
-        The state monitor owns ``state`` / ``active_source`` / ``ip``;
-        the tracker owns the per-signal freshness fields. Both
-        ``get_reachability_snapshot`` (initial WS subscribe) and
-        ``_on_reachability_observation`` (per-event push) need the
-        merged dict, so the device-lookup + delegate-to-tracker
-        combo lives once here. Returns ``None`` when no configured
-        device matches *name*.
-        """
-        bucket = self._scanner.get_by_name(name)
-        if not bucket:
-            return None
-        first = bucket[0]
-        return self._reachability.snapshot(
-            name,
-            state=first.state,
-            active_source=self._state_monitor.priority_for(name),
-            ip=first.ip,
-        )
+        return reachability.build_snapshot(self, name)
 
     def _on_reachability_observation(self, name: str) -> None:
-        """
-        Forward a reachability freshness observation onto the event bus.
-
-        Fires :data:`EventType.DEVICE_REACHABILITY` carrying the full
-        wire-shape snapshot for *name*. The device drawer's per-device
-        subscription filters by ``data["device"]`` and pushes the
-        snapshot to the client. The event is *not* forwarded by the
-        broadcast ``subscribe_events`` channel — adding a periodic
-        per-device freshness ping to every connected client would
-        bloat the bus for no UI gain.
-        """
-        snapshot = self._build_reachability_snapshot(name)
-        if snapshot is None:
-            return
-        self._db.bus.fire(EventType.DEVICE_REACHABILITY, snapshot)
+        reachability.on_observation(self, name)
 
     def get_reachability_snapshot(self, name: str) -> DeviceReachabilityData | None:
         """Return the current reachability snapshot for *name*, or ``None``.
@@ -2605,11 +2222,11 @@ class DevicesController:  # noqa: PLR0904 (grandfathered; new public methods nee
         ``None`` when no configured device matches *name* (the
         subscription handler maps that to a NOT_FOUND error).
         """
-        return self._build_reachability_snapshot(name)
+        return reachability.build_snapshot(self, name)
 
     async def refresh_device_mdns(self, name: str) -> None:
         """Force-refresh a device's mDNS A record. No-op if zeroconf is down."""
-        await self._state_monitor.refresh_mdns(name)
+        await reachability.refresh_device_mdns(self, name)
 
     def _on_state_change(self, name: str, state: DeviceState, source: str) -> None:
         """Forward state monitor updates onto the event bus."""
@@ -2856,166 +2473,23 @@ class DevicesController:  # noqa: PLR0904 (grandfathered; new public methods nee
         return [d for d in self.import_result.values() if d.name not in configured_names]
 
     def _on_firmware_job_completed(self, event: Event[JobLifecycleData]) -> None:
-        """
-        Refresh a device's cached state after a successful firmware job.
-
-        Without this hook, a freshly-flashed device keeps its stale
-        ``has_pending_changes=True`` — the symptom users see as a
-        still-orange "update pending" dot — because the disk scanner
-        only re-evaluates when the YAML file's stat changes.
-
-        COMPILE and INSTALL also recompute the YAML's
-        ``expected_config_hash`` here so the next mDNS resolve can
-        compare against the firmware's broadcast hash; UPLOAD doesn't
-        recompile, so it reuses whatever the previous compile cached.
-        """
-        job = event.data["job"]
-        if job.status != JobStatus.COMPLETED:
-            return
-        job_type = job.job_type
-        if job_type == JobType.RENAME:
-            # ``esphome rename`` deletes the old YAML and writes a new
-            # one with a different filename — neither path is the
-            # ``configuration`` field on the job. A full scan is the
-            # simplest way to pick up both the disappearance of the
-            # old entry and the appearance of the new one.
-            self._db.create_background_task(self._scanner.scan())
-            return
-        configuration = job.configuration
-        if not configuration:
-            return
-        if job_type == JobType.CLEAN:
-            # ``esphome clean`` removes the per-device build tree;
-            # the build-size cache for this device is now stale
-            # (cached non-zero, current dir mtime → 0). The pair-
-            # equality short-circuit in
-            # ``refresh_build_size_if_stale`` detects that and
-            # walks once to clear the cached triple, so the drawer
-            # / table flip back to the em-dash placeholder. No
-            # hash recompute / flash bookkeeping needed for CLEAN.
-            self._build_size.request(configuration)
-            return
-        if job_type not in (JobType.COMPILE, JobType.UPLOAD, JobType.INSTALL):
-            return
-        recompute_hash = job_type in (JobType.COMPILE, JobType.INSTALL)
-        flashed = job_type in (JobType.UPLOAD, JobType.INSTALL)
-        self._db.create_background_task(
-            self._refresh_after_firmware_job(
-                configuration, recompute_hash=recompute_hash, flashed=flashed
-            )
-        )
+        firmware_sync.on_job_completed(self, event)
 
     async def _refresh_after_firmware_job(
         self, configuration: str, *, recompute_hash: bool, flashed: bool
     ) -> None:
-        """
-        Persist the YAML's freshly-compiled hash and reload the device.
-
-        When *recompute_hash* is True, recomputes the YAML's
-        ``CORE.config_hash`` and writes it to the metadata sidecar so
-        the next mDNS resolve can compare against the firmware's
-        broadcast. The device is always reloaded afterwards — even
-        when hash computation is skipped or fails — so the mtime side
-        of ``has_pending_changes`` still flips after a successful
-        compile.
-
-        When *flashed* is True (UPLOAD or INSTALL completed), the
-        firmware on the device was just replaced with the binary that
-        compiled to ``expected_config_hash``. The reloaded device
-        otherwise keeps the *previous* mDNS-cached
-        ``deployed_config_hash`` — usually a now-stale value — so the
-        hash comparison reads ``expected != deployed`` and the dot
-        stays orange until the rebooted device's mDNS announce
-        propagates. That can be many seconds, sometimes longer if the
-        device's network announce gets dropped, and the user sees a
-        successful flash with a still-orange dot. Optimistically pin
-        deployed = expected on the reloaded device and recompute the
-        flag so the dot clears immediately. mDNS still gets to
-        correct the hash later — if the new firmware advertises a
-        different hash (e.g. because the OTA actually failed and the
-        device kept the old image), ``_on_config_hash_change`` will
-        push the real value back in.
-        """
-        if recompute_hash:
-            await self._persist_expected_config_hash(configuration)
-        await self._scanner.reload(configuration)
-        if flashed:
-            self._sync_deployed_hash_after_flash(configuration)
-        # A real compile moves the freshness pair the build-size
-        # cache keys off (build-dir mtime + ``build_info.json``
-        # mtime); hand off to the build-size worker so the drawer
-        # / table show an up-to-date "Build size" value the next
-        # time the frontend reads the device list. The worker
-        # short-circuits when the pair didn't actually move (e.g.
-        # an UPLOAD-only job that didn't recompile).
-        self._build_size.request(configuration)
+        await firmware_sync.refresh_after_job(
+            self, configuration, recompute_hash=recompute_hash, flashed=flashed
+        )
 
     async def _persist_expected_config_hash(self, configuration: str) -> None:
-        """
-        Read the canonical config_hash from build_info.json and persist it.
-
-        ESPHome's build (and ``--only-generate``) writes the
-        ``config_hash`` to ``build_info.json`` after running the full
-        validate + codegen pipeline. We read that value back rather
-        than recompute it, because reproducing the build's hash
-        in-process is fragile — ``CORE.config_hash`` is sensitive to
-        post-codegen state (id-pinning, default backfill,
-        normalisation) that ``read_config`` alone doesn't apply.
-        Verified against ``acfloatmonitor32.yaml``: pre-codegen yields
-        ``f3e21d5a`` while the firmware bakes in ``5a94a12d``.
-
-        No-op when the hash can't be read. The caller is on the
-        post-build / post-only-generate path, so a missing or
-        malformed ``build_info.json`` here is unexpected — log a
-        warning so an upstream ESPHome shape change doesn't
-        silently leave the sidecar out of date.
-        ``compute_has_pending_changes`` will lean on the bin mtime
-        in that gap, which catches the "user just edited the YAML"
-        case but won't notice firmware that's drifted from the
-        compile (e.g. flashed elsewhere) — the dot can read
-        in-sync when it shouldn't until the next real flash
-        rewrites the sidecar.
-        """
-        yaml_path = self._db.settings.rel_path(configuration)
-        new_hash = await compute_yaml_config_hash(yaml_path)
-        if not new_hash:
-            _LOGGER.warning(
-                "Could not read config_hash from build_info.json for %s — "
-                "the drawer's Local hash may stay stale until the next flash. "
-                "If this persists across compiles, check that ESPHome's "
-                "build_info.json schema hasn't changed.",
-                configuration,
-            )
-            return
-        await self._persist_device_metadata_async(configuration, expected_config_hash=new_hash)
-        _LOGGER.debug("Stored expected_config_hash for %s: %s", configuration, new_hash)
+        await firmware_sync.persist_expected_config_hash(self, configuration)
 
     def _sync_deployed_hash_after_flash(self, configuration: str) -> None:
-        """
-        Optimistically align ``deployed_config_hash`` with the just-flashed image.
-
-        See :meth:`_refresh_after_firmware_job` for the rationale.
-        Driving the update through ``apply_config_hash`` lets the
-        existing ``_on_config_hash_change`` callback handle the
-        device-field write + ``DEVICE_UPDATED`` event, so the
-        post-flash sync follows the same code path as a real mDNS
-        announce. ``apply_config_hash`` also seeds the monitor's
-        per-name cache, so when the rebooted device's announce lands
-        with the *same* hash the de-dup short-circuits and we don't
-        fire a redundant event.
-        """
-        device = next(
-            (d for d in self._scanner.devices if d.configuration == configuration),
-            None,
-        )
-        if device is None or not device.expected_config_hash:
-            return
-        self._state_monitor.apply_config_hash(device.name, device.expected_config_hash)
+        firmware_sync.sync_deployed_hash_after_flash(self, configuration)
 
     async def _persist_storage_version_async(self, configuration: str, version: str) -> None:
-        """Update ``StorageJSON.esphome_version`` on disk if it differs."""
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._persist_storage_version, configuration, version)
+        await firmware_sync.persist_storage_version_async(self, configuration, version)
 
     @staticmethod
     def _persist_storage_version(configuration: str, version: str) -> None:
