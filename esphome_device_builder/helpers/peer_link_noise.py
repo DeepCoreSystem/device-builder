@@ -58,15 +58,21 @@ through it. The held-ref pattern is verified by the unit tests.
 from __future__ import annotations
 
 import hashlib
+from functools import lru_cache
 from typing import cast
 
-from noise.connection import Keypair, NoiseConnection
+from noise.backends.default.keypairs import KeyPair25519
+from noise.connection import NoiseConnection
 from noise.exceptions import (
     NoiseHandshakeError,
     NoiseInvalidMessage,
     NoiseMaxNonceError,
     NoiseValueError,
 )
+
+# Noise's pattern-token notation: ``'s'`` is the local static.
+# Mirrors ``noise.connection._keypairs[Keypair.STATIC]``.
+_NOISE_LOCAL_STATIC = "s"
 
 # Standard Noise pattern name. Same cipher suite the ESPHome device
 # API uses (``Noise_NNpsk0_25519_ChaChaPoly_SHA256``); only the
@@ -130,7 +136,7 @@ class PeerLinkNoiseSession:
         """Construct an initiator session bound to *our_static_priv* (32-byte X25519 priv)."""
         nc = NoiseConnection.from_name(NOISE_PATTERN)
         nc.set_as_initiator()
-        nc.set_keypair_from_private_bytes(Keypair.STATIC, our_static_priv)
+        _install_cached_static_keypair(nc, our_static_priv)
         nc.start_handshake()
         return cls(nc)
 
@@ -139,7 +145,7 @@ class PeerLinkNoiseSession:
         """Construct a responder session bound to *our_static_priv* (32-byte X25519 priv)."""
         nc = NoiseConnection.from_name(NOISE_PATTERN)
         nc.set_as_responder()
-        nc.set_keypair_from_private_bytes(Keypair.STATIC, our_static_priv)
+        _install_cached_static_keypair(nc, our_static_priv)
         nc.start_handshake()
         return cls(nc)
 
@@ -270,3 +276,14 @@ def pin_sha256_for_pubkey(static_x25519_pub: bytes) -> str:
     UI and event payloads work in this representation.
     """
     return hashlib.sha256(static_x25519_pub).hexdigest()
+
+
+def _install_cached_static_keypair(nc: NoiseConnection, static_priv: bytes) -> None:
+    """Install our cached static keypair on *nc* (skips the X25519 derive)."""
+    nc.noise_protocol.keypairs[_NOISE_LOCAL_STATIC] = _cached_static_keypair(static_priv)
+
+
+@lru_cache(maxsize=8)
+def _cached_static_keypair(static_priv: bytes) -> KeyPair25519:
+    """Return the derived ``KeyPair25519`` for *static_priv*, building once."""
+    return KeyPair25519.from_private_bytes(static_priv)
