@@ -14,12 +14,8 @@ These tests pin three contracts:
    ``lock_format_version``, ``device_builder_version``, and
    ``start_ts`` — operators / future dashboards reading the file
    must see a stable shape.
-2. **Second start contends** and gets ``exit_code = 1``, with the
-   running PID surfaced on stderr so the operator knows what
-   they're stepping on. Driven via ``multiprocessing.Process`` so
-   the contention is real (cross-process flock); a same-process
-   re-acquire would falsely succeed because flock is reentrant on
-   the same fd.
+2. **Second start contends** and gets ``exit_code = 1``, with
+   the running PID surfaced on stderr.
 3. **A stale lock file is harmless** — the next start re-acquires
    cleanly, so a previous crash doesn't permanently lock the user
    out.
@@ -32,10 +28,9 @@ issue #451's "best-effort or skip entirely" Windows allowance).
 from __future__ import annotations
 
 import json
-import multiprocessing as mp
 import os
 import sys
-import time
+import threading
 from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
@@ -62,65 +57,29 @@ _REQUIRES_FCNTL = pytest.mark.skipif(
 )
 
 
-def _hold_lock(
-    config_dir: str,
-    started: mp.synchronize.Event,
-    release: mp.synchronize.Event,
-) -> None:
-    """
-    Subprocess body: acquire the lock and wait for the parent's signal.
-
-    Used by the contention test — runs in a spawned subprocess
-    (via ``mp.get_context("spawn")``) so the flock is held by a
-    *different* PID than the test runner. Signals via ``started``
-    once the lock is held, then blocks on ``release`` to keep
-    the lock alive until the parent has finished its own
-    (failing) acquisition attempt.
-    """
-    with ensure_single_execution(Path(config_dir)) as lock:
-        if lock.exit_code is not None:
-            # Shouldn't happen — we're the first acquirer.
-            return
-        started.set()
-        release.wait(timeout=10.0)
-
-
 @contextmanager
-def _lock_held_by_subprocess(
-    config_dir: Path,
-) -> Generator[mp.process.BaseProcess]:
-    """
-    Spawn a subprocess that holds the lock for the duration of the ``with``.
+def _lock_held_by_thread(config_dir: Path) -> Generator[None]:
+    """Hold the single-instance lock from a background thread."""
+    started = threading.Event()
+    release = threading.Event()
 
-    Yields the running ``Process`` (so the test body can read
-    ``holder.pid`` for diagnostic-output assertions) and tears
-    everything down on exit: signals the child to release, waits
-    for a clean join, and force-terminates if it didn't exit
-    promptly. Used by both contention tests so the
-    spawn / Event coordination / cleanup boilerplate lives in
-    exactly one place.
-    """
-    ctx = mp.get_context("spawn")
-    started = ctx.Event()
-    release = ctx.Event()
-    holder = ctx.Process(
-        target=_hold_lock,
-        args=(str(config_dir), started, release),
-    )
-    holder.start()
+    def _hold() -> None:
+        with ensure_single_execution(config_dir) as lock:
+            if lock.exit_code is not None:
+                return  # acquisition unexpectedly failed; let started timeout
+            started.set()
+            release.wait(timeout=10.0)
+
+    thread = threading.Thread(target=_hold, daemon=True)
+    thread.start()
     try:
-        # Wait for the child to actually acquire — without this
-        # the parent might race ahead and acquire first, defeating
-        # the test's premise.
         if not started.wait(timeout=5.0):
-            raise RuntimeError("subprocess did not acquire lock in time")
-        yield holder
+            raise RuntimeError("background thread did not acquire lock in time")
+        yield
     finally:
         release.set()
-        holder.join(timeout=5.0)
-        if holder.is_alive():
-            holder.terminate()
-            holder.join(timeout=2.0)
+        thread.join(timeout=5.0)
+        assert not thread.is_alive(), "lock-holder thread did not exit after release"
 
 
 @_REQUIRES_FCNTL
@@ -197,18 +156,8 @@ def test_windows_no_op_yields_success_without_touching_disk(
 def test_contention_with_running_instance_returns_exit_code_1(
     tmp_path: Path, capfd: pytest.CaptureFixture[str]
 ) -> None:
-    """
-    A second start while the lock is held by another PID surfaces ``exit_code=1``.
-
-    Drives the contention via ``multiprocessing.Process`` so the
-    flock is genuinely held by a different PID — same-process
-    flock is reentrant on the same fd and would falsely succeed.
-    Captures stderr to confirm the operator-facing diagnostic
-    output names the running PID.
-    """
-    with _lock_held_by_subprocess(tmp_path) as holder:
-        # Drain anything the child wrote to stderr before we check
-        # the parent's contention output.
+    """A second start while the lock is held surfaces ``exit_code=1``."""
+    with _lock_held_by_thread(tmp_path):
         capfd.readouterr()
 
         with ensure_single_execution(tmp_path) as lock:
@@ -218,7 +167,7 @@ def test_contention_with_running_instance_returns_exit_code_1(
         assert "Another device-builder is already running" in captured.err
         # Surfaces the running PID so operators can ``kill`` or
         # ``ps`` it; this is the headline UX win.
-        assert f"PID: {holder.pid}" in captured.err
+        assert f"PID: {os.getpid()}" in captured.err
         assert str(tmp_path) in captured.err
 
 
@@ -238,11 +187,9 @@ def test_contention_handles_unreadable_lock_file_gracefully(
     holder has flushed its diagnostic record so the parent's
     read sees the garbage, not the holder's clean JSON.
     """
-    with _lock_held_by_subprocess(tmp_path):
-        # Wait briefly so the holder's flush lands before we
-        # overwrite — we want our garbage in the file when the
-        # parent reads on contention.
-        time.sleep(0.05)
+    with _lock_held_by_thread(tmp_path):
+        # ``_write_lock_info`` flushes before the started-signal
+        # fires, so the lock file is already on disk by now.
         (tmp_path / _LOCK_FILE_NAME).write_text("not valid json {{{")
 
         capfd.readouterr()
