@@ -3178,6 +3178,7 @@ async def test_peer_link_client_auth_rejected_when_dashboard_id_unknown(
 @pytest.mark.asyncio
 async def test_peer_link_client_pin_mismatch_aborts_and_orphans(
     receiver_server: tuple[TestServer, ReceiverController, str, bytes],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A pinned pubkey that doesn't match the receiver's actual key aborts the connect.
 
@@ -3217,6 +3218,13 @@ async def test_peer_link_client_pin_mismatch_aborts_and_orphans(
     # XOR-with-0x01 form has none.
     wrong_pub = bytes([receiver_pub[0] ^ 0x01]) + receiver_pub[1:]
     assert wrong_pub != receiver_pub
+    # Real pair-row invariant: ``pin_sha256 == sha256(static_x25519_pub)``
+    # (both are set from the same ``result.remote_static_pub`` in
+    # :meth:`OffloaderController.request_pair`). The pin-drift
+    # warning logs both so an operator can spot a stored-row
+    # corruption (``stored_pin != expected_pin``); we mirror the
+    # production invariant here.
+    wrong_pin = pin_sha256_for_pubkey(wrong_pub)
 
     client = PeerLinkClient(
         receiver_hostname="127.0.0.1",
@@ -3224,36 +3232,56 @@ async def test_peer_link_client_pin_mismatch_aborts_and_orphans(
         identity_priv=initiator_priv,
         dashboard_id="alpha",
         pinned_static_x25519_pub=wrong_pub,
-        pin_sha256="a" * 64,
+        pin_sha256=wrong_pin,
         receiver_label="my-laptop",
         bus=bus,
     )
-    task = asyncio.create_task(client.run())
-    try:
-        # Pin-mismatch fires before close; close fires before
-        # orphaning. Wait on close (the terminal signal).
-        await asyncio.wait_for(closed.received.wait(), timeout=2.0)
-        # Yield once so any pending ``run`` post-close work
-        # (orphan flag set, return) finishes before we assert.
-        for _ in range(10):
-            if task.done():
-                break
-            await asyncio.sleep(0)
+    with caplog.at_level(
+        "WARNING",
+        logger="esphome_device_builder.controllers.remote_build.peer_link_client.client",
+    ):
+        task = asyncio.create_task(client.run())
+        try:
+            # Pin-mismatch fires before close; close fires before
+            # orphaning. Wait on close (the terminal signal).
+            await asyncio.wait_for(closed.received.wait(), timeout=2.0)
+            # Yield once so any pending ``run`` post-close work
+            # (orphan flag set, return) finishes before we assert.
+            for _ in range(10):
+                if task.done():
+                    break
+                await asyncio.sleep(0)
 
-        assert closed[0]["reason"] == "pin_mismatch"
-        assert len(pin_mismatch) == 1
-        assert pin_mismatch[0]["receiver_hostname"] == "127.0.0.1"
-        assert pin_mismatch[0]["receiver_label"] == "my-laptop"
-        assert pin_mismatch[0]["expected_pin"] != pin_mismatch[0]["observed_pin"]
-        # Application channel never opened — bundles can't flow
-        # against the wrong identity.
-        assert len(opened) == 0
-        # Client orphaned: reconnect loop exits without further
-        # backoff. ``run`` has returned, so the task is done.
-        assert task.done()
-        assert client.is_orphaned is True
-    finally:
-        await cancel_and_drain(task)
+            assert closed[0]["reason"] == "pin_mismatch"
+            assert len(pin_mismatch) == 1
+            assert pin_mismatch[0]["receiver_hostname"] == "127.0.0.1"
+            assert pin_mismatch[0]["receiver_label"] == "my-laptop"
+            assert pin_mismatch[0]["expected_pin"] != pin_mismatch[0]["observed_pin"]
+            # Application channel never opened — bundles can't flow
+            # against the wrong identity.
+            assert len(opened) == 0
+            # Client orphaned: reconnect loop exits without further
+            # backoff. ``run`` has returned, so the task is done.
+            assert task.done()
+            assert client.is_orphaned is True
+
+            # Exactly one drift warning, carrying ``stored_pin``,
+            # both fingerprints AND the raw 32-byte hex of each
+            # pubkey so an operator can tell a stored-row corruption
+            # from a bytes-comparison bug from a wire-level identity
+            # mismatch from a single log line.
+            drift_records = [
+                rec for rec in caplog.records if "observed pin drift" in rec.getMessage()
+            ]
+            assert len(drift_records) == 1
+            msg = drift_records[0].getMessage()
+            assert f"stored_pin={wrong_pin}" in msg
+            assert f"expected_pin={pin_sha256_for_pubkey(wrong_pub)}" in msg
+            assert f"expected_bytes={wrong_pub.hex()}" in msg
+            assert f"observed_pin={pin_sha256_for_pubkey(receiver_pub)}" in msg
+            assert f"observed_bytes={receiver_pub.hex()}" in msg
+        finally:
+            await cancel_and_drain(task)
 
 
 @pytest.mark.asyncio
