@@ -15,7 +15,6 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any
 
 import pytest
 from esphome.core import CORE
@@ -24,59 +23,12 @@ from esphome_device_builder.helpers.config_hash import (
     compute_yaml_config_hash,
     read_build_info_hash,
 )
-from tests._storage_fixtures import write_storage_json
-
-
-def _write_storage_pointer(yaml_path: Path, build_path: Path | None) -> None:
-    """Write the ESPHome ``StorageJSON`` sidecar next to *yaml_path*.
-
-    ``build_path=None`` simulates "device has never been compiled" —
-    we just don't write the sidecar at all so ``StorageJSON.load``
-    returns None.
-    """
-    if build_path is None:
-        return
-    write_storage_json(
-        yaml_path.parent,
-        yaml_path.name,
-        firmware_bin_path=build_path / ".pioenvs" / "firmware.bin",
-        build_path=build_path,
-    )
-
-
-def _write_build_info(build_path: Path, **fields: Any) -> None:
-    """Write a ``build_info.json`` with the given fields.
-
-    Defaults match what ESPHome's writer emits (see
-    ``esphome.writer.copy_src_tree``): a 32-bit unsigned int
-    ``config_hash``, a unix ``build_time`` etc. Tests override the
-    one or two fields they care about.
-    """
-    build_path.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "config_hash": 0xDEADBEEF,
-        "build_time": 1700000000,
-        "build_time_str": "2025-11-14 12:00:00 -0500",
-        "esphome_version": "2026.5.0-dev",
-    }
-    payload.update(fields)
-    (build_path / "build_info.json").write_text(json.dumps(payload), encoding="utf-8")
+from tests._storage_fixtures import write_build_info, write_storage_json, write_synthetic_device
 
 
 def _setup(tmp_path: Path, *, hash_value: int | None = 0xDEADBEEF) -> Path:
-    """Write a YAML, sidecar, and build_info.json with *hash_value* under tmp_path.
-
-    Returns the YAML path so each test can pass it to the helper.
-    ``hash_value=None`` skips writing build_info.json (simulates
-    post-clean / never-compiled).
-    """
-    yaml_path = tmp_path / "kitchen.yaml"
-    yaml_path.write_text("esphome:\n  name: kitchen\n", encoding="utf-8")
-    build_path = tmp_path / ".esphome" / "build" / "kitchen"
-    _write_storage_pointer(yaml_path, build_path)
-    if hash_value is not None:
-        _write_build_info(build_path, config_hash=hash_value)
-    return yaml_path
+    """Write a kitchen device under *tmp_path*; return the YAML path."""
+    return write_synthetic_device(tmp_path, "kitchen", config_hash=hash_value)
 
 
 def test_returns_canonical_hex_from_build_info(tmp_path: Path) -> None:
@@ -244,7 +196,7 @@ def test_resolves_storage_through_ext_storage_path(
     target = data_subdir / "storage" / f"{yaml_path.name}.json"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(sidecar_path.read_bytes())
-    _write_build_info(build_path, config_hash=0xCAFEBABE)
+    write_build_info(build_path, config_hash=0xCAFEBABE)
 
     monkeypatch.setenv("ESPHOME_DATA_DIR", str(data_subdir))
     monkeypatch.setattr(CORE, "config_path", config_subdir / "___SENTINEL___.yaml")
