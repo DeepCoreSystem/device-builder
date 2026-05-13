@@ -64,6 +64,13 @@ _STORAGE_LOADED: Final[dict[str, object]] = {
 def synthesize_fleet(config_dir: Path, n: int) -> list[Path]:
     """Materialise *n* synthetic devices under *config_dir*; return sorted YAML paths."""
     config_dir.mkdir(parents=True, exist_ok=True)
+    # Write secrets.yaml so ``!secret`` resolves; otherwise ESPHomeLoader
+    # silently falls back to the pure-Python loader (5-10x slower) and the
+    # bench stops reflecting production.
+    (config_dir / "secrets.yaml").write_text(
+        "wifi_ssid: bench-ssid\nwifi_password: bench-password\n",
+        encoding="utf-8",
+    )
     paths: list[Path] = []
     for index in range(n):
         name = f"device_{index:04d}"
