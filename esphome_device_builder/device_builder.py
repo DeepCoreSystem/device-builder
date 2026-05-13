@@ -374,6 +374,16 @@ class DeviceBuilder:
                 esphome_version=esphome_version,
                 dashboard_id=dashboard_identity.dashboard_id,
             )
+
+        await self.remote_build_receiver.start()
+
+        # Bind the peer-link site BEFORE advertiser register so pin
+        # and port land in the initial ServiceInfo; a post-register
+        # ``async_update_service`` would race python-zeroconf's
+        # initial announce and flap the wire-visible TXT keys.
+        await self._maybe_start_remote_build_site()
+
+        if self._dashboard_advertiser is not None and zeroconf is not None:
             await self._dashboard_advertiser.register(zeroconf)
 
         # Remote-build peer browse (issue #106): browse the same
@@ -385,14 +395,6 @@ class DeviceBuilder:
         # our own service-instance name and filter our broadcast
         # out of the discovered list.
         await self.remote_build_offloader.start()
-        await self.remote_build_receiver.start()
-
-        # Bind the peer-link Noise WS receiver site at
-        # ``/remote-build/peer-link`` if the user has opted in via
-        # ``RemoteBuildSettings.enabled``. Default-off so a
-        # fresh install never opens an inbound port without a
-        # deliberate operator action.
-        await self._maybe_start_remote_build_site()
 
         # Collect command handlers from all controllers
         for controller in (

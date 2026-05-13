@@ -27,6 +27,7 @@ from esphome_device_builder.controllers.config import (
     DashboardSettings,
     remote_build_settings_transaction,
 )
+from esphome_device_builder.controllers.devices import DevicesController
 from esphome_device_builder.controllers.remote_build import (
     OffloaderController,
     ReceiverController,
@@ -35,12 +36,14 @@ from esphome_device_builder.device_builder import (
     DeviceBuilder,
     _strip_server_header_middleware,
 )
+from esphome_device_builder.helpers.dashboard_advertise import DashboardAdvertiser
 from esphome_device_builder.helpers.dashboard_identity import (
     get_or_create_identity,
     rotate_identity,
 )
 from esphome_device_builder.helpers.event_bus import EventBus
 
+from .conftest import MakeSettingsFactory
 from .conftest import RemoteBuildTestHandles as RemoteBuildController
 
 
@@ -253,6 +256,115 @@ async def test_maybe_start_remote_build_site_updates_advertiser_on_success(
         # ``refresh`` was awaited so the TXT change actually
         # leaves the local cache.
         assert fake_advertiser.refresh.called
+    finally:
+        if db._remote_build_runner is not None:
+            await db._remote_build_runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_start_registers_advertiser_with_all_txt_keys_in_one_announce(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    make_settings: MakeSettingsFactory,
+    _hermetic_lifecycle: None,
+) -> None:
+    """``DeviceBuilder.start()`` publishes one ServiceInfo carrying all 4 TXT keys."""
+
+    def _enable() -> None:
+        with remote_build_settings_transaction(tmp_path) as txn:
+            txn.enabled = True
+
+    # ``remote_build_settings_transaction`` does an atomic-write
+    # (``tempfile.mkstemp`` → ``os.path.abspath``); hop through
+    # the executor so blockbuster doesn't trip on the sync I/O
+    # while the test is on the event loop.
+    await asyncio.get_running_loop().run_in_executor(None, _enable)
+
+    # Inject a fake zeroconf via the property so the advertise
+    # branch actually runs; ``_hermetic_lifecycle`` leaves it at
+    # ``None`` (the production "no advertise" path).
+    fake_zc = MagicMock()
+    fake_zc.async_register_service = AsyncMock()
+    fake_zc.async_update_service = AsyncMock()
+    fake_zc.async_unregister_service = AsyncMock()
+    monkeypatch.setattr(DevicesController, "zeroconf", property(lambda self: fake_zc))
+
+    settings = make_settings(with_core_path=True)
+    settings.host = "127.0.0.1"
+    settings.remote_build_port = 0
+    settings.on_ha_addon = False
+    db = DeviceBuilder(settings)
+    try:
+        await db.start()
+
+        # One register published a ServiceInfo with all 4 keys; no
+        # follow-up ``async_update_service`` raced the announce.
+        assert fake_zc.async_register_service.await_count == 1
+        info = fake_zc.async_register_service.call_args.args[0]
+        decoded = {k.decode(): v.decode() for k, v in info.properties.items()}
+        assert set(decoded) == {
+            "server_version",
+            "esphome_version",
+            "pin_sha256",
+            "remote_build_port",
+        }
+        assert fake_zc.async_update_service.await_count == 0
+    finally:
+        await db.stop()
+
+
+@pytest.mark.asyncio
+async def test_maybe_start_remote_build_site_against_unregistered_advertiser_stages_only(
+    tmp_path: Path,
+) -> None:
+    """A bind before advertiser registration stages pin+port and fires no update."""
+    loop = asyncio.get_running_loop()
+
+    def _enable() -> None:
+        with remote_build_settings_transaction(tmp_path) as txn:
+            txn.enabled = True
+
+    await loop.run_in_executor(None, _enable)
+
+    settings = DashboardSettings(config_dir=tmp_path)
+    settings.host = "127.0.0.1"
+    settings.remote_build_port = 0
+    db = DeviceBuilder(settings)
+    db.loop = loop
+    db.remote_build_receiver = MagicMock()
+    db.remote_build_receiver._db.settings.config_dir = tmp_path
+
+    # Real advertiser, deliberately not registered: ``_info`` and
+    # ``_zeroconf`` stay ``None`` so the production ``refresh``
+    # short-circuits without touching the wire.
+    advertiser = DashboardAdvertiser(
+        port=6052,
+        server_version="1.2.3",
+        esphome_version="2026.5.0",
+        dashboard_id="abcd1234",
+    )
+    db._dashboard_advertiser = advertiser
+
+    try:
+        await db._maybe_start_remote_build_site()
+        assert db._remote_build_runner is not None
+        # Pin + port were staged for the next ``build_service_info``.
+        assert advertiser._pin_sha256
+        assert advertiser._remote_build_port is not None
+        # No premature publish: ``_info`` / ``_zeroconf`` still
+        # absent, so ``refresh`` was a no-op.
+        assert advertiser._info is None
+        assert advertiser._zeroconf is None
+        # A subsequent ``build_service_info`` carries all 4 TXT keys
+        # in one shot; what ``register`` will publish.
+        info = advertiser.build_service_info(addresses=["127.0.0.1"])
+        decoded = {k.decode(): v.decode() for k, v in info.properties.items()}
+        assert set(decoded) == {
+            "server_version",
+            "esphome_version",
+            "pin_sha256",
+            "remote_build_port",
+        }
     finally:
         if db._remote_build_runner is not None:
             await db._remote_build_runner.cleanup()
