@@ -55,6 +55,18 @@ class JobSource(StrEnum):
     REMOTE = "remote"
 
 
+@dataclass(frozen=True, slots=True)
+class JobBuildSource:
+    """Bundle of :class:`FirmwareJob` ``source_*`` dispatch-origin fields."""
+
+    source: JobSource = JobSource.LOCAL
+    source_pin_sha256: str = ""
+    source_label: str = ""
+
+
+LOCAL_JOB_BUILD_SOURCE = JobBuildSource()
+
+
 # Terminal job states — a job in any of these isn't running and
 # isn't waiting to run.
 TERMINAL_JOB_STATUSES: frozenset[JobStatus] = frozenset(
