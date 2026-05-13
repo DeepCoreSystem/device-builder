@@ -34,7 +34,8 @@ application messages."
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -168,10 +169,11 @@ class PairedInstances:
         await asyncio.wait_for(self.receiver_closed.received.wait(), timeout=timeout)
 
 
-@pytest.fixture
-async def paired_instances(
-    tmp_path: Path,
-) -> AsyncGenerator[PairedInstances, None]:
+@asynccontextmanager
+async def _paired_instances_ctx(
+    receiver_dir: Path,
+    offloader_dir: Path,
+) -> AsyncIterator[PairedInstances]:
     """Yield two :class:`RemoteBuildController` instances paired via the real flow.
 
     Drives the production pair sequence end-to-end against two
@@ -208,11 +210,6 @@ async def paired_instances(
     receiver's session loop unwinds), then the receiver (closing
     any remaining server-side state), then the TestServer.
     """
-    receiver_dir = tmp_path / "receiver"
-    receiver_dir.mkdir()
-    offloader_dir = tmp_path / "offloader"
-    offloader_dir.mkdir()
-
     receiver_bus = EventBus()
     offloader_bus = EventBus()
     receiver = make_remote_build_controller(config_dir=receiver_dir, bus=receiver_bus)
@@ -314,6 +311,33 @@ async def paired_instances(
         await offloader.stop()
         await receiver.stop()
         await server.close()
+
+
+@pytest.fixture
+async def paired_instances(
+    tmp_path: Path,
+) -> AsyncGenerator[PairedInstances, None]:
+    """Yield two :class:`RemoteBuildController` instances paired via the real flow."""
+    receiver_dir = tmp_path / "receiver"
+    receiver_dir.mkdir()
+    offloader_dir = tmp_path / "offloader"
+    offloader_dir.mkdir()
+    async with _paired_instances_ctx(receiver_dir, offloader_dir) as instances:
+        yield instances
+
+
+@pytest.fixture
+async def paired_instances_relative_receiver_config_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> AsyncGenerator[PairedInstances, None]:
+    """Like :func:`paired_instances` but the receiver's ``config_dir`` is relative (#678)."""
+    monkeypatch.chdir(tmp_path)
+    receiver_dir = Path("receiver")
+    receiver_dir.mkdir()
+    offloader_dir = tmp_path / "offloader"
+    offloader_dir.mkdir()
+    async with _paired_instances_ctx(receiver_dir, offloader_dir) as instances:
+        yield instances
 
 
 def make_remote_peer_job(

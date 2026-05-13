@@ -33,6 +33,7 @@ from esphome_device_builder.controllers.remote_build.submit_job import (
     _validate_configuration_filename,
 )
 from esphome_device_builder.helpers.peer_link_bundle import BUNDLE_CHUNK_SIZE_BYTES
+from esphome_device_builder.helpers.remote_build_layout import RemoteBuildPath
 from esphome_device_builder.models import (
     JobType,
     SubmitJobChunkFrameData,
@@ -561,6 +562,59 @@ async def test_submit_job_happy_path_extracts_and_queues(
     # wire shape (Windows vs Linux receivers); test asserts in
     # the same form.
     assert job.configuration == expected_yaml.relative_to(tmp_path).as_posix()
+    firmware._enqueue.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_submit_job_happy_path_with_relative_config_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Receiver started with a relative ``config_dir`` still queues the job (#678)."""
+    monkeypatch.chdir(tmp_path)
+    rel_config_dir = Path("esphome-configs")
+    rel_config_dir.mkdir()
+
+    firmware = _make_firmware_controller()
+    receiver = SubmitJobReceiver(
+        config_dir=rel_config_dir,
+        firmware_controller=firmware,
+    )
+    session = _make_session(dashboard_id="alpha-dashboard")
+    bundle = make_tar_bundle("kitchen.yaml", b"esphome:\n  name: kitchen\n")
+
+    # Stub returns an absolute path so the post-extract path matches
+    # what real ``prepare_bundle_for_compile`` produces.
+    abs_config_dir = rel_config_dir.resolve()
+    expected_yaml = (
+        RemoteBuildPath(dashboard_id="alpha-dashboard", device_name="kitchen").subtree(
+            abs_config_dir
+        )
+        / "kitchen.yaml"
+    )
+
+    def _stub_prepare(bundle_path: Path, target_dir: Path) -> Path:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        expected_yaml.parent.mkdir(parents=True, exist_ok=True)
+        expected_yaml.write_bytes(b"esphome:\n  name: kitchen\n")
+        return expected_yaml
+
+    monkeypatch.setattr(
+        "esphome_device_builder.controllers.remote_build.submit_job.prepare_bundle_for_compile",
+        _stub_prepare,
+    )
+
+    await receiver.handle_submit_job(session, _header(bundle=bundle))
+    for chunk in _frame_chunks("job-1", bundle):
+        await receiver.handle_submit_job_chunk(session, chunk)
+
+    payload = _ack_payload(session)
+    assert payload["accepted"] is True, payload
+    assert payload["job_id"] == "job-1"
+    assert "reason" not in payload
+
+    assert len(firmware.created_jobs) == 1
+    job = firmware.created_jobs[0]
+    assert job.configuration == expected_yaml.relative_to(abs_config_dir).as_posix()
     firmware._enqueue.assert_awaited_once()
 
 
