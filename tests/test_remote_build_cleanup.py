@@ -98,6 +98,36 @@ def test_sweep_prunes_empty_dashboard_parent(tmp_path: Path) -> None:
     assert not parent.exists()
 
 
+def test_sweep_prunes_dashboard_parent_with_macos_metadata(tmp_path: Path) -> None:
+    """Dashboard_id parent holding only ``.DS_Store`` / ``._*`` still rmdirs."""
+    now = 1_000_000.0
+    key = RemoteBuildPath(dashboard_id="alpha", device_name="kitchen")
+    _populate(tmp_path, key, age_seconds=3600, now=now)
+    dashboard_dir = tmp_path / REMOTE_BUILDS_SUBDIR / "alpha"
+    (dashboard_dir / ".DS_Store").write_bytes(b"\x00\x00\x00\x01Bud1")
+    (dashboard_dir / "._kitchen").write_bytes(b"AppleDouble")
+
+    sweep_remote_builds(tmp_path, ttl_seconds=600, in_flight_keys=frozenset(), now=now)
+    assert not dashboard_dir.exists()
+
+
+def test_sweep_leaves_macos_metadata_alongside_warm_subtree(tmp_path: Path) -> None:
+    """Metadata purge is scoped to metadata-only parents, not non-empty ones."""
+    now = 1_000_000.0
+    warm = RemoteBuildPath(dashboard_id="alpha", device_name="kitchen")
+    _populate(tmp_path, warm, age_seconds=60, now=now)
+    dashboard_dir = tmp_path / REMOTE_BUILDS_SUBDIR / "alpha"
+    ds_store = dashboard_dir / ".DS_Store"
+    apple_double = dashboard_dir / "._kitchen"
+    ds_store.write_bytes(b"\x00\x00\x00\x01Bud1")
+    apple_double.write_bytes(b"AppleDouble")
+
+    sweep_remote_builds(tmp_path, ttl_seconds=600, in_flight_keys=frozenset(), now=now)
+    assert warm.subtree(tmp_path).is_dir()
+    assert ds_store.is_file()
+    assert apple_double.is_file()
+
+
 def test_sweep_keeps_dashboard_parent_when_sibling_still_warm(tmp_path: Path) -> None:
     """A dashboard with one cold + one warm device keeps the parent."""
     now = 1_000_000.0
@@ -412,6 +442,33 @@ def test_sweep_logs_orphan_unlink_failure(tmp_path: Path, monkeypatch: pytest.Mo
     # Should not raise.
     sweep_remote_builds(tmp_path, ttl_seconds=600, in_flight_keys=frozenset(), now=now)
     assert bundle.is_file()
+
+
+def test_sweep_logs_macos_metadata_unlink_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Failed ``.DS_Store`` unlink + the follow-on rmdir failure both stay debug-logs."""
+    now = 1_000_000.0
+    dashboard_dir = tmp_path / REMOTE_BUILDS_SUBDIR / "alpha"
+    dashboard_dir.mkdir(parents=True)
+    ds_store = dashboard_dir / ".DS_Store"
+    ds_store.write_bytes(b"junk")
+
+    real_unlink = Path.unlink
+
+    def _flaky_unlink(self: Path, *args: object, **kwargs: object) -> object:
+        if self == ds_store:
+            raise PermissionError("simulated denied")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", _flaky_unlink)
+
+    # Should not raise. Both defensive arms fire: the unlink
+    # OSError is logged, then the rmdir OSError (dir still
+    # holds the .DS_Store) is logged too.
+    sweep_remote_builds(tmp_path, ttl_seconds=600, in_flight_keys=frozenset(), now=now)
+    assert dashboard_dir.is_dir()
+    assert ds_store.is_file()
 
 
 def test_sweep_continues_after_subtree_rmtree_failure(

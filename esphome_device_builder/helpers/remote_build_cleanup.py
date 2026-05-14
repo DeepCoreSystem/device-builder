@@ -252,7 +252,20 @@ def _reclaim_orphan_bundle(
 
 
 def _prune_empty_dir(directory: Path) -> None:
-    """Remove *directory* if empty; debug-log + continue otherwise."""
+    """Remove *directory* when empty or holding only macOS metadata."""
+    metadata: list[Path] = []
+    for entry in _safe_iterdir(directory):
+        if entry.is_symlink():
+            return
+        name = entry.name
+        if name != ".DS_Store" and not name.startswith("._"):
+            return
+        metadata.append(entry)
+    for entry in metadata:
+        try:
+            entry.unlink()
+        except OSError as exc:
+            _LOGGER.debug("remote-build cleanup: unlink macOS metadata(%s) failed: %s", entry, exc)
     try:
         directory.rmdir()
     except OSError as exc:
