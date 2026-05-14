@@ -50,6 +50,7 @@ from .helpers.dashboard_advertise import DashboardAdvertiser
 from .helpers.dashboard_identity import get_or_create_identity as get_or_create_dashboard_identity
 from .helpers.event_bus import Event, EventBus, StreamControls, stream_events
 from .helpers.json import cors_middleware
+from .helpers.network_interfaces import ensure_single_host_for_ephemeral_port, resolve_bind_host
 from .helpers.peer_link_identity import PeerLinkIdentityStore
 from .helpers.subscriber_presence import SubscriberPresence
 from .models import EventType
@@ -765,18 +766,31 @@ class DeviceBuilder:
 
     async def _start_ingress_site(self, _: web.Application) -> None:
         """Start the trusted HA Ingress TCP site alongside the public site."""
+        hosts = resolve_bind_host(self.settings.ingress_host or "0.0.0.0")
+        ensure_single_host_for_ephemeral_port(hosts, self.settings.ingress_port, "--ingress-port")
         ingress_app = self.create_app(trusted=True, with_lifecycle=False)
         runner = web.AppRunner(ingress_app)
         await runner.setup()
-        host = self.settings.ingress_host or "0.0.0.0"
-        site = web.TCPSite(runner, host, self.settings.ingress_port)
-        await site.start()
+        # Partial-bind cleanup: a multi-host expansion can succeed
+        # on host[0] and fail on host[1]; without this guard the
+        # runner (still owning the host[0] socket) would go out of
+        # scope before ``self._ingress_runner`` is assigned, so
+        # ``_stop_ingress_site`` would see ``None`` and leak the
+        # bound port until process exit.
+        try:
+            for host in hosts:
+                site = web.TCPSite(runner, host, self.settings.ingress_port)
+                await site.start()
+                _LOGGER.info(
+                    "Ingress site listening on %s:%d (trusted, bypasses auth)",
+                    host,
+                    self.settings.ingress_port,
+                )
+        except Exception:
+            with contextlib.suppress(Exception):
+                await runner.cleanup()
+            raise
         self._ingress_runner = runner
-        _LOGGER.info(
-            "Ingress site listening on %s:%d (trusted, bypasses auth)",
-            host,
-            self.settings.ingress_port,
-        )
 
     async def _stop_ingress_site(self, _: web.Application) -> None:
         if self._ingress_runner is not None:
@@ -1089,6 +1103,14 @@ class DeviceBuilder:
         assert loop is not None  # caller-checked
         assert self.remote_build_receiver is not None  # caller-checked
 
+        # Validate before acquiring resources so the caller's
+        # fail-soft handler logs cleanly. The mDNS ``remote_build_port``
+        # TXT field only carries one port, so a multi-host expansion
+        # combined with an ephemeral port has no safe answer.
+        configured_port = self.settings.remote_build_port
+        hosts = resolve_bind_host(self.settings.remote_build_host)
+        ensure_single_host_for_ephemeral_port(hosts, configured_port, "--remote-build-port")
+
         runner: web.AppRunner | None = None
         try:
             identity = await self.peer_link_identity_store.async_load()
@@ -1104,7 +1126,6 @@ class DeviceBuilder:
 
             runner = web.AppRunner(app)
             await runner.setup()
-            configured_port = self.settings.remote_build_port
             # ``reuse_address=True`` is the asyncio default on POSIX
             # but defaults to False on Windows; pin it explicitly so
             # the rotation rebuild path
@@ -1113,13 +1134,14 @@ class DeviceBuilder:
             # (default 6055) cross-platform. The ephemeral-port test
             # path masks this risk because the OS picks a fresh port
             # each rebuild; production deploys with a fixed port.
-            site = web.TCPSite(
-                runner,
-                self.settings.remote_build_host,
-                configured_port,
-                reuse_address=True,
-            )
-            await site.start()
+            for host in hosts:
+                site = web.TCPSite(
+                    runner,
+                    host,
+                    configured_port,
+                    reuse_address=True,
+                )
+                await site.start()
         except Exception:
             if runner is not None:
                 with contextlib.suppress(Exception):
@@ -1191,7 +1213,7 @@ class DeviceBuilder:
             app = self.create_app(trusted=True, with_ingress_site=False)
             web.run_app(
                 app,
-                host=settings.ingress_host or "0.0.0.0",
+                host=resolve_bind_host(settings.ingress_host or "0.0.0.0"),
                 port=settings.ingress_port,
                 shutdown_timeout=_SHUTDOWN_TIMEOUT_SECONDS,
             )
@@ -1199,7 +1221,7 @@ class DeviceBuilder:
         app = self.create_app()
         web.run_app(
             app,
-            host=settings.host,
+            host=resolve_bind_host(settings.host),
             port=settings.port,
             shutdown_timeout=_SHUTDOWN_TIMEOUT_SECONDS,
         )
