@@ -23,10 +23,10 @@ def atomic_write(path: Path, data: bytes, *, mode: int | None = None) -> None:
     """
     Write *data* to *path* atomically.
 
-    Stages bytes in a sibling tempfile, then ``os.replace``s into
+    Stages bytes in a sibling tempfile, then ``Path.replace``s into
     place. Readers see either the old or new bytes, never a
     truncated file. ``mode`` is applied to the staging file before
-    the rename; ``os.replace`` carries that mode to the destination.
+    the rename; ``Path.replace`` carries that mode to the destination.
     """
     fd, tmp_str = tempfile.mkstemp(
         prefix=path.name + ".",
@@ -46,9 +46,9 @@ def atomic_write(path: Path, data: bytes, *, mode: int | None = None) -> None:
             raise
         with fh:
             if mode is not None:
-                os.chmod(tmp_path, mode)
+                tmp_path.chmod(mode)
             fh.write(data)
-        os.replace(tmp_path, path)
+        tmp_path.replace(path)
     except Exception:
         # Suppress all OSError on cleanup so the original write
         # failure isn't masked by a secondary unlink permission
