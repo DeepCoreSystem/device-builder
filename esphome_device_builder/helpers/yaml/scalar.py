@@ -32,11 +32,13 @@ class YamlUpsertNotSupportedError(ValueError):
 
 
 # Mapping-key line: optional leading whitespace, an unquoted scalar
-# key, ``:``, optional whitespace, optional value, optional trailing
-# comment. List items (``- foo: bar``) are excluded — none of the
-# rewrite paths we care about land inside a list, and the key stack
-# below assumes parent → child mapping nesting only.
-_MAPPING_KEY_LINE = re.compile(r"^(?P<indent>\s*)(?P<key>[A-Za-z_][\w-]*):\s*(?P<rest>.*)$")
+# key, ``:``, and the rest of the line verbatim — ``rest`` keeps the
+# post-colon whitespace so :func:`_split_value_and_comment` sees the
+# ``\s+#`` separator on a value-less line (``name: # TODO``). List
+# items (``- foo: bar``) are excluded — none of the rewrite paths we
+# care about land inside a list, and the key stack below assumes
+# parent → child mapping nesting only.
+_MAPPING_KEY_LINE = re.compile(r"^(?P<indent>\s*)(?P<key>[A-Za-z_][\w-]*):(?P<rest>.*)$")
 
 
 def _split_value_and_comment(rest: str) -> tuple[str, str]:
