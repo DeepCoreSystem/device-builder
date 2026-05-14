@@ -1,173 +1,142 @@
-"""
-Tests for ``PingSource.probe_device`` and ``DeviceStateMonitor.probe_device_ping``.
-
-A YAML dropped on disk for a ping-only device (no
-``_esphomelib._tcp`` broadcast) would otherwise sit at UNKNOWN
-until the next scheduled ICMP sweep (up to ``_PING_INTERVAL``
-seconds), blocking the log-stream UI on the freshly-created
-card. The eager per-device probe closes that window down to an
-ICMP round-trip.
-"""
+"""Tests for ``DeviceStateMonitor.probe_device_ping`` waking the ICMP sweep loop."""
 
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import MagicMock
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 
 import pytest
 
+from esphome_device_builder.controllers._device_state_monitor import ping as ping_module
+from esphome_device_builder.controllers._device_state_monitor.controller import (
+    DeviceStateMonitor,
+)
 from esphome_device_builder.models import Device, DeviceState
 
 from .conftest import make_state_monitor_with_callbacks
 
 
-def _ping_only_device() -> Device:
+def _ping_only_device(name: str = "garage") -> Device:
     """Build a no-API device (ICMP-reachable only) for the test fixtures."""
     return Device(
-        name="garage",
-        friendly_name="Garage",
-        configuration="garage.yaml",
-        address="192.168.1.42",
+        name=name,
+        friendly_name=name.title(),
+        configuration=f"{name}.yaml",
+        address=f"{name}.local",
         state=DeviceState.UNKNOWN,
         loaded_integrations=["wifi"],
     )
 
 
-@pytest.mark.asyncio
-async def test_probe_device_noop_during_bootstrap() -> None:
-    """During the bootstrap window the probe is a no-op.
+@dataclass
+class _SweepProbe:
+    """Counts sweeps and offers a release latch for blocking the first one mid-flight."""
 
-    Cold-start ``ScanChange.ADDED`` fires once per cached YAML;
-    if every one of those triggered an immediate ICMP, a 100-
-    device fleet would emit 100 concurrent pings before mDNS even
-    had its grace period to claim the API devices for free. The
-    flag-gate makes the cold-start case fall back to the next
-    scheduled sweep.
-    """
-    monitor, callbacks = make_state_monitor_with_callbacks([_ping_only_device()])
-    assert monitor._ping._bootstrap_complete is False
-
-    await monitor._ping.probe_device("garage")
-
-    # No state change, no DNS lookup, no ICMP: completely silent.
-    assert callbacks.calls == []
+    count: int = 0
+    first_entered: asyncio.Event = field(default_factory=asyncio.Event)
+    release_first: asyncio.Event = field(default_factory=asyncio.Event)
 
 
-@pytest.mark.asyncio
-async def test_probe_device_pings_after_bootstrap(monkeypatch: pytest.MonkeyPatch) -> None:
-    """After bootstrap, an alive ICMP target flips the device ONLINE.
+def _install_sweep_probe(
+    monkeypatch: pytest.MonkeyPatch, *, block_first: bool = False
+) -> _SweepProbe:
+    """Replace ``PingSource._ping_sweep`` with a stub recording into a fresh ``_SweepProbe``."""
+    probe = _SweepProbe()
 
-    The end-to-end contract: an immediate probe on a ping-only
-    device's newly-dropped YAML lands the card at ONLINE within
-    one ICMP round-trip instead of waiting on ``_PING_INTERVAL``.
-    """
-    monitor, callbacks = make_state_monitor_with_callbacks([_ping_only_device()])
-    monitor._ping._bootstrap_complete = True
+    async def _sweep(_self: ping_module.PingSource) -> None:
+        probe.count += 1
+        if probe.count == 1:
+            probe.first_entered.set()
+            if block_first:
+                await probe.release_first.wait()
 
-    ping_targets: list[str] = []
-
-    async def _fake_ping(target: str, **_kwargs: object) -> MagicMock:
-        ping_targets.append(target)
-        result = MagicMock()
-        result.is_alive = True
-        result.min_rtt = 4.2
-        return result
-
-    monkeypatch.setattr(
-        "esphome_device_builder.controllers._device_state_monitor.ping.icmp_ping",
-        _fake_ping,
-    )
-
-    await monitor._ping.probe_device("garage")
-
-    assert ping_targets == ["192.168.1.42"]
-    assert ("on_state_change", "garage", DeviceState.ONLINE, "ping") in callbacks.calls
+    monkeypatch.setattr(ping_module.PingSource, "_ping_sweep", _sweep)
+    return probe
 
 
-@pytest.mark.asyncio
-async def test_probe_device_unknown_name_is_noop() -> None:
-    """A probe for a name not in the catalog short-circuits silently."""
-    monitor, callbacks = make_state_monitor_with_callbacks([_ping_only_device()])
-    monitor._ping._bootstrap_complete = True
+def _patch_loop_for_wake_tests(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Skip bootstrap and stretch the interval so only wakes can drive a second sweep."""
+    monkeypatch.setattr(ping_module, "_PING_BOOTSTRAP_DELAY", 0)
+    monkeypatch.setattr(ping_module, "_PING_INTERVAL", 3600)
 
-    await monitor._ping.probe_device("not-a-device")
+    async def _noop_resolve(_monitor: object) -> None:
+        return None
 
-    assert callbacks.calls == []
-
-
-@pytest.mark.asyncio
-async def test_probe_device_skipped_when_higher_priority_source_owns(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """An mDNS-claimed device doesn't get a redundant ping.
-
-    Mirrors :func:`shared.should_ping`: once mDNS owns the
-    device at ONLINE the ping source has nothing to add. Without
-    this guard, dropping a new YAML for a device that just
-    announced via mDNS would still fire an unnecessary ICMP.
-    """
-    device = _ping_only_device()
-    device.state = DeviceState.ONLINE
-    monitor, _callbacks = make_state_monitor_with_callbacks([device])
-    monitor.state.state_source["garage"] = "mdns"
-    monitor._ping._bootstrap_complete = True
-
-    ping_calls: list[str] = []
-
-    async def _fake_ping(target: str, **_kwargs: object) -> MagicMock:
-        ping_calls.append(target)
-        return MagicMock(is_alive=True, min_rtt=1.0)
-
-    monkeypatch.setattr(
-        "esphome_device_builder.controllers._device_state_monitor.ping.icmp_ping",
-        _fake_ping,
-    )
-
-    await monitor._ping.probe_device("garage")
-
-    assert ping_calls == []
+    monkeypatch.setattr(ping_module.shared, "resolve_non_api_mdns_targets", _noop_resolve)
 
 
-@pytest.mark.asyncio
-async def test_probe_device_ping_skips_scheduling_during_bootstrap() -> None:
-    """No task is allocated until bootstrap completes.
+@asynccontextmanager
+async def _running_loop(monitor: DeviceStateMonitor) -> AsyncIterator[None]:
+    """Spawn ``monitor._ping.run()`` and cancel + drain on exit."""
+    task = asyncio.create_task(monitor._ping.run())
+    try:
+        yield
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
-    Critical for cold-start: the scanner fires ``ScanChange.ADDED``
-    once per cached YAML, and without this guard a 1000-device
-    fleet would allocate 1000 coroutines and 1000 tasks just to
-    have each one short-circuit internally. The hoisted guard
-    makes the wrapper a no-op so the storm never reaches the
-    scheduler.
-    """
+
+async def _yield_until(predicate: Callable[[], bool], iterations: int = 50) -> None:
+    """Yield to the event loop until *predicate()* is truthy or *iterations* elapse."""
+    for _ in range(iterations):
+        if predicate():
+            return
+        await asyncio.sleep(0)
+
+
+def test_probe_device_ping_sets_wake_event() -> None:
+    """One probe call flips the loop's wake event without scheduling a task."""
     monitor, _ = make_state_monitor_with_callbacks([_ping_only_device()])
-    assert monitor._ping._bootstrap_complete is False
+    assert monitor._ping._wake.is_set() is False
 
     monitor.probe_device_ping("garage")
 
+    assert monitor._ping._wake.is_set() is True
+    assert monitor._tasks == set()
+
+
+def test_probe_device_ping_herd_collapses_to_single_set() -> None:
+    """N concurrent scanner-ADDEDs collapse into one wake; no per-device task explosion."""
+    devices = [_ping_only_device(f"dev-{i}") for i in range(100)]
+    monitor, _ = make_state_monitor_with_callbacks(devices)
+
+    for device in devices:
+        monitor.probe_device_ping(device.name)
+
+    assert monitor._ping._wake.is_set() is True
     assert monitor._tasks == set()
 
 
 @pytest.mark.asyncio
-async def test_probe_device_ping_schedules_task_after_bootstrap(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Post-bootstrap the wrapper hands a coroutine to ``_track_task``."""
-
-    # Stub ``icmp_ping`` so the scheduled task can't fire a real
-    # ICMP probe at ``192.168.1.42`` (up to 3s flake on machines
-    # with icmplib installed); this test only verifies scheduling.
-    async def _noop_ping(_target: str, **_kwargs: object) -> MagicMock:
-        return MagicMock(is_alive=False, min_rtt=0.0)
-
-    monkeypatch.setattr(
-        "esphome_device_builder.controllers._device_state_monitor.ping.icmp_ping",
-        _noop_ping,
-    )
-
+async def test_wake_bails_idle_wait_early(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A wake fired during the idle wait re-runs the sweep without paying ``_PING_INTERVAL``."""
+    _patch_loop_for_wake_tests(monkeypatch)
     monitor, _ = make_state_monitor_with_callbacks([_ping_only_device()])
-    monitor._ping._bootstrap_complete = True
+    sweeps = _install_sweep_probe(monkeypatch)
 
-    monitor.probe_device_ping("garage")
+    async with _running_loop(monitor):
+        await _yield_until(lambda: sweeps.count >= 1)
+        assert sweeps.count == 1
 
-    assert len(monitor._tasks) == 1
-    await asyncio.gather(*monitor._tasks, return_exceptions=True)
+        monitor.probe_device_ping("garage")
+
+        await _yield_until(lambda: sweeps.count >= 2)
+        assert sweeps.count == 2
+
+
+@pytest.mark.asyncio
+async def test_wake_during_sweep_triggers_followup(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A wake fired mid-sweep survives the pre-sweep ``_wake.clear()`` to drive one follow-up."""
+    _patch_loop_for_wake_tests(monkeypatch)
+    monitor, _ = make_state_monitor_with_callbacks([_ping_only_device()])
+    sweeps = _install_sweep_probe(monkeypatch, block_first=True)
+
+    async with _running_loop(monitor):
+        await asyncio.wait_for(sweeps.first_entered.wait(), timeout=1)
+        monitor.probe_device_ping("garage")
+        sweeps.release_first.set()
+
+        await _yield_until(lambda: sweeps.count >= 2)
+        assert sweeps.count == 2

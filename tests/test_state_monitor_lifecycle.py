@@ -92,6 +92,7 @@ def _make_monitor(
 
     monitor._mdns = MdnsSource(monitor)
 
+    monitor._presence = None  # ping loop runs unconditionally in tests
     monitor._ping = PingSource(monitor)
     monitor._get_devices = lambda: devices
     monitor._get_devices_by_name = lambda name: [d for d in devices if d.name == name]
@@ -115,7 +116,6 @@ def _make_monitor(
     monitor._on_importable_removed = callbacks.on_importable_removed
     monitor.state.reachability = None
     monitor.state.dns_cache = MagicMock()
-    monitor._presence = None  # ping loop runs unconditionally in tests
     return monitor, callbacks
 
 
@@ -172,17 +172,11 @@ async def _start_with_captured_dispatch(
     return captured["dispatch"]
 
 
-async def _drain_ping_task(monitor: DeviceStateMonitor) -> None:
-    """Await the ping task to completion (typically via the bounded-sleep CancelledError).
-
-    Ping-pipeline tests patch ``state_monitor_module.asyncio.sleep``
-    to raise ``CancelledError`` after a few iterations; that
-    propagates out of ``_ping_loop`` and ends the task. ``stop``
-    would also cancel the task on teardown but draining first
-    lets the test assert on the post-iteration state.
-    """
-    if monitor._ping_task is not None:
-        await asyncio.gather(monitor._ping_task, return_exceptions=True)
+async def _let_ping_loop_run_briefly(monitor: DeviceStateMonitor) -> None:
+    """Yield long enough for the ping loop (paired with ``_shrink_ping_intervals``) to sweep."""
+    if monitor._ping_task is None:
+        return
+    await asyncio.sleep(0.05)
 
 
 async def _stop_and_drain(monitor: DeviceStateMonitor) -> None:
@@ -1248,23 +1242,10 @@ def test_revisit_importable_seeds_nothing_on_cache_miss(
 # ---------------------------------------------------------------------------
 
 
-def _bounded_sleep_factory(max_iterations: int = 3) -> Any:
-    """Build an ``asyncio.sleep`` replacement that bails after *max_iterations*.
-
-    ``_ping_loop`` is an infinite ``while True: await asyncio.sleep(_PING_INTERVAL)``
-    loop, so a test that drives it via ``start()`` needs a way to
-    end. Patching the module-local ``asyncio.sleep`` to raise
-    ``CancelledError`` after a few iterations terminates the task
-    cleanly without the test having to call ``cancel`` itself.
-    """
-    iterations = [0]
-
-    async def _impl(_seconds: float) -> None:
-        iterations[0] += 1
-        if iterations[0] >= max_iterations:
-            raise asyncio.CancelledError
-
-    return _impl
+def _shrink_ping_intervals(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Collapse the bootstrap delay + interval so ``_let_ping_loop_run_briefly`` sees sweeps."""
+    monkeypatch.setattr(ping_module, "_PING_BOOTSTRAP_DELAY", 0)
+    monkeypatch.setattr(ping_module, "_PING_INTERVAL", 0.001)
 
 
 @pytest.mark.asyncio
@@ -1287,11 +1268,11 @@ async def test_start_drives_ping_pipeline_to_online_state(
     monkeypatch.setattr(ping_module, "icmp_ping", _fake_ping)
     monitor.state.dns_cache.async_resolve = AsyncMock(return_value=["192.0.2.5"])
     monitor.state.dns_cache.has_cached_failure = MagicMock(return_value=False)
-    monkeypatch.setattr(ping_module.asyncio, "sleep", _bounded_sleep_factory())
+    _shrink_ping_intervals(monkeypatch)
 
     await _start_with_captured_dispatch(monitor, monkeypatch, park_ping_loop=False)
     try:
-        await _drain_ping_task(monitor)
+        await _let_ping_loop_run_briefly(monitor)
         assert device.state == DeviceState.ONLINE
     finally:
         await _stop_and_drain(monitor)
@@ -1312,11 +1293,11 @@ async def test_start_with_icmplib_unavailable_skips_dns_resolution(
 
     monkeypatch.setattr(ping_module, "icmp_ping", None)
     monitor.state.dns_cache.async_resolve = AsyncMock()
-    monkeypatch.setattr(ping_module.asyncio, "sleep", _bounded_sleep_factory(2))
+    _shrink_ping_intervals(monkeypatch)
 
     await _start_with_captured_dispatch(monitor, monkeypatch, park_ping_loop=False)
     try:
-        await _drain_ping_task(monitor)
+        await _let_ping_loop_run_briefly(monitor)
         monitor.state.dns_cache.async_resolve.assert_not_called()
     finally:
         await _stop_and_drain(monitor)
@@ -1345,11 +1326,11 @@ async def test_start_marks_offline_on_icmp_exception(
     monkeypatch.setattr(ping_module, "icmp_ping", _boom)
     monitor.state.dns_cache.async_resolve = AsyncMock(return_value=["10.0.0.1"])
     monitor.state.dns_cache.has_cached_failure = MagicMock(return_value=False)
-    monkeypatch.setattr(ping_module.asyncio, "sleep", _bounded_sleep_factory(2))
+    _shrink_ping_intervals(monkeypatch)
 
     await _start_with_captured_dispatch(monitor, monkeypatch, park_ping_loop=False)
     try:
-        await _drain_ping_task(monitor)
+        await _let_ping_loop_run_briefly(monitor)
         assert device.state == DeviceState.OFFLINE
     finally:
         await _stop_and_drain(monitor)
@@ -1376,12 +1357,12 @@ async def test_start_skips_ping_for_cached_dns_failures(
 
     monkeypatch.setattr(ping_module, "icmp_ping", _icmp)
     monitor.state.dns_cache.has_cached_failure = MagicMock(return_value=True)
-    monkeypatch.setattr(ping_module.asyncio, "sleep", _bounded_sleep_factory(2))
+    _shrink_ping_intervals(monkeypatch)
 
     with caplog.at_level(logging.DEBUG, logger=ping_module.__name__):
         await _start_with_captured_dispatch(monitor, monkeypatch, park_ping_loop=False)
         try:
-            await _drain_ping_task(monitor)
+            await _let_ping_loop_run_briefly(monitor)
         finally:
             await _stop_and_drain(monitor)
 
@@ -1405,12 +1386,12 @@ async def test_start_logs_ping_count_at_debug(
     monkeypatch.setattr(ping_module, "icmp_ping", _icmp)
     monitor.state.dns_cache.async_resolve = AsyncMock(return_value=["192.0.2.5"])
     monitor.state.dns_cache.has_cached_failure = MagicMock(return_value=False)
-    monkeypatch.setattr(ping_module.asyncio, "sleep", _bounded_sleep_factory(2))
+    _shrink_ping_intervals(monkeypatch)
 
     with caplog.at_level(logging.DEBUG, logger=ping_module.__name__):
         await _start_with_captured_dispatch(monitor, monkeypatch, park_ping_loop=False)
         try:
-            await _drain_ping_task(monitor)
+            await _let_ping_loop_run_briefly(monitor)
         finally:
             await _stop_and_drain(monitor)
 
@@ -1438,14 +1419,16 @@ async def test_repeat_sweep_with_unchanged_targets_logs_once(
     monkeypatch.setattr(ping_module, "icmp_ping", _icmp)
     monitor.state.dns_cache.async_resolve = AsyncMock(return_value=["192.0.2.5"])
     monitor.state.dns_cache.has_cached_failure = MagicMock(return_value=False)
-    # Run three sweeps so a regression that re-logs every cycle
-    # would emit 3 lines instead of 1.
-    monkeypatch.setattr(ping_module.asyncio, "sleep", _bounded_sleep_factory(4))
+    # The shrunk interval gives the loop plenty of room to run
+    # several sweeps inside ``_let_ping_loop_run_briefly``'s window — a
+    # regression that re-logs every cycle would emit multiple
+    # "Pinging" lines instead of one.
+    _shrink_ping_intervals(monkeypatch)
 
     with caplog.at_level(logging.DEBUG, logger=ping_module.__name__):
         await _start_with_captured_dispatch(monitor, monkeypatch, park_ping_loop=False)
         try:
-            await _drain_ping_task(monitor)
+            await _let_ping_loop_run_briefly(monitor)
         finally:
             await _stop_and_drain(monitor)
 
@@ -1471,11 +1454,11 @@ async def test_start_skips_devices_without_address(
         raise AssertionError("icmp_ping must not be called")
 
     monkeypatch.setattr(ping_module, "icmp_ping", _icmp)
-    monkeypatch.setattr(ping_module.asyncio, "sleep", _bounded_sleep_factory(2))
+    _shrink_ping_intervals(monkeypatch)
 
     await _start_with_captured_dispatch(monitor, monkeypatch, park_ping_loop=False)
     try:
-        await _drain_ping_task(monitor)
+        await _let_ping_loop_run_briefly(monitor)
         monitor.state.dns_cache.async_resolve.assert_not_called()
     finally:
         await _stop_and_drain(monitor)
@@ -1567,11 +1550,11 @@ async def test_start_uses_v6_fallback_when_only_v6_in_mdns_cache(
         raise AssertionError("icmp_ping must not be called for cached-mdns devices")
 
     monkeypatch.setattr(ping_module, "icmp_ping", _icmp)
-    monkeypatch.setattr(ping_module.asyncio, "sleep", _bounded_sleep_factory(2))
+    _shrink_ping_intervals(monkeypatch)
 
     await _start_with_captured_dispatch(monitor, monkeypatch, park_ping_loop=False)
     try:
-        await _drain_ping_task(monitor)
+        await _let_ping_loop_run_briefly(monitor)
         assert device.state == DeviceState.ONLINE
         assert device.ip == "fe80::1%en0"
     finally:

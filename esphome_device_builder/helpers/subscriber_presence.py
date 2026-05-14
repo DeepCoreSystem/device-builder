@@ -21,8 +21,11 @@ responsibilities single-purpose.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterator
+import logging
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class SubscriberPresence:
@@ -38,20 +41,12 @@ class SubscriberPresence:
 
     def __init__(self) -> None:
         self._count = 0
-        # Two events kept in lockstep. ``_has_subscriber`` is set
-        # while count > 0; ``_no_subscribers`` is set while
-        # count == 0. Tracking both lets consumers ``await`` on
-        # *either* transition — the ICMP loop awaits subscriber
-        # presence before each sweep AND awaits the no-subscriber
-        # event during its post-sweep idle window so a
-        # subscriber-drop mid-sleep cuts straight to the
-        # ``wait_for_subscriber`` park instead of burning the rest
-        # of the interval. Without that, a subscriber arriving
-        # ~1ms after the last one left could wait up to
-        # ``_PING_INTERVAL`` for fresh ICMP data.
+        # Both events kept in lockstep with the count so consumers
+        # can ``await`` either transition.
         self._has_subscriber = asyncio.Event()
         self._no_subscribers = asyncio.Event()
         self._no_subscribers.set()  # initial state: gate is closed
+        self._subscriber_callbacks: list[Callable[[], None]] = []
 
     def has_subscribers(self) -> bool:
         """Return True while at least one subscriber is registered."""
@@ -71,20 +66,12 @@ class SubscriberPresence:
         """
         await self._has_subscriber.wait()
 
-    async def wait_for_no_subscribers(self) -> None:
-        """Suspend until the count drops to 0.
+    def add_subscriber_callback(self, callback: Callable[[], None]) -> None:
+        """Register *callback* to fire synchronously on every count 0→1 transition."""
+        self._subscriber_callbacks.append(callback)
 
-        Mirror of :meth:`wait_for_subscriber` for the opposite
-        transition — used by consumers whose idle wait should be
-        interruptible by a subscriber drop. The ICMP ping loop
-        wraps its post-sweep idle window in
-        ``asyncio.wait_for(presence.wait_for_no_subscribers(),
-        timeout=_PING_INTERVAL)`` so when the last subscriber
-        disconnects the loop short-circuits the rest of the
-        interval and parks at the top on ``wait_for_subscriber``
-        — keeping the next subscriber's first sweep within one
-        scheduling tick of their connect.
-        """
+    async def wait_for_no_subscribers(self) -> None:
+        """Suspend until the count drops to 0 (mirror of :meth:`wait_for_subscriber`)."""
         await self._no_subscribers.wait()
 
     @contextmanager
@@ -104,6 +91,13 @@ class SubscriberPresence:
         if self._count == 1:
             self._has_subscriber.set()
             self._no_subscribers.clear()
+            for callback in self._subscriber_callbacks:
+                # Isolate so a misbehaving consumer can't break
+                # presence accounting or skip sibling callbacks.
+                try:
+                    callback()
+                except Exception:
+                    _LOGGER.exception("subscriber callback raised")
         try:
             yield
         finally:
