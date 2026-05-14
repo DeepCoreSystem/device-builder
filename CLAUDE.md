@@ -113,6 +113,30 @@ the official ESPHome container and Home Assistant add-on.
   See `controllers/devices/`, `controllers/firmware/`, and
   `controllers/remote_build/` for the canonical shape.
 
+  **State dataclass convention.** Group mutable *domain*
+  state — anything a sibling module reads or writes — into
+  a typed `XxxState` dataclass in `controllers/X/_state.py`;
+  the controller owns `self.state: XxxState`; siblings reach
+  through `controller.state.X` instead of `controller._X`.
+  Canonical examples: `OffloaderState`, `DevicesState`,
+  `ReceiverState`. Controller-internal handles that no
+  sibling touches (`_unsub_job_completed`, `_pairings_store`,
+  base infrastructure like `_db` / `_listeners` / `_tasks`)
+  stay on the controller even when reassigned across
+  `start()` / `stop()`. The cut is cross-module data, not
+  reassignment.
+
+  When splitting a controller into a package, design with
+  `XxxState` from PR 1 — adding it later forces a
+  post-split cleanup arc (#795, #797). When `start()` /
+  `stop()` repopulates a `state.X` dict/set that something
+  captured a bound method of (`state.X.__contains__`,
+  `state.X.add`), use in-place `.clear()` + `.update(...)`
+  rather than reassignment, or the captured method will
+  point at the original empty container forever (the
+  `DevicesController.state.ignored_devices` loader hit this
+  pre-refactor; #797 added the regression test).
+
   Existing modules over 800 lines (audit `wc -l` periodically;
   the worst offender at the time of writing was 5176 lines) are
   grandfathered. The split rule is scoped to invasive changes:
