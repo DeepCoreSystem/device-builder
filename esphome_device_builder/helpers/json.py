@@ -16,7 +16,12 @@ from typing import Any
 import orjson
 from aiohttp import web
 
+from .origin import request_origin_allowed
+
 _LOGGER = logging.getLogger(__name__)
+
+_CORS_METHODS = "GET, POST, PUT, DELETE, OPTIONS"
+_CORS_HEADERS = "Content-Type, Authorization"
 
 # Re-export so callers can ``except JSONDecodeError`` without importing
 # orjson themselves. orjson's exception is a subclass of ValueError.
@@ -85,12 +90,35 @@ def json_response(data: Any, status: int = 200) -> web.Response:
 
 @web.middleware
 async def cors_middleware(request: web.Request, handler: Any) -> web.StreamResponse:
-    """Permissive CORS for local development."""
-    if request.method == "OPTIONS":
-        resp = web.Response()
-    else:
-        resp = await handler(request)
-    resp.headers["Access-Control-Allow-Origin"] = "*"
-    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
-    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    """Reflect Origin in CORS headers only when same-origin or in ``trusted_domains``.
+
+    Sibling of the WS handshake gate in ``api/ws.py`` — both share
+    ``request_origin_allowed`` so they can't drift.
+    """
+    resp = web.Response() if request.method == "OPTIONS" else await handler(request)
+    # Vary: Origin unconditionally — response shape depends on Origin, so a
+    # shared cache must key on it to avoid mis-serving a peer.
+    resp.headers["Vary"] = "Origin"
+
+    origin = request.headers.get("Origin")
+    if origin and _cors_origin_allowed(request, origin):
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Access-Control-Allow-Methods"] = _CORS_METHODS
+        resp.headers["Access-Control-Allow-Headers"] = _CORS_HEADERS
+    elif origin:
+        _LOGGER.debug(
+            "CORS: omitting Access-Control-Allow-Origin: origin=%s host=%s", origin, request.host
+        )
     return resp
+
+
+def _cors_origin_allowed(request: web.Request, origin: str) -> bool:
+    """Return True when CORS should reflect *origin* — same predicate as the WS gate."""
+    if request.app.get("trusted_site", False):
+        # HA Ingress: supervisor handles the boundary upstream.
+        return True
+    device_builder = request.app.get("device_builder")
+    trusted_domains: list[str] = (
+        device_builder.settings.trusted_domains if device_builder is not None else []
+    )
+    return request_origin_allowed(origin, request.host, trusted_domains)
