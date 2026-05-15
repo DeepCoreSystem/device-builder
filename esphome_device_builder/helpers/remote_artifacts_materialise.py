@@ -26,6 +26,7 @@ from typing import Any, NamedTuple
 
 from esphome.helpers import rmtree
 from esphome.storage_json import StorageJSON
+from esphome.writer import storage_should_clean
 
 from ..controllers.remote_build.artifacts_tarball import (
     IDEDATA_MEMBER_NAME,
@@ -79,12 +80,6 @@ def materialise_remote_artifacts(tarball: bytes, configuration: str) -> Path:
     side-effects (the runner) can discard it.
     """
     extracted = _open_and_extract_build_tree(tarball, configuration)
-    _stage_offloader_storage(
-        configuration=configuration,
-        receiver_storage_bytes=extracted.storage_bytes,
-        receiver_build_path=extracted.receiver_build_path,
-        offloader_build_path=extracted.build_path,
-    )
     cached_idedata_path = _stage_offloader_idedata(
         configuration=configuration,
         idedata_bytes=extracted.idedata_bytes,
@@ -105,7 +100,7 @@ def materialise_remote_artifacts(tarball: bytes, configuration: str) -> Path:
 
 
 def _open_and_extract_build_tree(tarball: bytes, configuration: str) -> _ExtractedTarball:
-    """Open *tarball*, validate the storage shape, wipe + extract into the offloader build dir.
+    """Open *tarball*, stage the storage sidecar, conditionally wipe, extract the build tree.
 
     storage.json + idedata.json are cache-side files; their
     bytes are returned for the caller to rewrite before write
@@ -131,17 +126,28 @@ def _open_and_extract_build_tree(tarball: bytes, configuration: str) -> _Extract
             receiver_build_path = _receiver_build_path_from_storage(receiver_storage)
 
             build_path = resolve_data_dir(configuration) / "build" / device_name
-            # Wipe before extract so a board swap on the same YAML
-            # (esp32 → bk72xx) doesn't leave stale per-platform
-            # artefacts that firmware/download could surface as
-            # wrong bytes. Best-effort: rmtree failures log + fall
-            # through; the extract below still overwrites every
-            # member named in the tarball, though stale files the
-            # tarball doesn't mention may survive a failed wipe.
-            try:
-                rmtree(build_path)
-            except OSError as exc:
-                _LOGGER.debug("materialise: pre-extract rmtree(%s) failed: %s", build_path, exc)
+            # Stage the rewritten sidecar before deciding the wipe so
+            # esphome's ``storage_should_clean`` sees the offloader-form
+            # ``build_path`` instead of the receiver-absolute one it
+            # would otherwise flag as a build_path mismatch on every
+            # call. Loading the prior first preserves it across the
+            # stage write that overwrites the same path.
+            prior_storage = StorageJSON.load(resolve_storage_path(configuration))
+            new_storage = _stage_offloader_storage(
+                configuration=configuration,
+                receiver_storage_bytes=storage_bytes,
+                receiver_build_path=receiver_build_path,
+                offloader_build_path=build_path,
+            )
+            # rmtree is best-effort: failures log + fall through, and
+            # the extract below overwrites every member named in the
+            # tarball, but stale files the tarball doesn't mention can
+            # survive a failed wipe.
+            if storage_should_clean(prior_storage, new_storage):
+                try:
+                    rmtree(build_path)
+                except OSError as exc:
+                    _LOGGER.debug("materialise: pre-extract rmtree(%s) failed: %s", build_path, exc)
             build_path.mkdir(parents=True, exist_ok=True)
             _safe_extract_excluding(
                 tar,
@@ -296,8 +302,8 @@ def _stage_offloader_storage(
     receiver_storage_bytes: bytes,
     receiver_build_path: Path,
     offloader_build_path: Path,
-) -> None:
-    """Write the receiver's storage to the offloader's path, remap paths, save."""
+) -> StorageJSON:
+    """Stage and return the offloader-form storage sidecar."""
     storage_path = resolve_storage_path(configuration)
     storage_path.parent.mkdir(parents=True, exist_ok=True)
     storage_path.write_bytes(receiver_storage_bytes)
@@ -314,6 +320,7 @@ def _stage_offloader_storage(
         )
     storage.build_path = offloader_build_path
     storage.save(storage_path)
+    return storage
 
 
 def _stage_offloader_idedata(
