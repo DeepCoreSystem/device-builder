@@ -23,6 +23,12 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
+
+def _format_devices(devices: list[Device]) -> str:
+    """Render *devices* as ``"name (address), …"`` for log messages."""
+    return ", ".join(f"{d.name} ({d.address})" for d in devices)
+
+
 _PING_INTERVAL = 60  # seconds between ping sweeps
 # Bootstrap delay gives the mDNS browser a head start so the
 # common case (everything announces) skips a redundant ping the
@@ -44,10 +50,11 @@ class PingSource:
         # still triggers the next idle.
         self._wake = asyncio.Event()
         self._concurrency = asyncio.Semaphore(_PING_BATCH_SIZE)
-        # Tuple of ``(name, address)`` from the last DEBUG-logged
-        # sweep; suppresses re-logging the identical line every
-        # 60s when the target set hasn't changed. New devices,
-        # mDNS claims, and removals re-surface the line.
+        # Sorted ``(name, address)`` of every device in the union of
+        # the last DEBUG sweep's pingable + dns_failed buckets. Spanning
+        # both keeps the signature stable across the DNS-failure cache
+        # flicker (120s TTL vs 60s sweep) so the line only re-emits on
+        # real membership change.
         self._last_logged_targets: tuple[tuple[str, str], ...] = ()
         # 0→1 multiplexed into the same wake event so a subscriber
         # arriving mid-idle gets fresh ICMP without waiting out the
@@ -84,62 +91,64 @@ class PingSource:
     async def _ping_sweep(self) -> None:
         if icmp_ping is None:
             return
-        devices_to_ping = self._select_ping_targets()
-        if not devices_to_ping:
+        pingable, dns_failed = self._select_ping_targets()
+        if not pingable and not dns_failed:
             return
         if _LOGGER.isEnabledFor(logging.DEBUG):
-            signature = tuple((d.name, d.address) for d in devices_to_ping)
+            # Signature spans both buckets so a device whose 120s
+            # DNS-failure cache TTL flips it between ``pingable`` and
+            # ``dns_failed`` every 60s sweep doesn't re-emit the log
+            # line each cycle. New devices, mDNS claims, and removals
+            # still resurface it.
+            signature = tuple(sorted((d.name, d.address) for d in pingable + dns_failed))
             if signature != self._last_logged_targets:
                 self._last_logged_targets = signature
-                _LOGGER.debug(
-                    "Pinging %d devices: %s",
-                    len(devices_to_ping),
-                    ", ".join(f"{d.name} ({d.address})" for d in devices_to_ping),
-                )
+                if dns_failed:
+                    _LOGGER.debug(
+                        "Pinging %d devices: %s; skipping %d (cached DNS failure): %s",
+                        len(pingable),
+                        _format_devices(pingable) or "(none)",
+                        len(dns_failed),
+                        _format_devices(dns_failed),
+                    )
+                else:
+                    _LOGGER.debug(
+                        "Pinging %d devices: %s", len(pingable), _format_devices(pingable)
+                    )
         # ``self._concurrency`` semaphore caps in-flight ICMP at
         # ``_PING_BATCH_SIZE``; no need to pre-chunk the gather.
         await asyncio.gather(
-            *(self._resolve_and_ping(device) for device in devices_to_ping),
+            *(self._resolve_and_ping(device) for device in pingable),
             return_exceptions=True,
         )
 
-    def _select_ping_targets(self) -> list[Device]:
-        """Filter the device list down to actual ping candidates."""
-        return [d for d in self._monitor._get_devices() if self._classify_for_ping(d)]
-
-    def _classify_for_ping(self, device: Device) -> bool:
-        """
-        Return True iff *device* needs an ICMP probe; apply any short-circuit side-effects.
-
-        Three filters apply: skip when a higher-priority source
-        owns the device; claim ``.local`` cache hits for mDNS so
-        the bare-hostname DNS fallback can't resolve them off-
-        subnet; flip OFFLINE without probing when DNS already
-        failed (no point hammering the resolver).
-        """
+    def _select_ping_targets(self) -> tuple[list[Device], list[Device]]:
+        """Return ``(pingable, dns_failed)`` and apply per-device side-effects."""
+        pingable: list[Device] = []
+        dns_failed: list[Device] = []
         monitor = self._monitor
-        if not device.address or not shared.should_ping(monitor, device):
-            return False
-        if is_local_hostname(device.address) and (
-            cached := monitor.get_cached_addresses(device.address)
-        ):
-            monitor.apply(device.name, DeviceState.ONLINE, "mdns", claim=True)
-            # Forward every cached IP so the dashboard shows all
-            # of them; ``apply_ip_addresses`` picks the IPv4
-            # primary for ICMP / OTA targeting.
-            monitor.apply_ip_addresses(device.name, cached)
-            return False
-        if monitor.state.dns_cache.has_cached_failure(device.address):
-            # DNS-failure cache entry: don't hand the bare hostname
-            # to icmplib (it would hammer the system resolver every
-            # sweep). Apply OFFLINE under the ``ping`` source so a
-            # future successful resolve can flip the device back.
-            _LOGGER.debug(
-                "Skipping ping for %s (%s): cached DNS failure", device.name, device.address
-            )
-            monitor.apply(device.name, DeviceState.OFFLINE, "ping")
-            return False
-        return True
+        for device in monitor._get_devices():
+            if not device.address or not shared.should_ping(monitor, device):
+                continue
+            if is_local_hostname(device.address) and (
+                cached := monitor.get_cached_addresses(device.address)
+            ):
+                monitor.apply(device.name, DeviceState.ONLINE, "mdns", claim=True)
+                # Forward every cached IP so the dashboard shows all
+                # of them; ``apply_ip_addresses`` picks the IPv4
+                # primary for ICMP / OTA targeting.
+                monitor.apply_ip_addresses(device.name, cached)
+                continue
+            if monitor.state.dns_cache.has_cached_failure(device.address):
+                # Don't hand the bare hostname to icmplib (it would
+                # hammer the system resolver every sweep). Apply
+                # OFFLINE under the ``ping`` source so a future
+                # successful resolve can flip the device back.
+                monitor.apply(device.name, DeviceState.OFFLINE, "ping")
+                dns_failed.append(device)
+                continue
+            pingable.append(device)
+        return pingable, dns_failed
 
     async def _resolve_and_ping(self, device: Device) -> None:
         """Resolve *device.address* through the DNS cache and ICMP it."""

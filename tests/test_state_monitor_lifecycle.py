@@ -1437,6 +1437,47 @@ async def test_repeat_sweep_with_unchanged_targets_logs_once(
 
 
 @pytest.mark.asyncio
+async def test_dns_failure_flicker_does_not_re_emit_log(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A device flipping between pingable and dns-failed each sweep logs once."""
+    flaky = _device(name="zom", address="zom.local", state=DeviceState.UNKNOWN)
+    stable = _device(name="ok", address="ok.example.com", state=DeviceState.UNKNOWN)
+    monitor, _callbacks = _make_monitor([flaky, stable])
+
+    async def _icmp(_target: str, **_kw: Any) -> Any:
+        return MagicMock(is_alive=True, min_rtt=1.0)
+
+    monkeypatch.setattr(ping_module, "icmp_ping", _icmp)
+    monitor.state.dns_cache.async_resolve = AsyncMock(return_value=["192.0.2.5"])
+    monitor.get_cached_addresses = MagicMock(return_value=None)
+    cache_calls = {"n": 0}
+
+    def _has_cached_failure(host: str) -> bool:
+        if host != "zom.local":
+            return False
+        cache_calls["n"] += 1
+        return cache_calls["n"] % 2 == 0
+
+    monitor.state.dns_cache.has_cached_failure = MagicMock(side_effect=_has_cached_failure)
+    _shrink_ping_intervals(monkeypatch)
+
+    with caplog.at_level(logging.DEBUG, logger=ping_module.__name__):
+        await _start_with_captured_dispatch(monitor, monkeypatch, park_ping_loop=False)
+        try:
+            await _let_ping_loop_run_briefly(monitor)
+        finally:
+            await _stop_and_drain(monitor)
+
+    membership_logs = [
+        r for r in caplog.records if "Pinging" in r.message or "Skipping" in r.message
+    ]
+    assert len(membership_logs) == 1
+    assert cache_calls["n"] >= 2
+
+
+@pytest.mark.asyncio
 async def test_start_skips_devices_without_address(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
