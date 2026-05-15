@@ -34,6 +34,9 @@ application messages."
 from __future__ import annotations
 
 import asyncio
+import io
+import json
+import tarfile
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -371,6 +374,32 @@ def make_remote_peer_job(
         remote_job_id=remote_job_id,
         error=error,
     )
+
+
+def make_real_bundle(*, configuration_filename: str = "kitchen.yaml") -> bytes:
+    """
+    Build a minimal-but-valid esphome bundle the upstream extractor accepts.
+
+    Emits a ``manifest.json`` + the referenced YAML member; skips
+    :class:`BundleBuilder` so the test doesn't need a real
+    ``CORE.config_dir`` / ``CORE.config_path`` setup.
+    """
+    manifest = {
+        "manifest_version": 1,
+        "config_filename": configuration_filename,
+    }
+    yaml_body = b"esphome:\n  name: kitchen\n"
+    members: list[tuple[str, bytes]] = [
+        ("manifest.json", json.dumps(manifest).encode("utf-8")),
+        (configuration_filename, yaml_body),
+    ]
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name, data in members:
+            info = tarfile.TarInfo(name=name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
 
 
 async def make_and_seed_remote_peer_job(

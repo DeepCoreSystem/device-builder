@@ -829,3 +829,30 @@ def make_state_monitor_with_callbacks(
         on_mac_address_change=callbacks.on_mac_address_change,
     )
     return monitor, callbacks
+
+
+def make_device(name: str = "kitchen", **overrides: Any) -> Device:
+    """Build a ``Device`` deriving friendly_name / configuration / address from *name*."""
+    base: dict[str, Any] = {
+        "name": name,
+        "friendly_name": name.title(),
+        "configuration": f"{name}.yaml",
+        "address": f"{name}.local",
+        "state": DeviceState.UNKNOWN,
+    }
+    base.update(overrides)
+    return Device(**base)
+
+
+def make_peer_link_session(
+    *,
+    dashboard_id: str = "alpha",
+    with_terminate: bool = True,
+) -> Any:
+    """Stub ``PeerLinkSession`` with ``send_app_frame`` (and optionally terminate) as AsyncMock."""
+    session = MagicMock()
+    session.dashboard_id = dashboard_id
+    session.send_app_frame = AsyncMock(return_value=True)
+    if with_terminate:
+        session.terminate = AsyncMock()
+    return session

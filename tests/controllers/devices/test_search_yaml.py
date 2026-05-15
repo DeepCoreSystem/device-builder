@@ -31,18 +31,16 @@ import pytest
 
 from esphome_device_builder.controllers.devices._yaml_search import MAX_CONTEXT_LINES
 from esphome_device_builder.models import Device, DeviceState
+from tests.conftest import make_device
 
 if TYPE_CHECKING:
     from .conftest import MakeControllerFactory
 
 
 def _device(name: str, *, friendly: str | None = None) -> Device:
-    """Bare-minimum ``Device`` for search-result assertions."""
-    return Device(
+    return make_device(
         name=name,
         friendly_name=friendly or name.title(),
-        configuration=f"{name}.yaml",
-        address=f"{name}.local",
         state=DeviceState.ONLINE,
     )
 

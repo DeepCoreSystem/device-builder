@@ -25,12 +25,15 @@ import pytest
 from esphome_device_builder.controllers._device_scanner import _DeviceIndex
 from esphome_device_builder.models import Device
 
+from .conftest import make_device
+
 
 def _device(name: str, configuration: str, *, friendly_name: str | None = None) -> Device:
-    return Device(
+    return make_device(
         name=name,
         friendly_name=friendly_name or name.title(),
         configuration=configuration,
+        address="",
     )
 
 
