@@ -1,29 +1,23 @@
 """
-Single-process-per-``config_dir`` startup lock.
+Single-process-per-``data_dir`` startup lock.
 
-The dashboard expects exactly one process per ``<config_dir>`` —
-metadata sidecar, identity cert / key files, build tree, and
-firmware queue are all guarded by per-process ``threading.Lock``
-instances, which don't extend across processes. Two
-``device-builder`` processes running against the same config
-directory would race-write each other's state silently. The
-HA add-on shape funnels each instance into a distinct ``/data/``
-container, so this rarely surfaces today, but the dev shape
-(``pip install esphome-device-builder`` against a checked-out
-config dir) and the future Desktop shape don't enforce
-single-instance — an accidental double-launch corrupts state
-without warning.
+Keyed on ``CORE.data_dir`` rather than ``config_dir`` so the HA
+addon's Prod/Beta/DEV flavors — distinct ``/data`` mounts but a
+shared ``/config/esphome`` — can run in parallel; the
+race-prone state (build tree, firmware queue, StorageJSON) all
+lives in ``data_dir`` and is per-flavor there. Same-data-dir
+double-launches (dev mode against the same ``--config-dir``)
+are still caught. Cross-flavor writes to the shared
+``.device-builder.json`` are serialised separately by an
+``fcntl.flock`` inside :func:`controllers.config.metadata_transaction`.
 
-This module mirrors Home Assistant's
-:func:`homeassistant.runner.ensure_single_execution`: open
-``<config_dir>/.device-builder.lock`` in append mode, take an
-exclusive non-blocking ``fcntl.flock``, and on success write a
-``{pid, lock_format_version, device_builder_version, start_ts}``
-JSON record into the file for diagnostics. On contention, read
-the existing record and surface the running PID + start time on
-stderr so the operator knows what they're stepping on; the
-caller is expected to honour the returned ``exit_code`` and
-exit non-zero.
+Mirrors :func:`homeassistant.runner.ensure_single_execution`:
+open ``<data_dir>/.device-builder.lock`` in append mode, take
+an exclusive non-blocking ``fcntl.flock``, and on success write
+a ``{pid, lock_format_version, device_builder_version, start_ts}``
+JSON record for diagnostics. On contention, surface the running
+PID + start time on stderr and return ``exit_code=1`` for the
+caller to honour.
 
 The lock is held for the dashboard's lifetime — the OS releases
 the ``flock`` automatically when the process exits (clean
@@ -101,13 +95,13 @@ def _write_lock_info(lock_file: TextIOWrapper) -> None:
     lock_file.flush()
 
 
-def _report_existing_instance(lock_file_path: Path, config_dir: Path) -> None:
+def _report_existing_instance(lock_file_path: Path, lock_dir: Path) -> None:
     """
     Print diagnostics about the running instance to stderr.
 
     Best-effort: an empty / unreadable / partially-written lock
     file falls back to the "Unable to read lock file details"
-    line so we always print *something* useful (the config dir
+    line so we always print *something* useful (the data dir
     path + the "stop the existing instance" guidance) rather than
     swallowing the contention silently.
     """
@@ -158,7 +152,7 @@ def _report_existing_instance(lock_file_path: Path, config_dir: Path) -> None:
         OverflowError,
     ) as exc:
         error_lines.append(f"  Unable to read lock file details: {exc}")
-    error_lines.append(f"  Config directory: {config_dir}")
+    error_lines.append(f"  Data directory: {lock_dir}")
     error_lines.append("")
     error_lines.append("Stop the existing instance before starting a second one.")
     for line in error_lines:
@@ -181,27 +175,15 @@ def _open_lock_file(path: str, flags: int) -> int:
 
 
 @contextmanager
-def ensure_single_execution(config_dir: Path) -> Generator[SingleInstanceLock]:
+def ensure_single_execution(lock_dir: Path) -> Generator[SingleInstanceLock]:
     """
-    Acquire the per-config-dir startup lock; yield a status object.
+    Acquire the per-``lock_dir`` startup lock; yield a status object.
 
-    On success, ``lock.exit_code`` stays ``None`` and the caller
-    runs normally — the underlying ``flock`` is held until the
-    context exits (i.e. process exit, since the dashboard wraps
-    its entire run inside this).
-
-    On contention, ``lock.exit_code`` is set to ``1`` and a
-    diagnostic message is printed to stderr; the caller is
-    expected to ``sys.exit(lock.exit_code)`` after the context
-    exits. The ``with`` body still runs in that case so the
-    caller always gets a chance to do its own cleanup, but
-    ``DeviceBuilder.run()`` should not be called.
-
-    Windows / no-fcntl platforms: silently yields a success
-    object without taking any lock. The dashboard's per-process
-    ``threading.Lock``-based guarantees still hold within a
-    single process; the cross-process race is unmitigated there
-    by design (issue #451).
+    Callers pass ``CORE.data_dir``. The flock is held for the
+    lifetime of the ``with`` block. On contention, sets
+    ``lock.exit_code = 1`` and prints diagnostics; the caller
+    should ``sys.exit(lock.exit_code)`` after the context exits.
+    Windows / no-fcntl: silent no-op.
     """
     lock = SingleInstanceLock()
 
@@ -210,7 +192,21 @@ def ensure_single_execution(config_dir: Path) -> Generator[SingleInstanceLock]:
         yield lock
         return
 
-    lock_file_path = Path(config_dir) / _LOCK_FILE_NAME
+    lock_file_path = Path(lock_dir) / _LOCK_FILE_NAME
+
+    # ``CORE.data_dir`` doesn't exist yet on a fresh default-mode
+    # install — created lazily by the first compile, which runs
+    # after the lock. ``O_CREAT`` makes the file, not its parent.
+    try:
+        lock_file_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        _LOGGER.exception(
+            "Could not create lock directory %s (refusing to start)",
+            lock_file_path.parent,
+        )
+        lock.exit_code = 1
+        yield lock
+        return
 
     # ``a+`` so the previous instance's diagnostic record stays
     # readable until our flock acquisition succeeds — the
@@ -222,7 +218,7 @@ def ensure_single_execution(config_dir: Path) -> Generator[SingleInstanceLock]:
     # lock-file path is rejected with ``ELOOP`` instead of being
     # followed and truncated. Without this, an attacker (or a
     # misconfigured environment) with write access to
-    # ``<config_dir>`` could place a symlink at
+    # ``<data_dir>`` could place a symlink at
     # ``.device-builder.lock -> /etc/passwd`` (or any other path
     # the dashboard process can write) and have ``_write_lock_info``
     # truncate the link target on every start. The ``fstat``
@@ -256,7 +252,7 @@ def ensure_single_execution(config_dir: Path) -> Generator[SingleInstanceLock]:
         try:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            _report_existing_instance(lock_file_path, Path(config_dir))
+            _report_existing_instance(lock_file_path, Path(lock_dir))
             lock.exit_code = 1
             yield lock
             return

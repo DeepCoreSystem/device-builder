@@ -7,6 +7,7 @@ import hmac
 import logging
 import os
 import re
+import stat
 import tempfile
 import threading
 from collections.abc import Iterator
@@ -14,6 +15,13 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+try:
+    import fcntl
+
+    _HAS_FCNTL = True
+except ImportError:  # pragma: no cover — Windows path
+    _HAS_FCNTL = False
 
 from esphome.const import __version__ as esphome_version
 from esphome.core import CORE
@@ -48,6 +56,10 @@ _LOGGER = logging.getLogger(__name__)
 
 _DASHBOARD_SENTINEL_FILE = "___DASHBOARD_SENTINEL___.yaml"
 _METADATA_FILE = ".device-builder.json"
+# Separate sibling file for the flock — ``_save_metadata`` swaps
+# ``_METADATA_FILE``'s inode via ``Path.replace`` mid-transaction,
+# which would yank the lock out from under any holder.
+_METADATA_LOCK_FILE = ".device-builder.json.lock"
 _PREFS_KEY = "_preferences"
 _LABELS_KEY = "_labels"
 _REMOTE_BUILD_KEY = "_remote_build"
@@ -322,28 +334,49 @@ class DashboardSettings:
 _METADATA_LOCK = threading.Lock()
 
 
+def _open_metadata_lock_file(path: str, flags: int) -> int:
+    """``open()`` opener that adds ``O_NOFOLLOW`` to reject symlinks."""
+    return os.open(path, flags | os.O_NOFOLLOW, 0o644)
+
+
 @contextmanager
 def metadata_transaction(config_dir: Path) -> Iterator[dict[str, Any]]:
     """
     Atomic read-modify-write context for the metadata sidecar.
 
-    Yields the current metadata dict. Mutate it in place; on a clean
-    exit the changes are persisted atomically. Exceptions raised
-    inside the block discard the pending mutation. Concurrent
-    transactions are serialised so updates can't clobber each other.
-
-    Do not call from inside another ``metadata_transaction`` on the
-    same thread. The lock is non-reentrant and will deadlock; this
-    is intentional. Each call loads / saves its own snapshot, so
-    nested calls would lose updates even under a reentrant lock
-    (the outer save would overwrite the inner save). Helpers that
-    take the same lock (e.g. ``get_or_create_identity``) must be
-    called outside any open transaction.
+    Yields the current metadata dict. Serialised within the
+    process by ``_METADATA_LOCK`` and across processes by an
+    ``fcntl.flock`` on the sibling lock file — needed for the HA
+    addon multi-flavor shape where Prod/Beta/DEV share
+    ``/config/esphome``. Exceptions inside the block skip the
+    save. The per-process lock is non-reentrant; nested calls
+    deadlock by design (each call loads its own snapshot, so
+    nesting would clobber the inner write at the outer's exit).
+    Windows / no-fcntl degrades to per-process only.
     """
     with _METADATA_LOCK:
-        data = _load_metadata(config_dir)
-        yield data
-        _save_metadata(config_dir, data)
+        if not _HAS_FCNTL:
+            data = _load_metadata(config_dir)
+            yield data
+            _save_metadata(config_dir, data)
+            return
+        lock_path = config_dir / _METADATA_LOCK_FILE
+        with open(lock_path, "a+", encoding="utf-8", opener=_open_metadata_lock_file) as lock_fh:
+            # Defense in depth: O_NOFOLLOW rejects symlinks, but a
+            # FIFO planted at the lock path would block every
+            # transaction on ``open(..., "a+")``. Match the
+            # ``_ensure_single_execution`` shape — refuse anything
+            # that isn't a regular file.
+            st = os.fstat(lock_fh.fileno())
+            if not stat.S_ISREG(st.st_mode):
+                raise OSError(f"Lock file {lock_path} is not a regular file (mode={st.st_mode:o})")
+            # Blocking LOCK_EX (not LOCK_NB like the startup
+            # lock) — a transient WS-command race should queue,
+            # not fail.
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+            data = _load_metadata(config_dir)
+            yield data
+            _save_metadata(config_dir, data)
 
 
 def _load_metadata(config_dir: Path) -> dict[str, Any]:

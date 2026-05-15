@@ -1,16 +1,19 @@
 """
-Coverage for the per-config-dir startup lock.
+Coverage for the per-data-dir startup lock.
 
 The lock guards against two ``device-builder`` processes racing on
-the same config directory — the metadata sidecar, identity files,
-build tree, and firmware queue all use per-process
-``threading.Lock`` instances that don't extend across processes.
-A double-launch would corrupt state silently.
+the same data directory — the build tree, firmware queue, and
+StorageJSON sidecars all use per-process ``threading.Lock``
+instances that don't extend across processes. A double-launch
+against the same ``CORE.data_dir`` would corrupt state silently.
+Keying on ``data_dir`` rather than ``config_dir`` lets the HA
+addon's Prod/Beta/DEV flavors — each with its own per-instance
+``/data`` but a shared ``/config/esphome`` YAML tree — coexist.
 
 These tests pin three contracts:
 
 1. **First start succeeds** and writes a JSON record into
-   ``<config_dir>/.device-builder.lock`` carrying ``pid``,
+   ``<data_dir>/.device-builder.lock`` carrying ``pid``,
    ``lock_format_version``, ``device_builder_version``, and
    ``start_ts`` — operators / future dashboards reading the file
    must see a stable shape.
@@ -58,13 +61,13 @@ _REQUIRES_FCNTL = pytest.mark.skipif(
 
 
 @contextmanager
-def _lock_held_by_thread(config_dir: Path) -> Generator[None]:
+def _lock_held_by_thread(lock_dir: Path) -> Generator[None]:
     """Hold the single-instance lock from a background thread."""
     started = threading.Event()
     release = threading.Event()
 
     def _hold() -> None:
-        with ensure_single_execution(config_dir) as lock:
+        with ensure_single_execution(lock_dir) as lock:
             if lock.exit_code is not None:
                 return  # acquisition unexpectedly failed; let started timeout
             started.set()
@@ -84,7 +87,7 @@ def _lock_held_by_thread(config_dir: Path) -> Generator[None]:
 
 @_REQUIRES_FCNTL
 def test_first_start_acquires_and_writes_lock_info(tmp_path: Path) -> None:
-    """A clean ``config_dir`` acquires the lock and writes diagnostics."""
+    """A clean ``data_dir`` acquires the lock and writes diagnostics."""
     with ensure_single_execution(tmp_path) as lock:
         assert isinstance(lock, SingleInstanceLock)
         assert lock.exit_code is None
@@ -104,6 +107,44 @@ def test_first_start_acquires_and_writes_lock_info(tmp_path: Path) -> None:
         assert isinstance(contents["device_builder_version"], str)
         assert contents["device_builder_version"]  # non-empty
         assert isinstance(contents["start_ts"], (int, float))
+
+
+@_REQUIRES_FCNTL
+def test_first_start_creates_missing_data_dir(tmp_path: Path) -> None:
+    """Helper creates ``data_dir`` if it doesn't exist yet (fresh install)."""
+    missing_data_dir = tmp_path / ".esphome"
+    assert not missing_data_dir.exists()
+
+    with ensure_single_execution(missing_data_dir) as lock:
+        assert lock.exit_code is None
+
+    assert missing_data_dir.is_dir()
+    assert (missing_data_dir / _LOCK_FILE_NAME).exists()
+
+
+@_REQUIRES_FCNTL
+def test_mkdir_failure_refuses_to_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """OSError during the data-dir mkdir surfaces ``exit_code=1`` with a log."""
+    real_mkdir = Path.mkdir
+
+    def _boom(self: Path, *args: object, **kwargs: object) -> None:
+        if self == tmp_path / ".esphome":
+            raise PermissionError("read-only fs")
+        real_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", _boom)
+
+    with (
+        caplog.at_level("ERROR", logger=single_instance.__name__),
+        ensure_single_execution(tmp_path / ".esphome") as lock,
+    ):
+        assert lock.exit_code == 1
+
+    assert any("Could not create lock directory" in record.message for record in caplog.records)
 
 
 @_REQUIRES_FCNTL
@@ -309,12 +350,12 @@ def test_no_op_yields_success_when_fcntl_unavailable(
 @_REQUIRES_FCNTL
 def test_symlink_at_lock_file_is_refused(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     """
-    A symlink at ``<config_dir>/.device-builder.lock`` aborts startup.
+    A symlink at ``<data_dir>/.device-builder.lock`` aborts startup.
 
     Without ``O_NOFOLLOW`` the dashboard would happily follow
     the link and have ``_write_lock_info`` truncate whatever
     file the link targets — turning the lock mechanism into a
-    write-anywhere primitive for anyone with config-dir access.
+    write-anywhere primitive for anyone with data-dir access.
     Pin the contract: a symlink at the path produces
     ``exit_code=1`` and an actionable log line, and no truncation
     of the link target.

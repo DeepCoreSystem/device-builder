@@ -29,7 +29,9 @@ import asyncio
 import json
 import logging
 import os
+import sys
 import threading
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -37,6 +39,7 @@ from unittest.mock import MagicMock
 import pytest
 from esphome.util import SerialPort
 
+from esphome_device_builder.controllers import config as config_module
 from esphome_device_builder.controllers.config import (
     _APP_DESC_MAGIC,
     _APP_DESC_SIZE,
@@ -111,6 +114,74 @@ def test_metadata_transaction_persists_changes(tmp_path: Path) -> None:
 
     raw = json.loads((tmp_path / ".device-builder.json").read_bytes())
     assert raw == {"kitchen.yaml": {"board_id": "esp32"}}
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="cross-process flock requires fcntl (POSIX-only)",
+)
+def test_metadata_transaction_serialises_across_flocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cross-process flock serialises peers RMW-ing disjoint keys."""
+    # Bypass _METADATA_LOCK so the two threads race directly at
+    # the flock — the same path two real processes would hit.
+    monkeypatch.setattr(config_module, "_METADATA_LOCK", nullcontext())
+
+    thread_a_in_block = threading.Event()
+    release_a = threading.Event()
+    thread_b_done = threading.Event()
+
+    def _writer_a() -> None:
+        with metadata_transaction(tmp_path) as data:
+            data["a.yaml"] = {"board_id": "esp32"}
+            thread_a_in_block.set()
+            # Hold the flock so B has to wait for us.
+            release_a.wait(timeout=5.0)
+
+    def _writer_b() -> None:
+        thread_a_in_block.wait(timeout=5.0)
+        with metadata_transaction(tmp_path) as data:
+            data["b.yaml"] = {"board_id": "esp32-c3"}
+        thread_b_done.set()
+
+    t_a = threading.Thread(target=_writer_a)
+    t_b = threading.Thread(target=_writer_b)
+    t_a.start()
+    t_b.start()
+
+    # B must NOT have finished while A holds the flock.
+    assert not thread_b_done.wait(timeout=0.5), (
+        "B's transaction completed without waiting for A's flock — flock not engaged"
+    )
+
+    release_a.set()
+    t_a.join(timeout=5.0)
+    t_b.join(timeout=5.0)
+    assert not t_a.is_alive() and not t_b.is_alive()
+
+    final = json.loads((tmp_path / ".device-builder.json").read_bytes())
+    assert final == {
+        "a.yaml": {"board_id": "esp32"},
+        "b.yaml": {"board_id": "esp32-c3"},
+    }
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="fstat S_ISREG check is POSIX-only (fcntl path)",
+)
+def test_metadata_transaction_rejects_non_regular_lock_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Defense in depth: ``S_ISREG`` fstat refuses oddballs (e.g. block devices)."""
+    # Real block/char devices need root + a special FS; flip
+    # ``S_ISREG`` in the module so a normal regular-file open
+    # takes the rejection branch as if it had hit one.
+    monkeypatch.setattr(config_module.stat, "S_ISREG", lambda _mode: False)
+
+    with pytest.raises(OSError, match="is not a regular file"), metadata_transaction(tmp_path):
+        pass
 
 
 def test_metadata_transaction_discards_changes_on_exception(tmp_path: Path) -> None:
