@@ -375,6 +375,30 @@ async def test_upsert_rejects_unknown_location_kind(tmp_path: Path) -> None:
         )
 
 
+async def test_parse_uses_yaml_override_when_provided(tmp_path: Path) -> None:
+    """Parse honours ``yaml=`` so the editor's post-add hydrate sees the draft.
+
+    The frontend's add-automation wizard inserts the new entry
+    into the in-memory draft buffer; the post-add hydrate has to
+    parse against THAT buffer, not the unchanged disk file, or
+    the form lands empty even though the YAML pane shows the
+    user's input.
+    """
+    config = tmp_path / "p.yaml"
+    config.write_text("esphome:\n  name: p\n", encoding="utf-8")
+    controller = _make_controller(tmp_path)
+    draft = (
+        "esphome:\n  name: p\ninterval:\n  - interval: 30s\n    then:\n      - logger.log: tick\n"
+    )
+    result = await controller.parse(configuration="p.yaml", yaml=draft)
+    assert len(result) == 1
+    parsed = result[0]
+    assert parsed["location"] == {"kind": "interval", "index": 0}
+    # The interval time the user typed in the wizard round-trips
+    # straight back to trigger_params.
+    assert parsed["automation"]["trigger_params"]["interval"] == "30s"
+
+
 async def test_upsert_uses_yaml_override_when_provided(tmp_path: Path) -> None:
     """Passing ``yaml=`` makes the writer splice into the override text.
 

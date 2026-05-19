@@ -138,10 +138,21 @@ class AutomationsController:
         self,
         *,
         configuration: str,
+        yaml: str | None = None,
         **_kwargs: Any,
     ) -> list[dict]:
-        """Parse the device YAML and return every automation we recognise."""
-        text = await self._read_config(configuration)
+        """Parse the device YAML and return every automation we recognise.
+
+        Accepts the same optional ``yaml`` override as ``upsert`` /
+        ``delete``: when the frontend has an in-memory draft that's
+        not on disk yet (e.g. the user just used the add wizard, the
+        new automation lives in the draft buffer but the global Save
+        hasn't run), pass the draft so the parser sees what the user
+        sees. Without this the editor's post-add hydrate reads the
+        stale on-disk YAML, fails to find the new automation, and
+        the form lands empty.
+        """
+        text = yaml if yaml is not None else await self._read_config(configuration)
         loop = asyncio.get_running_loop()
         parsed = await loop.run_in_executor(None, parsing.parse_device_yaml, text)
         return [p.to_dict() for p in parsed]
