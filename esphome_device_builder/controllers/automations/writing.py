@@ -154,11 +154,11 @@ def _upsert_component_on(
             f"under {domain!r}; can't splice handler {location.trigger!r}"
         )
         raise CommandError(ErrorCode.INVALID_ARGS, msg)
-    new_text, from_line, to_line = res
+    new_text, from_line, to_line, replacement = res
     return new_text, YamlDiff(
         fromLine=from_line,
         toLine=to_line,
-        replacement=_extract_replacement(new_text, from_line, to_line),
+        replacement=replacement,
     )
 
 
@@ -191,11 +191,11 @@ def _upsert_light_effect(
     if res is None:
         msg = f"Light instance id={location.component_id!r} not found; can't splice effect entry"
         raise CommandError(ErrorCode.INVALID_ARGS, msg)
-    new_text, from_line, to_line = res
+    new_text, from_line, to_line, replacement = res
     return new_text, YamlDiff(
         fromLine=from_line,
         toLine=to_line,
-        replacement=_extract_replacement(new_text, from_line, to_line),
+        replacement=replacement,
     )
 
 
@@ -505,11 +505,11 @@ def _delete_light_effect(
             if res is None:  # pragma: no cover — instance found above
                 msg = f"light id={location.component_id!r} not found in splice"
                 raise CommandError(ErrorCode.INTERNAL_ERROR, msg)
-            new_text, from_line, to_line = res
+            new_text, from_line, to_line, replacement = res
             return new_text, YamlDiff(
                 fromLine=from_line,
                 toLine=to_line,
-                replacement=_extract_replacement(new_text, from_line, to_line),
+                replacement=replacement,
             )
         res = remove_inline_handler(
             yaml_text,

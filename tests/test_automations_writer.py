@@ -356,6 +356,36 @@ def test_upsert_component_on_unknown_trigger_raises() -> None:
     assert err.value.code == ErrorCode.INVALID_ARGS
 
 
+def test_upsert_component_on_diff_carries_inserted_text() -> None:
+    """Pure-insert under a component returns the rendered text as ``replacement``.
+
+    The frontend applies the diff client-side; an empty replacement
+    on a pure insert (``toLine == fromLine - 1``) means the new
+    automation never lands in the user's draft YAML. Reproducer:
+    add a Light → On State on a light instance — the YAML pane
+    stays unchanged. Pin the contract here so the writer never
+    drops the rendered content again.
+    """
+    text = (
+        "light:\n"
+        "  - platform: binary\n"
+        "    name: Status\n"
+        "    id: status_led\n"
+        "    output: status_led_out\n"
+    )
+    _new_text, diff = render_upsert(
+        text,
+        tree=AutomationTree(
+            trigger_id="light.on_state",
+            actions=[ActionNode(action_id="light.toggle", params={"id": "status_led"})],
+        ),
+        location=ComponentOnLocation(component_id="status_led", trigger="on_state"),
+    )
+    assert diff.replacement.strip() != ""
+    assert "on_state:" in diff.replacement
+    assert "light.toggle" in diff.replacement
+
+
 def test_upsert_component_on_resolves_domain_from_yaml_when_trigger_key_is_ambiguous() -> None:
     """The trigger key alone can match multiple domains; use the YAML's actual layout.
 

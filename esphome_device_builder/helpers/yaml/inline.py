@@ -14,16 +14,24 @@ def upsert_inline_handler(
     component_id: str,
     handler_key: str,
     rendered_yaml: str,
-) -> tuple[str, int, int] | None:
+) -> tuple[str, int, int, str] | None:
     """
     Insert or replace ``<handler_key>:`` inline under a configured component.
 
     Used by the automation writer for inline ``on_*:`` triggers under
     component instances (``binary_sensor[i].on_press``, ``light[i].on_turn_on``,
     ...) and for ``effects:`` entries under a light. Returns
-    ``(new_yaml_text, from_line, to_line)`` matching the
-    :class:`automations.YamlDiff` convention — ``from_line <= to_line``
-    for a replace, ``to_line == from_line - 1`` for a pure insert.
+    ``(new_yaml_text, from_line, to_line, replacement)``:
+
+      * ``from_line`` / ``to_line`` match the
+        :class:`automations.YamlDiff` convention — ``from_line <= to_line``
+        for a replace (the OLD line range in the pre-splice YAML),
+        ``to_line == from_line - 1`` for a pure insert.
+      * ``replacement`` is the indented rendered text spliced into
+        the YAML — callers feed it straight into ``YamlDiff.replacement``
+        rather than re-deriving from the new YAML (which is broken for
+        the pure-insert case because the slice ends up empty).
+
     ``None`` when the component instance can't be located (no
     ``id:`` match under ``<component_domain>:``).
 
@@ -68,7 +76,7 @@ def upsert_inline_handler(
         # Replace the existing handler block.
         new_lines = [*lines[:handler_start], rendered_text, *lines[handler_end:]]
         new_text = "".join(new_lines)
-        return new_text, handler_start + 1, handler_end
+        return new_text, handler_start + 1, handler_end, rendered_text
     # Insert a new handler at the end of the instance, before any
     # trailing blank lines.
     insert_at = instance_end
@@ -78,7 +86,7 @@ def upsert_inline_handler(
     new_text = "".join(new_lines)
     # Pure-insert: ``toLine == fromLine - 1`` flags the empty
     # replaced range. See :class:`automations.YamlDiff`.
-    return new_text, insert_at + 1, insert_at
+    return new_text, insert_at + 1, insert_at, rendered_text
 
 
 def remove_inline_handler(
