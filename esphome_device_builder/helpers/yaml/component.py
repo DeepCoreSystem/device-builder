@@ -5,6 +5,9 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING, Any
 
+import yaml
+
+from ...models.common import ConfigEntryType
 from .scalar import ESPHOME_YAML_INDENT
 
 if TYPE_CHECKING:
@@ -115,6 +118,7 @@ def generate_component_yaml(
       (no name) or can't be referenced from automations (no id).
     """
     fields = dict(fields)
+    _coerce_string_map_values(component, fields)
     category = component.category
     comp_id = component.id
 
@@ -173,6 +177,45 @@ def generate_component_yaml(
         lines.extend(_emit_field(key, value, indent))
 
     return "\n".join(lines)
+
+
+def _coerce_string_map_values(
+    component: ComponentCatalogEntry,
+    fields: dict[str, Any],
+) -> None:
+    """
+    Stringify dict values for MAP fields whose value template is STRING.
+
+    ``sdkconfig_options`` validates as ``Dict[str, str]`` on the
+    ESPHome side; a frontend that sends JSON number ``100`` for the
+    value would otherwise emit ``CONFIG_FOO: 100`` and trip
+    ``cv.string_strict`` (issue #901).
+    """
+    for entry in component.config_entries:
+        if entry.type != ConfigEntryType.MAP:
+            continue
+        if not entry.config_entries:
+            continue
+        if entry.config_entries[0].type != ConfigEntryType.STRING:
+            continue
+        value = fields.get(entry.key)
+        if not isinstance(value, dict):
+            continue
+        fields[entry.key] = {k: _coerce_map_scalar_to_string(v) for k, v in value.items()}
+
+
+def _coerce_map_scalar_to_string(value: Any) -> str:
+    """Convert a MAP-value scalar to its YAML-string form."""
+    if isinstance(value, str):
+        return value
+    # ``str(True)`` is ``"True"`` which YAML 1.1 re-parses as bool;
+    # canonicalise to the lowercase form so the downstream quoter
+    # recognises and quotes it.
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return "null"
+    return str(value)
 
 
 def _append_block(existing: str, block: str) -> str:
@@ -235,15 +278,56 @@ def _splice_into_domain_block(existing: str, domain: str, block: str) -> str | N
 
 def _format_yaml_value(value: Any) -> str:
     """Format a Python value for YAML output."""
+    if value is None:
+        return "null"
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, str):
-        if value in ("true", "false", "null", "yes", "no", "on", "off", "%"):
-            return f'"{value}"'
-        if value.startswith("!") or ":" in value or "#" in value:
-            return f'"{value}"'
-        return value
+        return f'"{value}"' if _string_needs_quoting(value) else value
     return str(value)
+
+
+_YAML_RESERVED_KEYWORDS = frozenset({"true", "false", "null", "yes", "no", "on", "off"})
+
+
+def _string_needs_quoting(value: str) -> bool:
+    """Return True when *value* needs YAML quoting to round-trip as a string."""
+    # YAML 1.1 recognises every case variant of the reserved words
+    # (``true``/``True``/``TRUE`` etc.) as bool/null, so ``str(True)``
+    # from a JSON bool would otherwise re-parse as ``True``. ``%`` is
+    # a YAML directive indicator; ``~`` and empty string are YAML null
+    # shorthands; ``!`` opens a tag; ``:`` opens a mapping value;
+    # ``#`` opens a comment. Anything that survives those checks then
+    # gets the (cheap pre-filtered) ``yaml.safe_load`` round-trip test
+    # for numeric-looking strings — the original #901 case.
+    if value.lower() in _YAML_RESERVED_KEYWORDS or value in ("%", "~", ""):
+        return True
+    if value.startswith("!") or ":" in value or "#" in value:
+        return True
+    return _yaml_reparses_as_non_string(value)
+
+
+# YAML 1.1 plain scalars can only re-parse as a non-string when the
+# first character is a digit, sign, or ``.`` (covers int / float /
+# hex / binary / ``.inf`` / ``.nan`` / dates / timestamps). Every
+# other plain leading character resolves to a string, so the cheap
+# membership test rules out the ``yaml.safe_load`` call for typical
+# values like ``"GPIO4"`` or ``"Bedroom Light"`` — without the
+# pre-filter the parser ran on every emitted string field and
+# regressed ``merge_component_yaml`` by ~600µs per emission
+# (CodSpeed flagged this on #908).
+_YAML_AMBIGUOUS_FIRST = frozenset("0123456789-+.")
+
+
+def _yaml_reparses_as_non_string(value: str) -> bool:
+    """Return True when ``yaml.safe_load(value)`` is not a string."""
+    if not value or value[0] not in _YAML_AMBIGUOUS_FIRST:
+        return False
+    try:
+        parsed = yaml.safe_load(value)
+    except yaml.YAMLError:
+        return False
+    return parsed is not None and not isinstance(parsed, str)
 
 
 def _format_flow_yaml_value(value: Any) -> str:

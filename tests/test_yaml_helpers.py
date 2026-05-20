@@ -44,6 +44,7 @@ from esphome_device_builder.helpers.yaml import (
     rewrite_yaml_scalar,
     upsert_yaml_leaf_under_top_block,
 )
+from esphome_device_builder.models.common import ConfigEntry, ConfigEntryType
 from esphome_device_builder.models.components import (
     ComponentCatalogEntry,
     ComponentCategory,
@@ -1002,7 +1003,7 @@ def test_generate_component_yaml_emits_bool_false_lowercase() -> None:
     assert "  enabled: false" in out
 
 
-@pytest.mark.parametrize("keyword", ["true", "false", "null", "yes", "no", "on", "off"])
+@pytest.mark.parametrize("keyword", ["true", "false", "null", "yes", "no", "on", "off", "~", ""])
 def test_generate_component_yaml_quotes_yaml_keyword_strings(keyword: str) -> None:
     """Strings whose value is a YAML 1.1 boolean keyword get quoted.
 
@@ -1011,7 +1012,9 @@ def test_generate_component_yaml_quotes_yaml_keyword_strings(keyword: str) -> No
     these as enum values for several components (e.g. light states),
     so the helper has to disambiguate. ``null`` / ``yes`` / ``no``
     follow the same logic; pin every keyword in the helper's
-    allowlist so a regression that drops one shows up here.
+    allowlist so a regression that drops one shows up here. ``~`` and
+    the empty string round-trip as YAML null, same class of bug as
+    #901 for any field validating as a strict string.
     """
     component = _component(component_id="myc", category=ComponentCategory.MISC)
     out = generate_component_yaml(component, {"state": keyword})
@@ -1065,6 +1068,20 @@ def test_generate_component_yaml_emits_numeric_value_via_str(value: int | float)
     out = generate_component_yaml(component, {"v": value})
     assert f"  v: {value}" in out
     assert f'"{value}"' not in out
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["100", "-5", "+5", "3.14", "0xFF", "0b101", ".inf", ".nan", "2024-01-01"],
+    ids=["int", "neg-int", "pos-int", "float", "hex", "binary", "inf", "nan", "date"],
+)
+def test_generate_component_yaml_quotes_strings_that_reparse_as_non_string(
+    value: str,
+) -> None:
+    """Strings whose YAML re-parse isn't a string get quoted (issue #901)."""
+    component = _component(component_id="myc", category=ComponentCategory.MISC)
+    out = generate_component_yaml(component, {"v": value})
+    assert f'  v: "{value}"' in out
 
 
 # ---------------------------------------------------------------------------
@@ -1187,6 +1204,165 @@ def test_generate_component_yaml_quotes_flow_string_with_flow_indicator() -> Non
     component = _component(component_id="myc", category=ComponentCategory.MISC)
     out = generate_component_yaml(component, {"items": ["a,b", "c"]})
     assert '  items: ["a,b", c]' in out
+
+
+# ---------------------------------------------------------------------------
+# generate_component_yaml — MAP fields with string value templates
+# ---------------------------------------------------------------------------
+
+
+def _component_with_string_map(key: str) -> ComponentCatalogEntry:
+    """Component with one MAP entry whose value template is STRING."""
+    return ComponentCatalogEntry(
+        id="myc",
+        name="myc",
+        description="",
+        category=ComponentCategory.MISC,
+        config_entries=[
+            ConfigEntry(
+                key=key,
+                type=ConfigEntryType.MAP,
+                label="Map",
+                config_entries=[
+                    ConfigEntry(key="value", type=ConfigEntryType.STRING, label="Value"),
+                ],
+            ),
+        ],
+    )
+
+
+def test_generate_component_yaml_quotes_map_string_value_that_looks_numeric() -> None:
+    """A MAP string-typed value sent as ``"100"`` lands quoted (issue #901)."""
+    component = _component_with_string_map("sdkconfig_options")
+    out = generate_component_yaml(component, {"sdkconfig_options": {"CONFIG_FOO": "100"}})
+    assert '    CONFIG_FOO: "100"' in out
+
+
+def test_generate_component_yaml_coerces_map_numeric_value_to_quoted_string() -> None:
+    """A MAP string-typed value sent as JSON number ``100`` lands as ``"100"``."""
+    component = _component_with_string_map("sdkconfig_options")
+    out = generate_component_yaml(component, {"sdkconfig_options": {"CONFIG_FOO": 100}})
+    assert '    CONFIG_FOO: "100"' in out
+
+
+def test_generate_component_yaml_leaves_plain_map_string_value_unquoted() -> None:
+    """A MAP string value that round-trips as itself stays unquoted."""
+    component = _component_with_string_map("sdkconfig_options")
+    out = generate_component_yaml(component, {"sdkconfig_options": {"CONFIG_FOO": "y"}})
+    assert "    CONFIG_FOO: y" in out
+    assert '"y"' not in out
+
+
+def test_generate_component_yaml_coerce_skips_non_map_entry() -> None:
+    """Non-MAP entries pass through the coerce step untouched."""
+    component = ComponentCatalogEntry(
+        id="myc",
+        name="myc",
+        description="",
+        category=ComponentCategory.MISC,
+        config_entries=[
+            ConfigEntry(key="label", type=ConfigEntryType.STRING, label="Label"),
+        ],
+    )
+    out = generate_component_yaml(component, {"label": "kitchen"})
+    assert "  label: kitchen" in out
+
+
+def test_generate_component_yaml_coerce_skips_map_without_value_template() -> None:
+    """A MAP entry without an inner ``config_entries[0]`` is left alone."""
+    component = ComponentCatalogEntry(
+        id="myc",
+        name="myc",
+        description="",
+        category=ComponentCategory.MISC,
+        config_entries=[
+            ConfigEntry(key="opts", type=ConfigEntryType.MAP, label="Opts"),
+        ],
+    )
+    out = generate_component_yaml(component, {"opts": {"k": 1}})
+    assert "    k: 1" in out
+
+
+def test_generate_component_yaml_coerce_skips_map_with_non_string_template() -> None:
+    """A MAP whose value template is INTEGER preserves the int value."""
+    component = ComponentCatalogEntry(
+        id="myc",
+        name="myc",
+        description="",
+        category=ComponentCategory.MISC,
+        config_entries=[
+            ConfigEntry(
+                key="opts",
+                type=ConfigEntryType.MAP,
+                label="Opts",
+                config_entries=[
+                    ConfigEntry(key="value", type=ConfigEntryType.INTEGER, label="Value"),
+                ],
+            ),
+        ],
+    )
+    out = generate_component_yaml(component, {"opts": {"k": 7}})
+    assert "    k: 7" in out
+    assert '"7"' not in out
+
+
+def test_generate_component_yaml_coerce_skips_map_value_that_isnt_a_dict() -> None:
+    """A MAP field whose value is None emits as ``null`` (coerce no-ops)."""
+    component = _component_with_string_map("sdkconfig_options")
+    # ``None`` would land here when the frontend submits the field
+    # with an empty payload; the coerce step must not blow up and the
+    # emitter renders YAML ``null`` rather than Python's ``None``.
+    out = generate_component_yaml(component, {"sdkconfig_options": None})
+    assert "  sdkconfig_options: null" in out
+
+
+@pytest.mark.parametrize(
+    ("py_value", "expected"),
+    [(True, '"true"'), (False, '"false"'), (None, '"null"')],
+    ids=["bool-true", "bool-false", "none"],
+)
+def test_generate_component_yaml_quotes_map_bool_and_none_values(
+    py_value: Any, expected: str
+) -> None:
+    """A MAP string-typed value sent as JSON ``true`` / ``false`` / ``null``.
+
+    Coerce canonicalises to the lowercase YAML keyword, which the
+    emitter then quotes — so the round-tripped value stays a string
+    rather than landing as a YAML bool / null and tripping
+    ``cv.string_strict`` (same class of bug as #901, raised in PR
+    review).
+    """
+    component = _component_with_string_map("sdkconfig_options")
+    out = generate_component_yaml(component, {"sdkconfig_options": {"K": py_value}})
+    assert f"    K: {expected}" in out
+
+
+@pytest.mark.parametrize("variant", ["True", "TRUE", "False", "FALSE", "Null", "NULL"])
+def test_generate_component_yaml_quotes_case_variant_keyword_strings(variant: str) -> None:
+    """``"True"`` / ``"FALSE"`` etc. round-trip as bool/null on YAML 1.1.
+
+    The base allowlist only carried the lowercase forms; PyYAML
+    recognises every case variant the spec lists, so a Python string
+    ``"True"`` (e.g. ``str(True)``) re-parsed to ``True``. Quote any
+    case variant so the value survives as a string.
+    """
+    component = _component(component_id="myc", category=ComponentCategory.MISC)
+    out = generate_component_yaml(component, {"v": variant})
+    assert f'  v: "{variant}"' in out
+
+
+def test_generate_component_yaml_quotes_unparseable_string_starting_with_digit() -> None:
+    r"""A digit-led string yaml can't parse (``"0\t"``) falls through unquoted.
+
+    Exercises the ``yaml.YAMLError`` branch in
+    ``_yaml_reparses_as_non_string`` — the pre-filter lets the value
+    through, the parser raises, and the helper returns False so the
+    string emits without quotes.
+    """
+    component = _component(component_id="myc", category=ComponentCategory.MISC)
+    out = generate_component_yaml(component, {"v": "0\t"})
+    # The value rendered bare — no extra quotes from the reparse check.
+    assert '  v: "' not in out
 
 
 # ---------------------------------------------------------------------------
