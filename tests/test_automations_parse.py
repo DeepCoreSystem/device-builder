@@ -148,6 +148,118 @@ def test_parse_interval_block() -> None:
 
 
 # ---------------------------------------------------------------------------
+# api.actions
+# ---------------------------------------------------------------------------
+
+
+def test_parse_api_action_surfaces_action_name_and_then() -> None:
+    """A bare ``api.actions:`` item parses to one ``api_action`` entry."""
+    parsed = parse_device_yaml(_load("api_action_simple.yaml"))
+    assert len(parsed) == 1
+    item = parsed[0]
+    assert item.location.kind == "api_action"
+    assert item.location.action_name == "start_laundry"
+    assert item.label == "API: start_laundry"
+    tree = item.automation
+    assert tree.trigger_id is None
+    assert tree.trigger_params == {}
+    assert [a.action_id for a in tree.actions] == ["logger.log"]
+
+
+def test_parse_api_action_surfaces_variables_as_trigger_params() -> None:
+    """``variables:`` survives as a dict on ``trigger_params``."""
+    parsed = parse_device_yaml(_load("api_action_with_variables.yaml"))
+    assert len(parsed) == 1
+    tree = parsed[0].automation
+    # The discriminator key is implicit via location; only sibling
+    # fields (``variables:`` here) surface on trigger_params.
+    assert "action" not in tree.trigger_params
+    assert tree.trigger_params["variables"] == {"message": "string", "urgency": "int"}
+
+
+def test_parse_api_action_emits_one_entry_per_item() -> None:
+    """Multiple ``api.actions:`` siblings each yield their own ParsedAutomation."""
+    parsed = parse_device_yaml(_load("api_actions_multiple.yaml"))
+    api_entries = [p for p in parsed if p.location.kind == "api_action"]
+    assert [e.location.action_name for e in api_entries] == [
+        "start_laundry",
+        "stop_laundry",
+    ]
+
+
+def test_parse_api_action_decomposes_nested_if() -> None:
+    """An api-action whose ``then:`` carries an ``if`` decomposes recursively."""
+    parsed = parse_device_yaml(_load("api_action_with_if.yaml"))
+    assert len(parsed) == 1
+    actions = parsed[0].automation.actions
+    assert len(actions) == 1
+    if_node = actions[0]
+    assert if_node.action_id == "if"
+    assert set(if_node.children) == {"then", "else"}
+
+
+def test_parse_api_action_accepts_legacy_service_key() -> None:
+    """The deprecated ``service:`` discriminator parses to the same shape."""
+    legacy = (
+        "esphome:\n  name: x\n"
+        "api:\n  actions:\n"
+        "    - service: legacy_name\n"
+        "      then:\n        - delay: 1s\n"
+    )
+    parsed = parse_device_yaml(legacy)
+    assert len(parsed) == 1
+    assert parsed[0].location.kind == "api_action"
+    assert parsed[0].location.action_name == "legacy_name"
+
+
+def test_parse_api_block_without_actions_returns_empty() -> None:
+    """An ``api:`` block without an ``actions:`` key yields no api_action entries.
+
+    The api block carries unrelated configuration (encryption, password,
+    port, ...) that's not an automation surface.
+    """
+    yaml = "esphome:\n  name: x\napi:\n  encryption:\n    key: 'aaaa'\n"
+    parsed = parse_device_yaml(yaml)
+    assert [p for p in parsed if p.location.kind == "api_action"] == []
+
+
+def test_parse_api_actions_skips_malformed_items() -> None:
+    """Items missing the discriminator or with a non-dict shape are silently skipped.
+
+    Defensive against mid-edit YAMLs where the user has typed a
+    partial item — surfacing an error would block the parse for
+    every other valid entry.
+    """
+    yaml = (
+        "esphome:\n  name: x\n"
+        "api:\n  actions:\n"
+        "    - then:\n        - delay: 1s\n"  # no action: key
+        "    - action: good\n      then:\n        - delay: 2s\n"
+    )
+    parsed = parse_device_yaml(yaml)
+    api_entries = [p for p in parsed if p.location.kind == "api_action"]
+    assert [e.location.action_name for e in api_entries] == ["good"]
+
+
+def test_parse_api_actions_skips_non_dict_list_items() -> None:
+    """A bare scalar item in ``actions:`` is silently skipped, not raised.
+
+    A mid-edit YAML can carry a stray ``- foo`` while the user is
+    typing — losing every following valid item to a parse error
+    would be hostile.
+    """
+    yaml = (
+        "esphome:\n  name: x\n"
+        "api:\n  actions:\n"
+        "    - bogus_scalar\n"
+        "    - action: real\n      then:\n        - delay: 1s\n"
+    )
+    parsed = parse_device_yaml(yaml)
+    api_entries = [p for p in parsed if p.location.kind == "api_action"]
+    assert [e.location.action_name for e in api_entries] == ["real"]
+
+
+# ---------------------------------------------------------------------------
 # Recursive / control-flow
 # ---------------------------------------------------------------------------
 
