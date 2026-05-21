@@ -16,6 +16,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from esphome.storage_json import StorageJSON
 
 from esphome_device_builder.controllers.config import (
     get_device_metadata,
@@ -126,6 +127,65 @@ async def test_create_device_emits_minimal_stub_when_no_board_or_file_content(
     # this device's metadata before the user picks real hardware.
     pio_lookup.assert_not_called()
     variant_lookup.assert_not_called()
+
+
+@pytest.mark.usefixtures("stub_create_device_metadata_helpers")
+async def test_create_device_slugifies_hostname_and_preserves_raw_name_as_friendly(
+    tmp_path: Path, make_controller: MakeControllerFactory
+) -> None:
+    """Pins that raw input drives ``friendly_name`` while a slug drives ``name`` and filename."""
+    ctrl = make_controller(tmp_path, with_state_monitor=True, with_boards=True)
+    boards = StubBoardLookups(ctrl)
+    boards.find_by_pio_board_returns(None)
+    boards.find_by_platform_variant_returns(None)
+
+    result = await ctrl.create_device(name="Lüftung EG Bad")
+
+    assert result.configuration == "luftung-eg-bad.yaml"
+    content = (tmp_path / "luftung-eg-bad.yaml").read_text("utf-8")
+    assert "esphome:\n  name: luftung-eg-bad\n  friendly_name: Lüftung EG Bad\n" in content
+    storage = StorageJSON.load(tmp_path / "storage.json")
+    assert storage is not None
+    assert storage.name == "luftung-eg-bad"
+    assert storage.friendly_name == "Lüftung EG Bad"
+
+
+@pytest.mark.usefixtures("stub_create_device_metadata_helpers")
+async def test_create_device_quotes_friendly_name_with_yaml_metachars(
+    tmp_path: Path, make_controller: MakeControllerFactory
+) -> None:
+    """Pins that YAML metacharacters in ``friendly_name`` round-trip through quoted scalars."""
+    ctrl = make_controller(tmp_path, with_state_monitor=True, with_boards=True)
+    boards = StubBoardLookups(ctrl)
+    boards.find_by_pio_board_returns(None)
+    boards.find_by_platform_variant_returns(None)
+
+    result = await ctrl.create_device(name="Bedroom #2: lamp")
+
+    assert result.configuration == "bedroom-2-lamp.yaml"
+    content = (tmp_path / "bedroom-2-lamp.yaml").read_text("utf-8")
+    # `#` would otherwise start a comment; `: ` would split into a
+    # nested key/value pair. The safe-scalar renderer double-quotes
+    # the value so neither happens on round trip.
+    assert '  friendly_name: "Bedroom #2: lamp"\n' in content
+    storage = StorageJSON.load(tmp_path / "storage.json")
+    assert storage is not None
+    assert storage.friendly_name == "Bedroom #2: lamp"
+
+
+@pytest.mark.usefixtures("stub_create_device_metadata_helpers")
+async def test_create_device_rejects_name_with_no_hostname_safe_characters(
+    tmp_path: Path, make_controller: MakeControllerFactory
+) -> None:
+    """Pins that a name slugifying to empty (only emoji etc.) raises ``INVALID_ARGS``."""
+    ctrl = make_controller(tmp_path, with_state_monitor=True, with_boards=True)
+
+    with pytest.raises(CommandError) as excinfo:
+        await ctrl.create_device(name="🚀🚀🚀")
+
+    assert excinfo.value.code == ErrorCode.INVALID_ARGS
+    assert "hostname-safe" in excinfo.value.message
+    assert ctrl._scanner.calls == []
 
 
 @pytest.mark.usefixtures("stub_create_device_metadata_helpers")
