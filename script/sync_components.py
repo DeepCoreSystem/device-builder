@@ -87,6 +87,9 @@ sys.path.insert(0, str(_REPO_ROOT))
 from esphome_device_builder.controllers.components import (  # noqa: E402
     INTERNAL_COMPONENT_IDS as _INTERNAL_COMPONENT_IDS,
 )
+from script._light_schemas import (  # noqa: E402
+    resolve_light_effects_applies_to,
+)
 
 # Top-level platform domains in the schema (also keys in our category enum).
 # Components keyed as ``<id>.<domain>`` in the schema files — e.g.
@@ -1981,6 +1984,29 @@ def _convert_field(key: str, raw: dict, schema_dir: Path) -> dict | None:  # noq
     if entry_type is None and data_type in _DATA_TYPE_PRIMITIVE:
         entry_type = _DATA_TYPE_PRIMITIVE[data_type]
 
+    # Polymorphic registry list (#941). Two upstream shapes:
+    #   1. Lights' ``effects:`` carries ``{filter: [<ids>], key:
+    #      Optional}`` with no ``type`` — collapse to the
+    #      ``light_effects`` catalog.
+    #   2. Sensors' / binary_sensors' / text_sensors' ``filters:``
+    #      carries ``{type: registry, registry: <domain>.filter,
+    #      is_list: true}`` — collapse to the shared ``filter``
+    #      catalog (dedupe across domains).
+    # The frontend's REGISTRY_LIST renderer pulls the matching
+    # catalog and renders one row per item with a type picker.
+    registry_name: str | None = None
+    if key == "effects" and isinstance(raw.get("filter"), list) and raw["filter"]:
+        entry_type = "registry_list"
+        registry_name = "light_effects"
+    elif (
+        schema_type == "registry"
+        and raw.get("is_list")
+        and isinstance(raw.get("registry"), str)
+        and raw["registry"].endswith(".filter")
+    ):
+        entry_type = "registry_list"
+        registry_name = "filter"
+
     # An ``enum`` whose values are ``true`` and ``false`` is really a
     # boolean — the schema uses cv.boolean which produces this shape.
     if (entry_type == "string" or entry_type is None) and _looks_like_boolean_enum(raw):
@@ -2075,7 +2101,13 @@ def _convert_field(key: str, raw: dict, schema_dir: Path) -> dict | None:  # noq
         "allow_custom_value": False,
         "range": list(_DATA_TYPE_RANGE[data_type]) if data_type in _DATA_TYPE_RANGE else None,
         "display_format": "hex" if data_type in _DATA_TYPE_HEX else None,
-        "multi_value": bool(raw.get("is_list")),
+        "registry": registry_name,
+        # REGISTRY_LIST fields are inherently list-shaped — the
+        # upstream ``filter: [...]`` schema doesn't carry an explicit
+        # ``is_list`` flag, so the bool conversion of ``None`` would
+        # otherwise emit ``multi_value: false`` and the parser /
+        # serializer round-trip would miss the array contract.
+        "multi_value": (True if entry_type == "registry_list" else bool(raw.get("is_list"))),
         "templatable": bool(raw.get("templatable")),
         "depends_on": None,
         "depends_on_value": None,
@@ -3170,6 +3202,7 @@ _ENTRY_DEFAULTS: dict[str, Any] = {
     "platform_type": None,
     "group": None,
     "required_groups": [],
+    "registry": None,
 }
 
 _COMPONENT_DEFAULTS: dict[str, Any] = {
@@ -4479,9 +4512,9 @@ def build_automations(  # noqa: C901
     Walk every schema file and emit the automation catalog.
 
     Returns a dict with ``triggers`` / ``actions`` / ``conditions`` /
-    ``light_effects`` lists. Parameter schemas come out in the same
-    ``ConfigEntry[]`` shape the component catalog uses, so the
-    frontend renders both through one form pipeline.
+    ``light_effects`` / ``filters`` lists. Parameter schemas come
+    out in the same ``ConfigEntry[]`` shape the component catalog
+    uses, so the frontend renders both through one form pipeline.
 
     *component_ids* is the set of ids in the just-built component
     catalog (``switch.template``, ``display.ssd1306_i2c``, …).
@@ -4495,6 +4528,7 @@ def build_automations(  # noqa: C901
     actions: list[dict] = []
     conditions: list[dict] = []
     effects: list[dict] = []
+    filters: list[dict] = []
 
     for path in iter_schema_files(schema_dir):
         try:
@@ -4543,6 +4577,21 @@ def build_automations(  # noqa: C901
                 )
                 if entry is not None:
                     effects.append(entry)
+            # Filter registry — sensor / binary_sensor / text_sensor
+            # each carry their own filter registry under a ``filter:``
+            # subsection (sensor has 27, binary_sensor 8, text_sensor
+            # 7). ``applies_to`` tracks the originating domain so the
+            # frontend renderer scopes the per-row picker against the
+            # parent component's domain. #941.
+            for name, body in (section.get("filter") or {}).items():
+                entry = _convert_filter(
+                    name=name,
+                    body=body,
+                    domain=top_key,
+                    schema_dir=schema_dir,
+                )
+                if entry is not None:
+                    filters.append(entry)
             # Triggers — surfaced through CONFIG_SCHEMA's config_vars
             # (and any other ``_SCHEMA`` the file declares).
             triggers.extend(
@@ -4559,6 +4608,7 @@ def build_automations(  # noqa: C901
         "actions": _dedupe_by_id(actions),
         "conditions": _dedupe_by_id(conditions),
         "light_effects": _dedupe_by_id(effects),
+        "filters": _dedupe_filters(filters),
     }
 
 
@@ -4659,6 +4709,75 @@ def _convert_automation_condition(
     }
 
 
+def _convert_registry_entry(
+    *,
+    name: str,
+    body: dict,
+    label_domain: str,
+    applies_to: list[str],
+    schema_dir: Path,
+) -> dict | None:
+    """Build a registry catalog dict (id, name, config_entries, applies_to)."""
+    if not isinstance(body, dict):
+        return None
+    docs = clean_docs(body.get("docs"))
+    schema = body.get("schema") if isinstance(body.get("schema"), dict) else None
+    config_entries, _alist, _hcg = _extract_automation_param_schema(schema, schema_dir)
+    return {
+        "id": name,
+        "name": _automation_label(label_domain, name, docs.name),
+        "config_entries": [_strip_entry_defaults(e) for e in config_entries],
+        "applies_to": applies_to,
+    }
+
+
+# Shared by `_automation_label` (producer) and `_dedupe_filters`
+# (multi-domain prefix stripper).
+_AUTOMATION_LABEL_SEPARATOR = " → "
+
+
+def _convert_filter(
+    *,
+    name: str,
+    body: dict,
+    domain: str,
+    schema_dir: Path,
+) -> dict | None:
+    """Build one ``Filter`` dict from a ``<domain>.filter`` registry entry."""
+    return _convert_registry_entry(
+        name=name,
+        body=body,
+        label_domain=domain,
+        applies_to=[domain],
+        schema_dir=schema_dir,
+    )
+
+
+def _dedupe_filters(filters: list[dict]) -> list[dict]:
+    """
+    Merge filters sharing an ``id`` across domains; union ``applies_to``.
+
+    Multi-domain merges strip the ``"<Domain> → "`` prefix from the
+    display name since it would otherwise read wrong in whichever
+    domain the user is editing (``lambda`` under ``sensor:`` would
+    show "Binary Sensor → Lambda" otherwise).
+    """
+    by_id: dict[str, dict] = {}
+    for f in filters:
+        existing = by_id.get(f["id"])
+        if existing is None:
+            by_id[f["id"]] = f
+            continue
+        merged_applies_to = sorted({*existing.get("applies_to", []), *f.get("applies_to", [])})
+        existing["applies_to"] = merged_applies_to
+        # Multi-domain entry: strip the "<Domain> → " prefix so the
+        # bare name reads correctly regardless of editing context.
+        name = existing.get("name") or ""
+        if len(merged_applies_to) > 1 and _AUTOMATION_LABEL_SEPARATOR in name:
+            existing["name"] = name.split(_AUTOMATION_LABEL_SEPARATOR, 1)[1]
+    return list(by_id.values())
+
+
 def _convert_light_effect(
     *,
     name: str,
@@ -4666,30 +4785,13 @@ def _convert_light_effect(
     schema_dir: Path,
 ) -> dict | None:
     """Build one ``LightEffect`` dict from a light.effects registry entry."""
-    if not isinstance(body, dict):
-        return None
-    docs = clean_docs(body.get("docs"))
-    schema = body.get("schema") if isinstance(body.get("schema"), dict) else None
-    config_entries, _alist, _hcg = _extract_automation_param_schema(schema, schema_dir)
-    # The schema doesn't carry a clean "this effect applies to which
-    # light platforms" map. Heuristic: effects whose id starts with
-    # ``addressable_`` need an addressable platform; everything else
-    # is valid on any light platform.
-    applies_to: list[str] = []
-    if name.startswith("addressable_"):
-        applies_to = [
-            "light.addressable_rgb",
-            "light.fastled_clockless",
-            "light.fastled_spi",
-            "light.neopixelbus",
-            "light.rgb",
-        ]
-    return {
-        "id": name,
-        "name": _automation_label("light", name, docs.name),
-        "config_entries": [_strip_entry_defaults(e) for e in config_entries],
-        "applies_to": applies_to,
-    }
+    return _convert_registry_entry(
+        name=name,
+        body=body,
+        label_domain="light",
+        applies_to=resolve_light_effects_applies_to(name, schema_dir),
+        schema_dir=schema_dir,
+    )
 
 
 def _extract_triggers_from_section(
@@ -4813,7 +4915,7 @@ def _automation_label(domain: str, name: str, docs_name: str | None) -> str:
     if domain in ("core", "esphome") or not domain:
         return pretty_name
     domain_label = domain.replace("_", " ").title()
-    return f"{domain_label} → {pretty_name}"
+    return f"{domain_label}{_AUTOMATION_LABEL_SEPARATOR}{pretty_name}"
 
 
 def _dedupe_by_id(entries: list[dict]) -> list[dict]:

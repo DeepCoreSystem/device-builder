@@ -18,6 +18,7 @@ from ...models.automations import (
     AutomationAction,
     AutomationCondition,
     AutomationTrigger,
+    Filter,
     LightEffect,
 )
 
@@ -32,11 +33,13 @@ _CATALOG_FILE = "automations.json"
 @cache
 def load_catalog() -> dict[str, list]:
     """
-    Return the four catalog lists keyed by section.
+    Return the five catalog lists keyed by section.
 
-    Empty lists when ``automations.json`` is missing — a fresh
-    checkout that hasn't run ``script/sync_components.py`` yet
-    boots cleanly with an empty catalog instead of crashing.
+    Keys: ``triggers`` / ``actions`` / ``conditions`` /
+    ``light_effects`` / ``filters``. Empty lists when
+    ``automations.json`` is missing — a fresh checkout that hasn't
+    run ``script/sync_components.py`` yet boots cleanly with an
+    empty catalog instead of crashing.
     """
     try:
         raw_bytes = resources.files(_DEFINITIONS_PACKAGE).joinpath(_CATALOG_FILE).read_bytes()
@@ -46,6 +49,7 @@ def load_catalog() -> dict[str, list]:
             "actions": [],
             "conditions": [],
             "light_effects": [],
+            "filters": [],
         }
     raw = json.loads(raw_bytes)
     return {
@@ -53,6 +57,7 @@ def load_catalog() -> dict[str, list]:
         "actions": [AutomationAction.from_dict(a) for a in raw.get("actions", [])],
         "conditions": [AutomationCondition.from_dict(c) for c in raw.get("conditions", [])],
         "light_effects": [LightEffect.from_dict(e) for e in raw.get("light_effects", [])],
+        "filters": [Filter.from_dict(f) for f in raw.get("filters", [])],
     }
 
 
@@ -74,6 +79,11 @@ def all_conditions() -> list[AutomationCondition]:
 def all_light_effects() -> list[LightEffect]:
     """Return the full light-effects catalogue."""
     return list(load_catalog()["light_effects"])
+
+
+def all_filters() -> list[Filter]:
+    """Return the full filter catalogue (sensor / binary_sensor / text_sensor)."""
+    return list(load_catalog()["filters"])
 
 
 def action_by_id(action_id: str) -> AutomationAction | None:
