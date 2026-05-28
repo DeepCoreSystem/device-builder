@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""
-Generate definitions/components.json from ESPHome's pre-built schema bundle.
+"""Generate the split component catalog from ESPHome's pre-built schema bundle.
+
+Emits ``definitions/components.index.json`` plus per-id body files
+under ``definitions/components/<id>.json``.
 
 The schema repo (https://github.com/esphome/esphome-schema) publishes a
 schema.zip per ESPHome release containing one JSON file per component.
@@ -58,11 +60,16 @@ import voluptuous as vol
 _LOGGER = logging.getLogger("sync_components")
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_OUTPUT_FILE = _REPO_ROOT / "esphome_device_builder" / "definitions" / "components.json"
-_AUTOMATIONS_OUTPUT_FILE = (
-    _REPO_ROOT / "esphome_device_builder" / "definitions" / "automations.json"
-)
+_DEFINITIONS_DIR = _REPO_ROOT / "esphome_device_builder" / "definitions"
+_OUTPUT_INDEX_FILE = _DEFINITIONS_DIR / "components.index.json"
+_OUTPUT_BODIES_DIR = _DEFINITIONS_DIR / "components"
+_AUTOMATIONS_OUTPUT_FILE = _DEFINITIONS_DIR / "automations.json"
 _CACHE_ROOT = _REPO_ROOT / ".cache"
+
+# Fields stripped from index entries — they belong on the per-id body
+# files only. Slim-index keeps the catalog UI's list / search /
+# filter paths off the per-field tree.
+_INDEX_DROP_FIELDS: frozenset[str] = frozenset({"config_entries", "required_groups"})
 
 _RELEASES_API = "https://api.github.com/repos/esphome/esphome-schema/releases"
 _SCHEMA_URL_TEMPLATE = "https://schema.esphome.io/{version}/schema.zip"
@@ -86,6 +93,9 @@ _USER_AGENT = "esphome-device-builder-backend (https://github.com/esphome/device
 sys.path.insert(0, str(_REPO_ROOT))
 from esphome_device_builder.controllers.components import (  # noqa: E402
     INTERNAL_COMPONENT_IDS as _INTERNAL_COMPONENT_IDS,
+)
+from esphome_device_builder.controllers.components import (  # noqa: E402
+    is_unsafe_component_id,
 )
 from script._light_schemas import (  # noqa: E402
     resolve_light_effects_applies_to,
@@ -596,8 +606,16 @@ _DOC_PREFIX_TYPES: dict[str, str] = {
 }
 
 # Time-period default values are short strings like ``"60s"``,
-# ``"5min"``, ``"1h30s"``. This regex matches that shape.
-_TIME_PERIOD_DEFAULT = re.compile(r"^\d+(\.\d+)?\s*(ms|us|ns|s|min|h|d)(\d+\s*\w+)*$")
+# ``"5min"``, ``"1h30s"``. Each segment is a digit run + a fixed
+# unit; the repeating group sticks to the same closed unit
+# alternation rather than ``\w+`` so the engine can't backtrack
+# exponentially on inputs like ``"9s9" + "00" * N`` (CodeQL
+# ReDoS alert). The caller pre-strips whitespace so no ``\s*``
+# is needed here either.
+_TIME_PERIOD_DEFAULT = re.compile(
+    r"^\d+(?:\.\d+)?(?:ms|us|ns|min|s|h|d)"
+    r"(?:\d+(?:\.\d+)?(?:ms|us|ns|min|s|h|d))*$"
+)
 
 
 class Visibility(StrEnum):
@@ -717,7 +735,10 @@ def main() -> int:
     logging.basicConfig(format="%(message)s", level=logging.INFO)
 
     parser = argparse.ArgumentParser(
-        description="Generate components.json from ESPHome's pre-built schema bundle.",
+        description=(
+            "Generate components.index.json + per-id body files under "
+            "definitions/components/ from ESPHome's pre-built schema bundle."
+        ),
     )
     parser.add_argument(
         "--version",
@@ -767,17 +788,7 @@ def main() -> int:
 
     _audit_catalog_for_unit_mismatches(catalog)
 
-    payload = {
-        "esphome_schema_version": version,
-        "components": [_strip_defaults(c) for c in catalog],
-    }
-    # Use orjson (already a runtime dep) for a compact UTF-8 dump —
-    # the file is consumed only by the loader (not hand-edited or
-    # diffed), so indentation was pure overhead. Indented stdlib json
-    # was ~39 MB on disk vs ~19 MB here, ~600 KB off the wheel after
-    # deflate.
-    _OUTPUT_FILE.write_bytes(orjson.dumps(payload, option=orjson.OPT_APPEND_NEWLINE))
-    _LOGGER.info("Wrote %s", _OUTPUT_FILE)
+    _emit_split_catalog(catalog, version)
 
     # Second pass: walk the same schema bundle for action / condition /
     # trigger / effect registries and emit the automation catalog. Runs
@@ -3264,6 +3275,87 @@ def _strip_defaults(component: dict) -> dict:
             continue
         if k == "config_entries" and v:
             out[k] = [_strip_entry_defaults(e) for e in v]
+            continue
+        out[k] = v
+    return out
+
+
+def _emit_split_catalog(catalog: list[dict], version: str) -> None:
+    """
+    Write the catalog as ``components.index.json`` + per-id body files.
+
+    The index carries every field the catalog UI's list / search /
+    filter paths reference; the per-id bodies under
+    ``definitions/components/<id>.json`` carry the full
+    ``config_entries`` tree the detail-view fetches on demand.
+
+    Crash-safety is best-effort; this is a build-time tool. Both
+    outputs land at sibling temp paths first so a Ctrl-C
+    mid-serialize never overwrites the live catalog. The bodies
+    dir swap (rmtree old + rename next) has a sub-millisecond
+    window where the dir is absent; the index is written via
+    ``os.replace`` so its swap is atomic. Between the bodies swap
+    and the index swap, the live index briefly points at the old
+    id set against the new bodies; the runtime loader handles
+    that gracefully (missing body files log a warning, new ids
+    aren't yet listed), so a reader landing in that window
+    degrades rather than crashes.
+    """
+    next_bodies = _OUTPUT_BODIES_DIR.parent / "components.next"
+    if next_bodies.exists():
+        shutil.rmtree(next_bodies)
+    next_bodies.mkdir(parents=True)
+
+    for component in catalog:
+        cid = component["id"]
+        # Mirror the runtime body loader's path-traversal guard on
+        # the write side; catalog ids come from a controlled schema
+        # bundle today, but a sync-time bug or an upstream schema
+        # change introducing a separator / parent ref in an id
+        # would silently escape ``next_bodies`` without this check.
+        # Fail the build rather than warn-and-skip so a regression
+        # surfaces in CI, not as a half-populated catalog at
+        # runtime.
+        if is_unsafe_component_id(cid):
+            msg = f"Refusing to emit body for traversal-shaped component id: {cid!r}"
+            raise ValueError(msg)
+        stripped = _strip_defaults(component)
+        body_path = next_bodies / f"{cid}.json"
+        body_path.write_bytes(orjson.dumps(stripped, option=orjson.OPT_APPEND_NEWLINE))
+
+    # Serialize the new index to a sibling temp so a partial
+    # write can't leave the live file truncated. orjson keeps the
+    # wheel size in check; indented stdlib json was ~39 MB on the
+    # monolithic file vs ~19 MB packed here, ~600 KB off the
+    # wheel after deflate.
+    index_payload = {
+        "esphome_schema_version": version,
+        "components": [_strip_index_defaults(c) for c in catalog],
+    }
+    next_index = _OUTPUT_INDEX_FILE.with_suffix(".json.next")
+    next_index.write_bytes(orjson.dumps(index_payload, option=orjson.OPT_APPEND_NEWLINE))
+
+    if _OUTPUT_BODIES_DIR.exists():
+        shutil.rmtree(_OUTPUT_BODIES_DIR)
+    next_bodies.rename(_OUTPUT_BODIES_DIR)
+    _LOGGER.info("Wrote %d body files to %s", len(catalog), _OUTPUT_BODIES_DIR)
+
+    Path(next_index).replace(_OUTPUT_INDEX_FILE)
+    _LOGGER.info("Wrote %s", _OUTPUT_INDEX_FILE)
+
+
+def _strip_index_defaults(component: dict) -> dict:
+    """Slim form of ``_strip_defaults`` for the index file.
+
+    Drops the per-field ``config_entries`` and ``required_groups``
+    trees (they live in the body files) and the same default-equal
+    fields ``_strip_defaults`` would have dropped.
+    """
+    out: dict[str, Any] = {}
+    for k, v in component.items():
+        if k in _INDEX_DROP_FIELDS:
+            continue
+        if k in _COMPONENT_DEFAULTS and v == _COMPONENT_DEFAULTS[k]:
             continue
         out[k] = v
     return out
