@@ -12,7 +12,20 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
+from mashumaro.config import BaseConfig
 from mashumaro.mixins.orjson import DataClassORJSONMixin
+
+# ---------------------------------------------------------------------------
+# Catalog-shared mashumaro Config
+# ---------------------------------------------------------------------------
+
+
+class _CatalogConfig(BaseConfig):
+    """Omit fields whose runtime value equals the declared default or ``None``."""
+
+    omit_default = True
+    omit_none = True
+
 
 # ---------------------------------------------------------------------------
 # Paged response base
@@ -851,3 +864,6 @@ class FieldPreset(DataClassORJSONMixin):
     value: ConfigPrimitive | dict[str, Any] | list[Any] | None = None
     locked: bool = False
     suggestions: list[ConfigPrimitive] | None = None
+
+    class Config(_CatalogConfig):
+        """Omit ``locked=False`` / ``suggestions=None``; see :class:`_CatalogConfig`."""
