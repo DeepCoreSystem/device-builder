@@ -62,8 +62,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
-from esphome.bundle import EsphomeError, prepare_bundle_for_compile
-
+from ...helpers.lazy_module import async_import_module
 from ...helpers.peer_link_bundle import (
     BundleAssembler,
     BundleAssemblerError,
@@ -80,6 +79,8 @@ from ...models import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from ..firmware import FirmwareController
     from .peer_link import PeerLinkSession
 
@@ -584,6 +585,13 @@ class SubmitJobReceiver:
         bundle_path = key.bundle(self._config_dir)
         remote_builds_root = self._config_dir / REMOTE_BUILDS_SUBDIR
 
+        # ``esphome.bundle`` is ~1 MB of upstream code; load it through
+        # the shared lazy-import executor so the receiver's idle resident
+        # set stays lean until a peer-link offload actually lands. Pass
+        # the resolved callable into the executor so the worker doesn't
+        # rely on a preload-ordering invariant in this caller.
+        bundle = await async_import_module("esphome.bundle")
+        prepare = bundle.prepare_bundle_for_compile
         loop = asyncio.get_running_loop()
         try:
             configuration = await loop.run_in_executor(
@@ -594,6 +602,7 @@ class SubmitJobReceiver:
                 target_dir,
                 remote_builds_root,
                 self._config_dir,
+                prepare,
             )
         except _PathEscapeError as exc:
             _LOGGER.warning(
@@ -602,7 +611,7 @@ class SubmitJobReceiver:
                 target_dir,
             )
             raise _SubmitJobRejectionError(_REASON_INVALID_HEADER) from exc
-        except (EsphomeError, OSError) as exc:
+        except (bundle.EsphomeError, OSError) as exc:
             _LOGGER.warning(
                 "submit_job from %s: extract failed for job %s (%s): %s",
                 session.dashboard_id,
@@ -747,6 +756,7 @@ def _validate_write_extract_bundle(
     target_dir: Path,
     remote_builds_root: Path,
     config_dir: Path,
+    prepare_bundle_for_compile: Callable[[Path, Path], Path],
 ) -> str:
     """Sync helper: validate path, write tarball, extract, return wire-shape ``configuration``.
 
