@@ -501,43 +501,28 @@ def parse_platform_from_yaml(yaml_content: str) -> tuple[str, str, str]:
     return platform, pio_board, variant
 
 
-def detect_platform_from_yaml(path: Path) -> str:
+def detect_platform_from_yaml(yaml_content: str, resolved_config: dict | None) -> str:
     """
-    Find a YAML file's platform key.
+    Find a config's platform key from its raw text and merged config.
 
-    First tries the cheap line-scan against the raw file (no parser
-    involved, survives mid-edit drafts). Falls back to the
-    package-merged load ONLY when the raw scan misses AND the file
-    actually contains a ``packages:`` block — configs that place
-    ``esp32:`` / ``esp8266:`` / etc. inside a package only register
-    that key after merge runs. Without the gate every YAML that
-    happens to omit a top-level platform key (mid-edit drafts,
-    package-less configs that get their platform from
-    ``StorageJSON``) would pay a full parser load on every
-    dashboard scan, even though there's nothing in the file the
-    merge could surface. The cheap-regex-only fast path stays the
-    winner for the typical no-packages config.
-
-    Returns the empty string when neither path turns up a platform.
+    Cheap line-scan of *yaml_content* first (survives mid-edit
+    drafts); falls back to *resolved_config* only on a raw-scan
+    miss when the text has a ``packages:`` block, since a packaged
+    ``esp32:`` key only appears post-merge. Empty string when
+    neither turns one up.
     """
     try:
-        raw = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
-        return ""
-    try:
-        platform, _, _ = parse_platform_from_yaml(raw)
+        platform, _, _ = parse_platform_from_yaml(yaml_content)
     except Exception:  # noqa: BLE001 — future-proof against parse_platform_from_yaml gaining a throw shape
         platform = ""
     if platform:
         return platform
-    if not yaml_has_top_level_block(raw, CONF_PACKAGES):
+    if not yaml_has_top_level_block(yaml_content, CONF_PACKAGES):
         # No ``packages:`` block in the raw text → the merge can't
-        # surface a platform key that wasn't already there. Skip
-        # the load to keep the scan cheap.
+        # surface a platform key that wasn't already there.
         return ""
-    config = load_device_yaml(path)
-    if isinstance(config, dict):
-        for key in config:
+    if isinstance(resolved_config, dict):
+        for key in resolved_config:
             # ``key`` is ``Any`` (dict came from ``yaml_util.load_yaml``
             # which is untyped); the runtime contract is "platform keys
             # are always strings", so narrow with ``isinstance`` before
@@ -910,7 +895,7 @@ def load_device_from_storage(
     #    ``StorageJSON`` doesn't carry the attribute at all —
     #    pyproject's floor is ``esphome>=2024.1.0`` so the
     #    pre-#9028 path is reachable.
-    # 2. ``detect_platform_from_yaml(path)`` — the YAML's top-level
+    # 2. ``detect_platform_from_yaml`` — the YAML's top-level
     #    platform key, also lowercase. Picks up never-compiled
     #    devices and pre-2025.6 ``StorageJSON`` files that don't
     #    carry ``core_platform`` yet.
@@ -930,7 +915,7 @@ def load_device_from_storage(
         if core_platform:
             target_platform = core_platform.lower()
     if not target_platform:
-        target_platform = detect_platform_from_yaml(path)
+        target_platform = detect_platform_from_yaml(yaml_content, resolved_config)
 
     loaded_integrations = sorted(storage.loaded_integrations) if storage else []
     # Subset of loaded_integrations the user directly wrote — top-

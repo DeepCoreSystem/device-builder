@@ -10,6 +10,7 @@ import logging
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, ClassVar
+from unittest import mock
 
 import pytest
 
@@ -20,7 +21,6 @@ from esphome_device_builder.helpers.device_yaml import (
     _select_wifi_helper,
     compute_has_pending_changes,
     configuration_stem,
-    detect_platform_from_yaml,
     generate_device_yaml,
     generate_minimal_stub_yaml,
     load_device_from_storage,
@@ -773,26 +773,25 @@ esp8266:
 
 
 # ----------------------------------------------------------------------
-# detect_platform_from_yaml — file I/O wrapper
+# detect_platform_from_yaml — scan platform-detection
 # ----------------------------------------------------------------------
 
 
-def test_detect_platform_returns_empty_on_missing_file(tmp_path: Path) -> None:
-    """Unreadable file (``OSError``) falls into the ``except`` branch.
-
-    Pin the silent-fallback contract — callers (the device-loader
-    address fallback) rely on the empty-string sentinel rather
-    than having to wrap every call in their own try/except.
-    """
-    missing = tmp_path / "no-such-file.yaml"
-    assert detect_platform_from_yaml(missing) == ""
-
-
-def test_detect_platform_reads_real_file(tmp_path: Path) -> None:
-    """Round-trip through the file reader picks up the platform key."""
-    path = tmp_path / "device.yaml"
-    path.write_text("esp32:\n  variant: ESP32S3\n", encoding="utf-8")
-    assert detect_platform_from_yaml(path) == "esp32"
+def test_load_device_from_storage_resolves_config_once_for_packages(tmp_path: Path) -> None:
+    """The scan path reuses the merged config: ``load_device_yaml`` runs once, not twice."""
+    (tmp_path / "board.yaml").write_text("esp32:\n  board: esp32dev\n", encoding="utf-8")
+    yaml_file = tmp_path / "ble.yaml"
+    yaml_file.write_text(
+        "esphome:\n  name: ble\npackages:\n  board: !include board.yaml\n",
+        encoding="utf-8",
+    )
+    with mock.patch(
+        "esphome_device_builder.helpers.device_yaml.load_device_yaml",
+        wraps=device_yaml.load_device_yaml,
+    ) as spy:
+        device = load_device_from_storage(yaml_file)
+    assert device.target_platform == "esp32"
+    assert spy.call_count == 1
 
 
 # ----------------------------------------------------------------------
