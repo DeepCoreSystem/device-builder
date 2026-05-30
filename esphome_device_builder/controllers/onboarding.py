@@ -37,7 +37,7 @@ from ..models import (
     UserPreferences,
 )
 from ..models.onboarding import ONBOARDING_VERSION
-from .config import load_preferences, save_preferences
+from .config import load_preferences, mutate_preferences
 
 if TYPE_CHECKING:
     from esphome_device_builder.device_builder import DeviceBuilder
@@ -164,17 +164,14 @@ class OnboardingController:
         loop = asyncio.get_running_loop()
         config_dir = self._db.settings.config_dir
 
-        current = await loop.run_in_executor(None, load_preferences, config_dir)
-        # Monotonic update only — never downgrade a stored higher
-        # version. A user who briefly ran a future build (with
-        # `ONBOARDING_VERSION = 2`) and then rolled back to this
-        # build (`= 1`) shouldn't lose the v2 acknowledgement and
-        # get re-prompted on the next upgrade. ``<`` not ``!=``.
-        if current.onboarding_completed_version < ONBOARDING_VERSION:
-            current_dict = current.to_dict()
-            current_dict["onboarding_completed_version"] = ONBOARDING_VERSION
-            updated = UserPreferences.from_dict(current_dict)
-            await loop.run_in_executor(None, save_preferences, config_dir, updated)
+        def _bump(prefs: UserPreferences) -> None:
+            # max(), not assign: a rollback from a future build must
+            # not downgrade a higher stored acknowledgement.
+            prefs.onboarding_completed_version = max(
+                prefs.onboarding_completed_version, ONBOARDING_VERSION
+            )
+
+        await loop.run_in_executor(None, mutate_preferences, config_dir, _bump)
         return await self.get_state()
 
 

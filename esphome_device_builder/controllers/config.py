@@ -10,7 +10,7 @@ import re
 import stat
 import tempfile
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -592,22 +592,50 @@ def clear_volatile_device_metadata(config_dir: Path, filename: str) -> None:
             data.pop(filename, None)
 
 
-def load_preferences(config_dir: Path) -> UserPreferences:
-    """Load user preferences, returning defaults for missing fields."""
-    raw = _load_metadata(config_dir).get(_PREFS_KEY, {})
+def _prefs_from_data(data: dict[str, Any]) -> UserPreferences:
+    """Decode the ``_preferences`` blob, returning defaults on a corrupt shape."""
     try:
-        return UserPreferences.from_dict(raw)
+        return UserPreferences.from_dict(data.get(_PREFS_KEY, {}))
     except (ValueError, TypeError, LookupError):
-        # mashumaro runtime-shape errors → defaults. Hand-edited
-        # sidecar with a malformed prefs blob shouldn't take the
-        # whole dashboard down.
         return UserPreferences()
+
+
+def load_preferences(config_dir: Path) -> UserPreferences:
+    """Load user preferences, returning defaults for missing or corrupt fields."""
+    return _prefs_from_data(_load_metadata(config_dir))
 
 
 def save_preferences(config_dir: Path, prefs: UserPreferences) -> None:
     """Save user preferences to disk."""
     with metadata_transaction(config_dir) as data:
         data[_PREFS_KEY] = prefs.to_dict()
+
+
+def mutate_preferences(
+    config_dir: Path, mutate: Callable[[UserPreferences], UserPreferences | None]
+) -> UserPreferences:
+    """
+    Atomic read-modify-write for user preferences.
+
+    *mutate* receives the current prefs (defaults on a corrupt
+    blob) and returns the next state, or mutates it in place and
+    returns ``None``. Load and save share one lock.
+    """
+    with metadata_transaction(config_dir) as data:
+        prefs = _prefs_from_data(data)
+        result = mutate(prefs)
+        if result is None:
+            result = prefs
+        data[_PREFS_KEY] = result.to_dict()
+        return result
+
+
+def update_preferences(config_dir: Path, update_fields: dict[str, Any]) -> UserPreferences:
+    """Merge a validated partial dict into stored preferences atomically."""
+    return mutate_preferences(
+        config_dir,
+        lambda prefs: UserPreferences.from_dict({**prefs.to_dict(), **update_fields}),
+    )
 
 
 _REMOTE_BUILD_FAIL_SAFE = RemoteBuildSettings(enabled=False)
@@ -1370,18 +1398,8 @@ class ConfigController:
         """
         loop = asyncio.get_running_loop()
         config_dir = self._db.settings.config_dir
-
-        # Load current, merge with provided fields, validate, save
-        current = await loop.run_in_executor(None, load_preferences, config_dir)
         update_fields = {k: v for k, v in kwargs.items() if k not in ("client", "message_id")}
-
-        # Merge into current preferences
-        current_dict = current.to_dict()
-        current_dict.update(update_fields)
-        updated = UserPreferences.from_dict(current_dict)
-
-        await loop.run_in_executor(None, save_preferences, config_dir, updated)
-        return updated
+        return await loop.run_in_executor(None, update_preferences, config_dir, update_fields)
 
     @api_command("config/get_secrets")
     async def get_secrets(self, **kwargs: Any) -> list[str]:
