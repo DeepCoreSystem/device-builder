@@ -56,6 +56,7 @@ from esphome_device_builder.controllers.config import (
     _read_descriptor_file,
     _run_esptool,
     _save_metadata,
+    clear_volatile_device_metadata,
     delete_label_cascade,
     get_device_ip,
     get_device_metadata,
@@ -127,7 +128,7 @@ def test_metadata_transaction_serialises_across_flocks(
     """Cross-process flock serialises peers RMW-ing disjoint keys."""
     # Bypass _METADATA_LOCK so the two threads race directly at
     # the flock — the same path two real processes would hit.
-    monkeypatch.setattr(config_module, "_METADATA_LOCK", nullcontext())
+    monkeypatch.setattr(config_module.metadata, "_METADATA_LOCK", nullcontext())
 
     thread_a_in_block = threading.Event()
     release_a = threading.Event()
@@ -179,7 +180,7 @@ def test_metadata_transaction_rejects_non_regular_lock_file(
     # Real block/char devices need root + a special FS; flip
     # ``S_ISREG`` in the module so a normal regular-file open
     # takes the rejection branch as if it had hit one.
-    monkeypatch.setattr(config_module.stat, "S_ISREG", lambda _mode: False)
+    monkeypatch.setattr(config_module.metadata.stat, "S_ISREG", lambda _mode: False)
 
     with pytest.raises(OSError, match="is not a regular file"), metadata_transaction(tmp_path):
         pass
@@ -883,7 +884,7 @@ async def test_get_info_returns_storage_metadata_dict(
     # redirect it onto our seeded sidecar so the handler's read lands
     # there without a real CORE setup.
     monkeypatch.setattr(
-        "esphome_device_builder.controllers.config.resolve_storage_path",
+        "esphome_device_builder.controllers.config.controller.resolve_storage_path",
         lambda configuration: sidecar.parent / f"{configuration}.json",
     )
     controller = _make_controller(tmp_path)
@@ -927,7 +928,7 @@ async def test_get_info_returns_none_when_storage_missing(
     looking blank fields instead of the compile prompt.
     """
     monkeypatch.setattr(
-        "esphome_device_builder.controllers.config.resolve_storage_path",
+        "esphome_device_builder.controllers.config.controller.resolve_storage_path",
         lambda configuration: tmp_path / "missing-storage.json",
     )
     controller = _make_controller(tmp_path)
@@ -1046,7 +1047,7 @@ async def test_get_serial_ports_returns_path_and_desc(
         SerialPort(path="/dev/ttyACM0", description="Arduino Uno"),
     ]
     monkeypatch.setattr(
-        "esphome_device_builder.controllers.config.get_serial_ports",
+        "esphome_device_builder.controllers.config.controller.get_serial_ports",
         lambda: fake_ports,
     )
     controller = _make_controller(tmp_path)
@@ -1082,7 +1083,7 @@ async def test_get_serial_ports_runs_in_executor(
         return [SerialPort(path="/dev/ttyUSB0", description="USB Serial")]
 
     monkeypatch.setattr(
-        "esphome_device_builder.controllers.config.get_serial_ports",
+        "esphome_device_builder.controllers.config.controller.get_serial_ports",
         _record_thread,
     )
     controller = _make_controller(tmp_path)
@@ -1110,7 +1111,7 @@ async def test_get_serial_ports_substitutes_path_for_na_description(
     actually being broken.
     """
     monkeypatch.setattr(
-        "esphome_device_builder.controllers.config.get_serial_ports",
+        "esphome_device_builder.controllers.config.controller.get_serial_ports",
         lambda: [SerialPort(path="/dev/ttyUSB0", description="n/a")],
     )
     controller = _make_controller(tmp_path)
@@ -1268,7 +1269,7 @@ async def test_run_esptool_calls_run_subprocess_capture_with_resolved_cmd(
         return _FakeCaptured()
 
     monkeypatch.setattr(
-        "esphome_device_builder.controllers.config.run_subprocess_capture", fake_capture
+        "esphome_device_builder.controllers.config.chip_detect.run_subprocess_capture", fake_capture
     )
 
     rc, stdout, timed_out = await _run_esptool(["--port", "/dev/ttyUSB0", "chip-id"], 30.0)
@@ -1300,7 +1301,7 @@ async def test_run_esptool_substitutes_minus_one_when_returncode_is_none(
         return _FakeCaptured()
 
     monkeypatch.setattr(
-        "esphome_device_builder.controllers.config.run_subprocess_capture", fake_capture
+        "esphome_device_builder.controllers.config.chip_detect.run_subprocess_capture", fake_capture
     )
 
     rc, _stdout, timed_out = await _run_esptool(["--port", "/dev/ttyUSB0", "chip-id"], 1.0)
@@ -1375,7 +1376,7 @@ def _mock_run_esptool(monkeypatch: pytest.MonkeyPatch, side_effect):
             return rc, stdout, False
         return result
 
-    monkeypatch.setattr("esphome_device_builder.controllers.config._run_esptool", fake)
+    monkeypatch.setattr("esphome_device_builder.controllers.config.chip_detect._run_esptool", fake)
 
 
 async def test_detect_chip_returns_chip_and_board_id_on_full_success(
@@ -1557,7 +1558,7 @@ async def test_get_serial_ports_returns_empty_when_no_ports(
     returned ``None`` would break iteration in the frontend.
     """
     monkeypatch.setattr(
-        "esphome_device_builder.controllers.config.get_serial_ports",
+        "esphome_device_builder.controllers.config.controller.get_serial_ports",
         list,
     )
     controller = _make_controller(tmp_path)
@@ -1810,3 +1811,84 @@ def test_set_device_labels_rejects_non_string_items(tmp_path: Path) -> None:
 
     # No partial write happened.
     assert "kitchen.yaml" not in _load_metadata(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Coverage fillers exposed by the package split
+# ---------------------------------------------------------------------------
+
+
+async def test_get_version_returns_server_and_esphome_versions(tmp_path: Path) -> None:
+    """``config/version`` reports both the server and the esphome version."""
+    controller = _make_controller(tmp_path)
+    result = await controller.get_version()
+    assert set(result) == {"server_version", "esphome_version"}
+
+
+def test_status_use_mqtt_reflects_env(
+    make_settings: MakeSettingsFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``status_use_mqtt`` mirrors ``ESPHOME_DASHBOARD_USE_MQTT``."""
+    settings = make_settings()
+    monkeypatch.delenv("ESPHOME_DASHBOARD_USE_MQTT", raising=False)
+    assert settings.status_use_mqtt is False
+    monkeypatch.setenv("ESPHOME_DASHBOARD_USE_MQTT", "true")
+    assert settings.status_use_mqtt is True
+
+
+def test_metadata_transaction_persists_without_fcntl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The no-fcntl degraded path (Windows / no fcntl) still round-trips the write."""
+    monkeypatch.setattr(config_module.metadata, "_HAS_FCNTL", False)
+
+    with metadata_transaction(tmp_path) as data:
+        data["kitchen.yaml"] = {"board_id": "esp32"}
+
+    raw = json.loads((tmp_path / ".device-builder.json").read_bytes())
+    assert raw == {"kitchen.yaml": {"board_id": "esp32"}}
+
+
+def test_clear_volatile_device_metadata_drops_emptied_entry(tmp_path: Path) -> None:
+    """Clearing the last volatile field drops the now-empty entry; mixed entries survive."""
+    (tmp_path / ".device-builder.json").write_bytes(
+        json.dumps(
+            {
+                "volatile_only.yaml": {"mac_address": "AA:BB:CC:DD:EE:FF"},
+                "mixed.yaml": {"board_id": "esp32", "mac_address": "AA:BB:CC:DD:EE:FF"},
+            }
+        ).encode()
+    )
+
+    clear_volatile_device_metadata(tmp_path, "volatile_only.yaml")
+    clear_volatile_device_metadata(tmp_path, "mixed.yaml")
+
+    raw = _load_metadata(tmp_path)
+    assert "volatile_only.yaml" not in raw
+    assert raw["mixed.yaml"] == {"board_id": "esp32"}
+
+
+def test_set_device_labels_treats_non_list_catalog_as_empty(tmp_path: Path) -> None:
+    """A corrupt non-list ``_labels`` block reads as an empty catalog."""
+    (tmp_path / ".device-builder.json").write_bytes(
+        json.dumps({"_labels": {"corrupt": "mapping"}}).encode()
+    )
+
+    # Empty assignment has nothing to validate, so it succeeds; no labels are written.
+    set_device_labels(tmp_path, "kitchen.yaml", [])
+    assert _load_metadata(tmp_path)["kitchen.yaml"] == {}
+
+    # Any real id can't match the empty catalog → rejected.
+    with pytest.raises(ValueError, match="Unknown label id"):
+        set_device_labels(tmp_path, "kitchen.yaml", ["a"])
+
+
+def test_set_device_labels_overwrites_non_dict_entry(tmp_path: Path) -> None:
+    """A corrupt non-dict device entry is replaced with a fresh mapping rather than crashing."""
+    (tmp_path / ".device-builder.json").write_bytes(
+        json.dumps({"_labels": [{"id": "a", "name": "A"}], "kitchen.yaml": "corrupt"}).encode()
+    )
+
+    set_device_labels(tmp_path, "kitchen.yaml", ["a"])
+
+    assert _load_metadata(tmp_path)["kitchen.yaml"] == {"labels": ["a"]}
