@@ -185,6 +185,8 @@ class AutomationActionIndex(DataClassORJSONMixin):
     is_control_flow: bool = False
     has_else_branch: bool = False
     accepts_action_list: list[str] = field(default_factory=list)
+    # False when the editor should not render this action as a form.
+    form_editable: bool = True
 
 
 @dataclass

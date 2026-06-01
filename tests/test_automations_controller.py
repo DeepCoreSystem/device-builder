@@ -61,6 +61,22 @@ async def test_get_actions_returns_full_catalog() -> None:
         assert required in ids, f"{required} missing from action catalog"
 
 
+async def test_get_actions_excludes_oversized_lvgl_update_forms() -> None:
+    """Oversized LVGL actions are dropped from the picker and the known-id set."""
+    controller = _make_controller(Path("/unused"))
+    ids = {a["id"] for a in await controller.get_actions()}
+    # Present in the unfiltered catalog but filtered out of the picker.
+    slim_ids = {a.id for a in catalog._slim_actions()}
+    for excluded in ("lvgl.label.update", "lvgl.widget.update"):
+        assert excluded in slim_ids
+        assert excluded not in ids
+    assert "lvgl.pause" in ids
+    assert "lvgl.page.show" in ids
+    # In-memory check (avoids a blocking body read); _ACTION_IDS gates is_known.
+    assert "lvgl.label.update" not in catalog._ACTION_IDS
+    assert "lvgl.pause" in catalog._ACTION_IDS
+
+
 async def test_get_conditions_returns_full_catalog() -> None:
     """``automations/get_conditions`` returns every catalog condition."""
     controller = _make_controller(Path("/unused"))

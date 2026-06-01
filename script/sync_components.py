@@ -71,6 +71,10 @@ _CACHE_ROOT = _REPO_ROOT / ".cache"
 # filter paths off the per-field tree.
 _INDEX_DROP_FIELDS: frozenset[str] = frozenset({"config_entries", "required_groups"})
 
+# Actions with more top-level config entries than this are flagged
+# form_editable=False (LVGL *.update sits at 160+, every other action <= 30).
+_MAX_FORM_CONFIG_ENTRIES = 80
+
 _RELEASES_API = "https://api.github.com/repos/esphome/esphome-schema/releases"
 _SCHEMA_URL_TEMPLATE = "https://schema.esphome.io/{version}/schema.zip"
 _DOCS_INDEX_URL = (
@@ -3397,7 +3401,22 @@ def _emit_split_automations_catalog(automations: dict[str, Any], version: str) -
             # the slim model — drops fields that aren't in the
             # slim picker shape and validates the slim contract
             # against the same source dict.
-            slim_entries.append(slim_cls.from_dict(entry).to_dict())
+            slim_src = entry
+            if type_key == "actions":
+                count = len(entry.get("config_entries") or [])
+                form_editable = count <= _MAX_FORM_CONFIG_ENTRIES
+                if not form_editable:
+                    _LOGGER.info(
+                        "Flagging action %s form_editable=False (%d config entries)",
+                        entry["id"],
+                        count,
+                    )
+                slim_src = {**entry, "form_editable": form_editable}
+            slim_dict = slim_cls.from_dict(slim_src).to_dict()
+            # Omit the flag when True so only non-editable actions carry it.
+            if type_key == "actions" and slim_dict.get("form_editable", True):
+                slim_dict.pop("form_editable", None)
+            slim_entries.append(slim_dict)
         index_payload[type_key] = slim_entries
 
     swap_split_catalog_in(

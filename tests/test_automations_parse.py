@@ -121,6 +121,27 @@ def test_parse_on_value_range_float_params_are_json_serialisable() -> None:
 
 
 # ---------------------------------------------------------------------------
+# LVGL actions — oversized forms fall back to raw-YAML editing
+# ---------------------------------------------------------------------------
+
+
+def test_parse_oversized_lvgl_action_falls_back_to_raw_yaml() -> None:
+    """An oversized LVGL action parses as an unknown id (raw-YAML fallback)."""
+    parsed = parse_device_yaml(_load("lvgl_action_unsupported.yaml"))
+    assert len(parsed) == 1
+    assert parsed[0].error is not None
+    assert parsed[0].automation.actions == []
+
+
+def test_parse_small_lvgl_action_stays_editable() -> None:
+    """A small LVGL action (``lvgl.pause``) still decomposes normally."""
+    parsed = parse_device_yaml(_load("lvgl_action_small_editable.yaml"))
+    assert len(parsed) == 1
+    assert parsed[0].error is None
+    assert [a.action_id for a in parsed[0].automation.actions] == ["lvgl.pause"]
+
+
+# ---------------------------------------------------------------------------
 # Top-level blocks
 # ---------------------------------------------------------------------------
 
