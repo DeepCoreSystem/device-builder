@@ -303,6 +303,39 @@ def singleton_component_id(section: dict, domain: str) -> str:
     return str(section.get("id") or domain)
 
 
+def resolve_component_domain(yaml_text: str, component_id: str) -> str | None:
+    """
+    Return the top-level domain whose instance declares *component_id*.
+
+    Keys instances exactly as :func:`_parse_inline_component_triggers`
+    does — list instances on ``id`` (or the synthetic ``<domain>_<idx>``),
+    flat singletons on :func:`singleton_component_id` — so the writer
+    attributes an id to the same domain the parser did. Only declared
+    instance ids match; an action *reference* (``id:`` nested in a
+    handler body) never does. ``None`` when no instance matches or the
+    YAML can't be parsed.
+    """
+    yaml = make_yaml()
+    try:
+        root = yaml.load(yaml_text)
+    except Exception:  # noqa: BLE001 — any load failure falls back to the catalog guess
+        return None
+    if not isinstance(root, dict):
+        return None
+    for domain, section in root.items():
+        if domain not in _component_trigger_domains():
+            continue
+        if isinstance(section, list):
+            for idx, instance in enumerate(section):
+                if not isinstance(instance, dict):
+                    continue
+                if str(instance.get("id") or f"{domain}_{idx}") == component_id:
+                    return str(domain)
+        elif isinstance(section, dict) and singleton_component_id(section, domain) == component_id:
+            return str(domain)
+    return None
+
+
 def _parse_inline_component_triggers(root: Any) -> list[ParsedAutomation]:
     """
     Walk component instances for inline ``on_*:`` handlers.
