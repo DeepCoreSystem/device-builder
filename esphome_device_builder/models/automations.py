@@ -305,10 +305,24 @@ class ApiActionLocation(DataClassORJSONMixin):
     kind: Literal["api_action"] = "api_action"
 
 
+@dataclass
+class ComponentActionFieldLocation(DataClassORJSONMixin):
+    """A ``type: trigger`` action-list config field (cover ``open_action`` …).
+
+    Keyed on the literal ``field`` name (not a catalog trigger); carries a
+    bare action list with no trigger/params, unlike ``ComponentOnLocation``.
+    """
+
+    component_id: str
+    field: str
+    kind: Literal["component_action"] = "component_action"
+
+
 AutomationLocation = Annotated[
     ScriptLocation
     | IntervalLocation
     | ComponentOnLocation
+    | ComponentActionFieldLocation
     | DeviceOnLocation
     | LightEffectLocation
     | ApiActionLocation,

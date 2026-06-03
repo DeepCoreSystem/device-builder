@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from esphome_device_builder.controllers.automations import writing
 from esphome_device_builder.controllers.automations.parsing import parse_device_yaml
 from esphome_device_builder.controllers.automations.writing import (
     render_delete,
@@ -28,6 +29,7 @@ from esphome_device_builder.models.automations import (
     ActionNode,
     ApiActionLocation,
     AutomationTree,
+    ComponentActionFieldLocation,
     ComponentOnLocation,
     DeviceOnLocation,
     IntervalLocation,
@@ -523,6 +525,135 @@ def test_delete_light_effect_removes_one_list_item() -> None:
     # ``flicker`` is gone, ``pulse`` remains.
     assert "flicker" not in new_text
     assert "pulse" in new_text
+
+
+# ---------------------------------------------------------------------------
+# Component action-list config fields (``open_action:`` etc.)
+# ---------------------------------------------------------------------------
+
+
+def test_round_trip_component_action_field_preserves_actions() -> None:
+    """Parse → upsert with the same tree → parse keeps the action field stable."""
+    text = _load("cover_feedback_actions.yaml")
+    first = next(
+        p
+        for p in parse_device_yaml(text)
+        if p.location.kind == "component_action" and p.location.field == "open_action"
+    )
+    new_text, _diff = render_upsert(text, tree=first.automation, location=first.location)
+    second = next(
+        p
+        for p in parse_device_yaml(new_text)
+        if p.location.kind == "component_action" and p.location.field == "open_action"
+    )
+    assert second.location == first.location
+    assert [a.action_id for a in second.automation.actions] == [
+        a.action_id for a in first.automation.actions
+    ]
+    # Bare action list — no ``then:`` wrapper introduced.
+    assert "then:" not in new_text
+
+
+def test_upsert_component_action_field_leaves_siblings_untouched() -> None:
+    """Rewriting open_action doesn't disturb close_action / stop_action."""
+    text = _load("cover_feedback_actions.yaml")
+    loc = ComponentActionFieldLocation(component_id="driveway_gate", field="open_action")
+    tree = AutomationTree(
+        trigger_id=None,
+        actions=[ActionNode(action_id="switch.turn_on", params={"id": "gate_open"})],
+    )
+    new_text, _diff = render_upsert(text, tree=tree, location=loc)
+    assert "close_action:" in new_text
+    assert "stop_action:" in new_text
+    assert new_text.count("open_action:") == 1
+
+
+def test_upsert_component_action_field_creates_field_when_absent() -> None:
+    """A platform instance with no such field yet gets it spliced in."""
+    text = "cover:\n  - platform: feedback\n    id: g\n    device_class: gate\n"
+    loc = ComponentActionFieldLocation(component_id="g", field="open_action")
+    tree = AutomationTree(
+        trigger_id=None,
+        actions=[ActionNode(action_id="switch.turn_on", params={"id": "relay"})],
+    )
+    new_text, _diff = render_upsert(text, tree=tree, location=loc)
+    reparsed = next(p for p in parse_device_yaml(new_text) if p.location.kind == "component_action")
+    assert reparsed.location == loc
+    assert [a.action_id for a in reparsed.automation.actions] == ["switch.turn_on"]
+
+
+def test_delete_component_action_field_drops_only_that_field() -> None:
+    """Deleting close_action keeps open_action / stop_action."""
+    text = _load("cover_feedback_actions.yaml")
+    loc = ComponentActionFieldLocation(component_id="driveway_gate", field="close_action")
+    new_text, diff = render_delete(text, location=loc)
+    assert "close_action:" not in new_text
+    assert "open_action:" in new_text
+    assert "stop_action:" in new_text
+    assert diff.replacement == ""
+
+
+def test_upsert_component_action_field_unknown_id_raises() -> None:
+    """An id that matches no component instance is a NOT_FOUND error."""
+    loc = ComponentActionFieldLocation(component_id="nope", field="open_action")
+    tree = AutomationTree(trigger_id=None, actions=[])
+    with pytest.raises(CommandError) as exc:
+        render_upsert(_load("cover_feedback_actions.yaml"), tree=tree, location=loc)
+    assert exc.value.code == ErrorCode.NOT_FOUND
+
+
+def test_delete_component_action_field_unknown_id_raises() -> None:
+    """Deleting an action field on a non-existent instance is NOT_FOUND."""
+    loc = ComponentActionFieldLocation(component_id="nope", field="open_action")
+    with pytest.raises(CommandError) as exc:
+        render_delete(_load("cover_feedback_actions.yaml"), location=loc)
+    assert exc.value.code == ErrorCode.NOT_FOUND
+
+
+def test_round_trip_component_action_field_on_singleton_hub() -> None:
+    """A hub (``opentherm:``, no ``platform:``/``id:``) action field round-trips.
+
+    The id-less singleton resolves on ``component_id == domain`` through
+    both the parser and the writer's ``_locate_singleton_instance`` path.
+    """
+    text = "opentherm:\n  in_pin: 4\n  before_send:\n    - logger.log: sending\n"
+    first = next(p for p in parse_device_yaml(text) if p.location.kind == "component_action")
+    assert first.location.component_id == "opentherm"
+    new_text, _diff = render_upsert(text, tree=first.automation, location=first.location)
+    second = next(p for p in parse_device_yaml(new_text) if p.location.kind == "component_action")
+    assert second.location == first.location
+    assert "then:" not in new_text
+    # Deleting it drops the field but keeps the rest of the hub config.
+    deleted, _d = render_delete(text, location=first.location)
+    assert "before_send" not in deleted
+    assert "in_pin: 4" in deleted
+
+
+def test_upsert_component_action_field_splice_miss_raises(monkeypatch) -> None:
+    """Domain resolves but the splice can't locate the instance → NOT_FOUND.
+
+    Force a domain that doesn't host the instance (``my_gate`` is under
+    ``cover``, not ``switch``); ``upsert_inline_handler`` then returns
+    None and the guard raises.
+    """
+    monkeypatch.setattr(writing, "resolve_component_domain", lambda *_a, **_k: "switch")
+    loc = ComponentActionFieldLocation(component_id="my_gate", field="open_action")
+    tree = AutomationTree(
+        trigger_id=None,
+        actions=[ActionNode(action_id="switch.turn_on", params={"id": "r"})],
+    )
+    with pytest.raises(CommandError) as exc:
+        render_upsert(_load("cover_feedback_actions.yaml"), tree=tree, location=loc)
+    assert exc.value.code == ErrorCode.NOT_FOUND
+
+
+def test_delete_component_action_field_splice_miss_raises(monkeypatch) -> None:
+    """Domain resolves but the splice can't locate the instance → NOT_FOUND."""
+    monkeypatch.setattr(writing, "resolve_component_domain", lambda *_a, **_k: "switch")
+    loc = ComponentActionFieldLocation(component_id="my_gate", field="open_action")
+    with pytest.raises(CommandError) as exc:
+        render_delete(_load("cover_feedback_actions.yaml"), location=loc)
+    assert exc.value.code == ErrorCode.NOT_FOUND
 
 
 # ---------------------------------------------------------------------------
