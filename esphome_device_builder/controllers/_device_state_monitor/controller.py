@@ -194,6 +194,10 @@ class DeviceStateMonitor(TaskControllerBase):  # noqa: PLR0904 (grandfathered; n
         """
         return ReachabilitySource(self.state.state_source.get(name, ReachabilitySource.UNKNOWN))
 
+    def forget(self, name: str) -> None:
+        """Drop the source-precedence ledger entry for *name*."""
+        self.state.state_source.pop(name, None)
+
     def apply(self, name: str, state: DeviceState, source: str, *, claim: bool = False) -> bool:
         """
         Record a state observation from *source*.
