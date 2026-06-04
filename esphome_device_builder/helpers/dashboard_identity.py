@@ -131,6 +131,11 @@ async def rotate_identity(
     )
 
 
+def get_or_create_dashboard_id(config_dir: Path) -> str:
+    """Sync accessor for the persistent ``dashboard_id`` (mints + persists on first call)."""
+    return _get_or_create_dashboard_id(config_dir)
+
+
 # ---------------------------------------------------------------------------
 # Internals
 # ---------------------------------------------------------------------------

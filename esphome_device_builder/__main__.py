@@ -271,6 +271,7 @@ def main() -> None:
     from .controllers.config import DashboardSettings  # noqa: PLC0415
     from .device_builder import DeviceBuilder  # noqa: PLC0415
     from .helpers.single_instance import ensure_single_execution  # noqa: PLC0415
+    from .helpers.windows_build_paths import windows_short_build_paths  # noqa: PLC0415
 
     settings = DashboardSettings()
     settings.parse_args(args)
@@ -284,7 +285,13 @@ def main() -> None:
     # ``$ESPHOME_DATA_DIR`` and falls back to ``<config_dir>/.esphome``
     # — ``parse_args`` above sets ``CORE.config_path``, which the
     # fallback needs.
-    with ensure_single_execution(CORE.data_dir) as lock:
+    # Windows: relocate the build tree to a short, space-free root (MAX_PATH + spaces)
+    # first, so the lock lands in the relocated dir (CORE.data_dir is evaluated after the
+    # relocation enters) and migration runs before any lock file is held open in old .esphome.
+    with (
+        windows_short_build_paths(settings.config_dir),
+        ensure_single_execution(CORE.data_dir) as lock,
+    ):
         if lock.exit_code is not None:
             sys.exit(lock.exit_code)
         device_builder = DeviceBuilder(settings)
