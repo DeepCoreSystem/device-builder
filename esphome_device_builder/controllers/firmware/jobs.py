@@ -12,12 +12,11 @@ from ...models import (
     ErrorCode,
     EventType,
     FirmwareJob,
-    JobLifecycleData,
     JobStatus,
 )
 from . import lifecycle
 from .constants import _ACTIVE_JOB_STATUSES
-from .helpers import _mark_job_terminal
+from .helpers import _fire_job_lifecycle
 
 if TYPE_CHECKING:
     from ._state import Lane
@@ -116,15 +115,19 @@ async def cancel(controller: FirmwareController, *, job_id: str) -> None:
         raise CommandError(ErrorCode.NOT_FOUND, msg)
 
     if job.status == JobStatus.QUEUED:
+        # A pending remote compile is QUEUED but held off-lane in the dispatch
+        # pool — remove it so the matcher can't bind it after (and clear an
+        # in-flight binding for the non-eager bound-but-not-yet-RUNNING window;
+        # the driver's terminal guard then skips the build).
+        controller.state.remote_dispatch.discard(job_id)
         # Mark + persist before fire so a restart-after-cancel reload
         # sees the job as CANCELLED. Spelled out rather than routed
         # through ``_finalize_terminal`` because we need to land
         # ``_persist_jobs`` between the mark and the fire.
-        _mark_job_terminal(job, JobStatus.CANCELLED)
+        job.mark_terminal(JobStatus.CANCELLED)
         controller._prune_history()
         await controller._persist_jobs()
-        cancelled_payload: JobLifecycleData = {"job": job}
-        controller._db.bus.fire(EventType.JOB_CANCELLED, cancelled_payload)
+        _fire_job_lifecycle(job, controller._db.bus, EventType.JOB_CANCELLED)
         # Cancel anything held on this job (an install's upload waits on its
         # compile) so a cancelled compile never goes on to flash the device.
         # Persist again when the cascade fired so the dependents' CANCELLED
@@ -137,17 +140,17 @@ async def cancel(controller: FirmwareController, *, job_id: str) -> None:
         return
 
     if job.status == JobStatus.RUNNING:
+        if controller.state.remote_dispatch.is_in_flight(job_id):
+            # Off-lane remote compile: no subprocess to SIGTERM —
+            # ``run_remote_job`` parks on its cancel event, which sends a wire
+            # ``cancel_job``.
+            controller.state.request_cancel(job_id)
+            return
         lane = _running_lane(controller, job_id)
         if lane is None:
             msg = "Running job is not the active subprocess (state out of sync)"
             raise RuntimeError(msg)
-        controller.state.cancel_requested.add(job_id)
-        # Wake any runner parked on its cancel event — only the
-        # remote runner registers one; the local subprocess path's
-        # wake signal is SIGTERM on the spawned process.
-        cancel_event = controller.state.cancel_events.get(job_id)
-        if cancel_event is not None:
-            cancel_event.set()
+        controller.state.request_cancel(job_id)
         # Lane-scoped so cancelling an upload doesn't signal a concurrent compile.
         await controller._terminate_current_process(lane)
         return

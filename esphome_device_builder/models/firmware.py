@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import NamedTuple, TypedDict
 
 from mashumaro.mixins.orjson import DataClassORJSONMixin
 
 from .common import EventType
+
+
+def _now_iso() -> str:
+    """Return the current UTC time as an ISO 8601 string (the job-timestamp format)."""
+    return datetime.now(UTC).isoformat()
 
 
 class QueueStatus(NamedTuple):
@@ -70,10 +76,19 @@ class JobSource(StrEnum):
     fetched the artifacts from. Distinct from
     :class:`JobType` ("what operation: compile / upload /
     install"); ``source`` answers "who did the compile."
+
+    ``REMOTE_PENDING`` is the offloader-only transient between
+    enqueue and dispatch: a compile that *will* go to a paired
+    server, but whose server is chosen at dispatch (so a host
+    paired/freed mid-queue is picked up). The remote-dispatch
+    pool resolves it to ``REMOTE`` (with a pin) or, if no server
+    is reachable, to ``LOCAL`` before the build runs; it never
+    crosses the wire to a receiver.
     """
 
     LOCAL = "local"
     REMOTE = "remote"
+    REMOTE_PENDING = "remote_pending"
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,8 +100,21 @@ class JobBuildSource:
     source_label: str = ""
     source_esphome_version: str = ""
 
+    @classmethod
+    def for_server(cls, *, pin_sha256: str, label: str, esphome_version: str) -> JobBuildSource:
+        """Bundle a REMOTE source bound to build server *pin_sha256*."""
+        return cls(
+            source=JobSource.REMOTE,
+            source_pin_sha256=pin_sha256,
+            source_label=label,
+            source_esphome_version=esphome_version,
+        )
+
 
 LOCAL_JOB_BUILD_SOURCE = JobBuildSource()
+# Submit-time marker for "remote-eligible, server chosen at dispatch".
+# The pin/label/version stay empty until the dispatch pool resolves them.
+REMOTE_PENDING_JOB_BUILD_SOURCE = JobBuildSource(source=JobSource.REMOTE_PENDING)
 
 
 # Terminal job states — a job in any of these isn't running and
@@ -258,7 +286,10 @@ class FirmwareJob(DataClassORJSONMixin):
         - **Keeps ``output``** — the pre-crash log is useful
           diagnostic history. Appends a marker line so a
           follower tailing the merged buffer can see exactly
-          where the rebuild starts.
+          where the rebuild starts. (Re-routing a compile to
+          another build server uses :meth:`clear_run_state`
+          instead, so it doesn't claim a restart that didn't
+          happen.)
         - **Clears per-run state** — ``progress`` / ``error`` /
           ``started_at`` / ``completed_at`` / ``exit_code``
           back to their defaults.
@@ -277,11 +308,70 @@ class FirmwareJob(DataClassORJSONMixin):
           intact.
         """
         self.output = [*self.output, _RECOVERY_NOTICE]
+        self.clear_run_state()
+
+    def mark_running(self) -> None:
+        """Stamp this job RUNNING with the current start time."""
+        self.status = JobStatus.RUNNING
+        self.started_at = _now_iso()
+
+    def mark_terminal(self, status: JobStatus, *, error: str | None = None) -> None:
+        """Set a terminal *status* (and *error* if given) and stamp completion time.
+
+        Raises ``ValueError`` on a non-terminal *status* so a stray call can't
+        stamp ``completed_at`` on a still-running job (which mis-orders the
+        dashboard's relative-time strings and confuses prune-on-shutdown).
+        """
+        if status not in TERMINAL_JOB_STATUSES:
+            msg = f"mark_terminal called with non-terminal status {status!r}"
+            raise ValueError(msg)
+        if error is not None:
+            self.error = error
+        self.status = status
+        self.completed_at = _now_iso()
+
+    def revert_to_pending_remote(self) -> None:
+        """Reset run state and re-mark ``REMOTE_PENDING`` so the pool re-routes this compile."""
+        self.clear_run_state()
+        self.status = JobStatus.QUEUED
+        self.apply_build_source(REMOTE_PENDING_JOB_BUILD_SOURCE)
+
+    def restore_for_requeue(self) -> None:
+        """Prepare a restored active job for re-queue after a dashboard restart.
+
+        A RUNNING job gets a fresh run via ``reset`` (restart marker); a remote
+        COMPILE re-enters ``REMOTE_PENDING`` with its pin cleared so the dispatch
+        pool re-routes it to a live server, while a REMOTE CLEAN keeps its pin
+        (it targets a specific server on purpose).
+        """
+        if self.status is JobStatus.RUNNING:
+            self.reset()
+        self.status = JobStatus.QUEUED
+        if self.job_type is JobType.COMPILE and self.source in (
+            JobSource.REMOTE,
+            JobSource.REMOTE_PENDING,
+        ):
+            self.apply_build_source(REMOTE_PENDING_JOB_BUILD_SOURCE)
+
+    def clear_run_state(self) -> None:
+        """Clear per-run fields (progress / error / timing / exit code); keeps output and identity.
+
+        ``reset`` is this plus a restart marker; a mid-build re-route to
+        another server calls this directly so the log isn't stamped with a
+        restart notice that never happened.
+        """
         self.progress = None
         self.error = None
         self.started_at = None
         self.completed_at = None
         self.exit_code = None
+
+    def apply_build_source(self, build_source: JobBuildSource) -> None:
+        """Stamp this job's dispatch origin (source + pin / label / version) from *build_source*."""
+        self.source = build_source.source
+        self.source_pin_sha256 = build_source.source_pin_sha256
+        self.source_label = build_source.source_label
+        self.source_esphome_version = build_source.source_esphome_version
 
 
 _RECOVERY_NOTICE = (

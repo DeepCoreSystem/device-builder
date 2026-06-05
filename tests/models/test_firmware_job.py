@@ -13,12 +13,15 @@ methods on it carry meaningful behaviour:
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 import pytest
 
 from esphome_device_builder.models.firmware import (
+    REMOTE_PENDING_JOB_BUILD_SOURCE,
     FirmwareJob,
+    JobBuildSource,
     JobSource,
     JobStatus,
     JobType,
@@ -158,6 +161,166 @@ def test_reset_preserves_dispatch_origin_fields() -> None:
     assert job.source_esphome_version == "2026.5.0"
     assert job.remote_peer == "alpha-dashboard-id"
     assert job.remote_job_id == "offloader-job-7"
+
+
+# ---------------------------------------------------------------------------
+# FirmwareJob.mark_running / revert_to_pending_remote
+# ---------------------------------------------------------------------------
+
+
+def test_mark_running_stamps_status_and_start_time() -> None:
+    """``mark_running`` sets RUNNING and an ISO 8601 ``started_at``."""
+    job = _make_job(status=JobStatus.QUEUED, started_at=None)
+
+    job.mark_running()
+
+    assert job.status is JobStatus.RUNNING
+    assert job.started_at is not None
+    assert job.started_at.endswith("+00:00")
+
+
+def test_revert_to_pending_remote_clears_binding_and_run_state() -> None:
+    """``revert_to_pending_remote`` resets run state and re-marks REMOTE_PENDING with no pin."""
+    job = _make_job(
+        status=JobStatus.RUNNING,
+        started_at="2026-01-01T00:00:00Z",
+        progress=42,
+        source=JobSource.REMOTE,
+        source_pin_sha256="a" * 64,
+        source_label="desktop",
+    )
+
+    job.revert_to_pending_remote()
+
+    assert job.status is JobStatus.QUEUED
+    assert job.source is JobSource.REMOTE_PENDING
+    assert job.source_pin_sha256 == ""
+    assert job.started_at is None
+    assert job.progress is None
+
+
+def test_mark_terminal_sets_status_and_completed_at() -> None:
+    """``mark_terminal`` stamps a terminal status plus a parseable completion time."""
+    job = _make_job(status=JobStatus.RUNNING, completed_at=None)
+
+    job.mark_terminal(JobStatus.COMPLETED)
+
+    assert job.status is JobStatus.COMPLETED
+    assert job.completed_at is not None
+    assert datetime.fromisoformat(job.completed_at).tzinfo is not None
+
+
+def test_mark_terminal_records_error_when_given() -> None:
+    """``mark_terminal(..., error=...)`` writes the failure message alongside the status."""
+    job = _make_job(status=JobStatus.RUNNING, error=None)
+
+    job.mark_terminal(JobStatus.FAILED, error="boom")
+
+    assert job.status is JobStatus.FAILED
+    assert job.error == "boom"
+
+
+def test_mark_terminal_rejects_non_terminal_status() -> None:
+    """A non-terminal status raises and leaves the job untouched (no stray completed_at)."""
+    job = _make_job(status=JobStatus.RUNNING, completed_at=None)
+
+    with pytest.raises(ValueError, match="non-terminal"):
+        job.mark_terminal(JobStatus.RUNNING)
+
+    assert job.completed_at is None
+    assert job.status is JobStatus.RUNNING
+
+
+def test_restore_for_requeue_repools_a_running_remote_compile() -> None:
+    """A restored RUNNING remote compile re-queues as REMOTE_PENDING, pin + run cleared."""
+    job = _make_job(
+        status=JobStatus.RUNNING,
+        job_type=JobType.COMPILE,
+        source=JobSource.REMOTE,
+        source_pin_sha256="a" * 64,
+        started_at="2026-01-01T00:00:00Z",
+    )
+
+    job.restore_for_requeue()
+
+    assert job.status is JobStatus.QUEUED
+    assert job.source is JobSource.REMOTE_PENDING
+    assert job.source_pin_sha256 == ""
+    assert job.started_at is None  # reset cleared the interrupted run
+
+
+def test_restore_for_requeue_keeps_a_remote_clean_pinned() -> None:
+    """A restored REMOTE CLEAN keeps its server pin — it targets that server on purpose."""
+    job = _make_job(
+        status=JobStatus.QUEUED,
+        job_type=JobType.CLEAN,
+        source=JobSource.REMOTE,
+        source_pin_sha256="b" * 64,
+    )
+
+    job.restore_for_requeue()
+
+    assert job.status is JobStatus.QUEUED
+    assert job.source is JobSource.REMOTE
+    assert job.source_pin_sha256 == "b" * 64
+
+
+def test_restore_for_requeue_leaves_a_local_compile_local() -> None:
+    """A restored local compile re-queues without being pulled into the remote pool."""
+    job = _make_job(status=JobStatus.QUEUED, job_type=JobType.COMPILE, source=JobSource.LOCAL)
+
+    job.restore_for_requeue()
+
+    assert job.status is JobStatus.QUEUED
+    assert job.source is JobSource.LOCAL
+
+
+# ---------------------------------------------------------------------------
+# JobBuildSource.for_server / FirmwareJob.apply_build_source
+# ---------------------------------------------------------------------------
+
+
+def test_for_server_bundles_a_remote_source() -> None:
+    """``JobBuildSource.for_server`` bundles REMOTE plus the server's pin / label / version."""
+    build_source = JobBuildSource.for_server(
+        pin_sha256="a" * 64, label="desktop", esphome_version="2026.5.0"
+    )
+
+    assert build_source.source is JobSource.REMOTE
+    assert build_source.source_pin_sha256 == "a" * 64
+    assert build_source.source_label == "desktop"
+    assert build_source.source_esphome_version == "2026.5.0"
+
+
+def test_apply_build_source_stamps_the_job() -> None:
+    """``apply_build_source`` copies a bundle's source + pin / label / version onto the job."""
+    job = _make_job()
+
+    job.apply_build_source(
+        JobBuildSource.for_server(pin_sha256="a" * 64, label="desktop", esphome_version="2026.5.0")
+    )
+
+    assert job.source is JobSource.REMOTE
+    assert job.source_pin_sha256 == "a" * 64
+    assert job.source_label == "desktop"
+    assert job.source_esphome_version == "2026.5.0"
+
+
+def test_apply_build_source_clears_a_prior_binding() -> None:
+    """Applying ``REMOTE_PENDING_JOB_BUILD_SOURCE`` drops a prior server binding."""
+    job = _make_job(
+        source=JobSource.REMOTE,
+        source_pin_sha256="a" * 64,
+        source_label="desktop",
+        source_esphome_version="2026.5.0",
+    )
+
+    job.apply_build_source(REMOTE_PENDING_JOB_BUILD_SOURCE)
+
+    assert job.source is JobSource.REMOTE_PENDING
+    assert job.source_pin_sha256 == ""
+    assert job.source_label == ""
+    assert job.source_esphome_version == ""
 
 
 # ---------------------------------------------------------------------------

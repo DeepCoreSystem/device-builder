@@ -7,23 +7,20 @@ import logging
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from ...helpers.subprocess import create_subprocess_exec, iter_lines_with_progress
 from ...models import (
-    EventType,
     FirmwareJob,
-    JobLifecycleData,
     JobSource,
     JobStatus,
     JobType,
 )
+from . import lifecycle
 from .constants import _ERROR_PATTERNS
 from .helpers import (
     _ingest_output_line,
     _is_no_module_named_esphome,
-    _trim_job_output,
 )
 from .remote_runner import run_remote_job
 
@@ -62,12 +59,12 @@ async def _await_build_gate(controller: FirmwareController, job: FirmwareJob) ->
         await controller.state.build_gate.wait()
 
 
-async def execute_job(  # noqa: PLR0912, PLR0915, C901
+async def execute_job(  # noqa: PLR0915, C901
     controller: FirmwareController, job: FirmwareJob, lane: Lane
 ) -> None:
     """Execute a single firmware job on *lane*."""
-    job.status = JobStatus.RUNNING
-    job.started_at = datetime.now(UTC).isoformat()
+    # Claim the lane slot before JOB_STARTED fires — the receiver's
+    # ``compile_queue_status`` reads ``current_job`` reactively on that event.
     lane.current_job = job
     _LOGGER.info(
         "Starting job %s: %s %s",
@@ -75,9 +72,7 @@ async def execute_job(  # noqa: PLR0912, PLR0915, C901
         job.job_type,
         job.configuration,
     )
-    started_payload: JobLifecycleData = {"job": job}
-    controller._db.bus.fire(EventType.JOB_STARTED, started_payload)
-    await controller._persist_jobs()
+    await lifecycle.begin_run(controller, job)
 
     try:
         # Source-routed branch: REMOTE-source jobs dispatch via
@@ -190,8 +185,7 @@ async def execute_job(  # noqa: PLR0912, PLR0915, C901
         # If the user cancelled this job mid-run, the subprocess
         # exits non-zero (terminated by signal). Honour that
         # intent rather than reporting it as a generic failure.
-        if job.job_id in controller.state.cancel_requested:
-            controller._finalize_cancelled(job)
+        if lifecycle.cancel_if_requested(controller, job):
             _LOGGER.info("Job %s cancelled mid-run (exit %s)", job.job_id, exit_code)
         else:
             success = exit_code == 0 and not has_error_in_output
@@ -227,31 +221,16 @@ async def execute_job(  # noqa: PLR0912, PLR0915, C901
         controller._finalize_cancelled(job)
         _LOGGER.info("Job %s cancelled (runner shutdown)", job.job_id)
         raise
-    except Exception as exc:
-        # If a cancel was requested before this exception escaped,
-        # honour it as CANCELLED instead of FAILED. The
-        # ``_verify_chip`` early-cancel path raises ``ValueError``
-        # to short-circuit the install — without this branch
-        # that error would be reported as a generic failure
-        # rather than the user-driven cancel it actually is.
-        if job.job_id in controller.state.cancel_requested:
-            controller._finalize_cancelled(job)
-            _LOGGER.info("Job %s cancelled before subprocess wait: %s", job.job_id, exc)
-        else:
-            job.error = str(exc)
-            controller._finalize_terminal(job, JobStatus.FAILED)
-            _LOGGER.exception("Job %s failed", job.job_id)
+    except Exception as exc:  # noqa: BLE001 — terminality guarantee; helper logs + finalizes
+        # Cancel intent wins over the raise — e.g. ``_verify_chip``'s early-cancel
+        # path raises ``ValueError`` to short-circuit the install, which is a
+        # user-driven cancel, not a generic failure. Shared with the off-lane
+        # dispatch driver so both paths guarantee terminality identically.
+        lifecycle.finalize_unexpected_error(controller, job, exc)
     finally:
         lane.current_job = None
         lane.current_process = None
-        if job.status in (
-            JobStatus.COMPLETED,
-            JobStatus.FAILED,
-            JobStatus.CANCELLED,
-        ):
-            _trim_job_output(job)
-            controller._prune_history()
-        await controller._persist_jobs()
+        await lifecycle.end_run(controller, job)
 
 
 async def execute_remote_job(controller: FirmwareController, job: FirmwareJob) -> None:
@@ -291,7 +270,7 @@ async def execute_remote_job(controller: FirmwareController, job: FirmwareJob) -
     flow.
 
     Terminal states are mapped through the same helpers the
-    local path uses (``_mark_job_terminal`` /
+    local path uses (``job.mark_terminal`` /
     ``_finalize_cancelled``), so the outer
     ``_execute_job``'s ``finally`` runs the shared
     ``_trim_job_output`` / ``_prune_history`` / persist

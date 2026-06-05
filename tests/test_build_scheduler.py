@@ -16,7 +16,10 @@ from esphome_device_builder.helpers.build_scheduler import (
     BuildPath,
     BuildPathDecision,
     BuildSchedulerInputs,
+    DispatchDecision,
+    DispatchOutcome,
     pick_build_path,
+    pick_dispatch_target,
 )
 from esphome_device_builder.helpers.version_compat import VersionMatchPolicy
 from esphome_device_builder.models.api import ErrorCode
@@ -87,6 +90,7 @@ def _inputs(
     peer_queue_status: dict[str, PeerQueueStatusSnapshotEntry] | None = None,
     offloader_esphome_version: str = "",
     version_match_policy: VersionMatchPolicy = VersionMatchPolicy.ANY,
+    busy_build_server_pins: set[str] | None = None,
 ) -> BuildSchedulerInputs:
     """Build :class:`BuildSchedulerInputs` with the test's slices.
 
@@ -104,6 +108,7 @@ def _inputs(
         peer_queue_status=peer_queue_status or {},
         offloader_esphome_version=offloader_esphome_version,
         version_match_policy=version_match_policy,
+        busy_build_server_pins=frozenset(busy_build_server_pins or set()),
     )
 
 
@@ -816,3 +821,155 @@ def test_exact_required_falls_through_when_only_pending_peers() -> None:
     decision = pick_build_path(inputs)
     assert decision.path is BuildPath.LOCAL
     assert decision.pin_sha256 is None
+
+
+# ---------------------------------------------------------------------------
+# busy_build_server_pins — the dispatcher's "this server already has a job"
+# exclusion so a re-pick spreads the next compile onto a free server.
+# ---------------------------------------------------------------------------
+
+
+def test_busy_build_server_pin_excluded_picks_next_eligible() -> None:
+    """A busy server is skipped so the next idle one wins, even when older."""
+    pin_a = "a" * 64
+    pin_b = "b" * 64
+    decision = pick_build_path(
+        _inputs(
+            pairings={
+                pin_a: _stub_pairing(pin_sha256=pin_a, paired_at=1.0),
+                pin_b: _stub_pairing(pin_sha256=pin_b, paired_at=2.0),
+            },
+            open_peer_links={pin_a, pin_b},
+            peer_queue_status={
+                pin_a: _stub_queue_status(pin_sha256=pin_a),
+                pin_b: _stub_queue_status(pin_sha256=pin_b),
+            },
+            # A is the oldest and idle, but the dispatcher already
+            # handed it the previous compile.
+            busy_build_server_pins={pin_a},
+        )
+    )
+    assert decision == BuildPathDecision.remote(pin_b)
+
+
+def test_all_build_servers_busy_returns_local() -> None:
+    """Every connected server already driving a job → LOCAL fallback (ANY policy)."""
+    pin_a = "a" * 64
+    pin_b = "b" * 64
+    decision = pick_build_path(
+        _inputs(
+            pairings={
+                pin_a: _stub_pairing(pin_sha256=pin_a, paired_at=1.0),
+                pin_b: _stub_pairing(pin_sha256=pin_b, paired_at=2.0),
+            },
+            open_peer_links={pin_a, pin_b},
+            peer_queue_status={
+                pin_a: _stub_queue_status(pin_sha256=pin_a),
+                pin_b: _stub_queue_status(pin_sha256=pin_b),
+            },
+            busy_build_server_pins={pin_a, pin_b},
+        )
+    )
+    assert decision == BuildPathDecision.local()
+
+
+# ---------------------------------------------------------------------------
+# pick_dispatch_target — the dispatch pool's 4-way decision (adds WAIT).
+# ---------------------------------------------------------------------------
+
+
+def test_dispatch_picks_a_free_server() -> None:
+    """A free idle server → REMOTE with its pin."""
+    pin = "a" * 64
+    decision = pick_dispatch_target(
+        _inputs(
+            pairings={pin: _stub_pairing(pin_sha256=pin)},
+            open_peer_links={pin},
+            peer_queue_status={pin: _stub_queue_status(pin_sha256=pin)},
+        )
+    )
+    assert decision == DispatchDecision.remote(pin)
+
+
+def test_dispatch_waits_when_every_compatible_server_is_busy() -> None:
+    """The only server busy → WAIT (hold the job), not LOCAL and not a raise."""
+    pin = "a" * 64
+    decision = pick_dispatch_target(
+        _inputs(
+            pairings={pin: _stub_pairing(pin_sha256=pin)},
+            open_peer_links={pin},
+            peer_queue_status={pin: _stub_queue_status(pin_sha256=pin)},
+            busy_build_server_pins={pin},
+        )
+    )
+    assert decision.outcome is DispatchOutcome.WAIT
+
+
+def test_dispatch_falls_back_to_local_when_no_server_connected() -> None:
+    """No connected server → LOCAL (run on the local lane)."""
+    pin = "a" * 64
+    decision = pick_dispatch_target(
+        _inputs(pairings={pin: _stub_pairing(pin_sha256=pin)}, open_peer_links=set())
+    )
+    assert decision.outcome is DispatchOutcome.LOCAL
+
+
+def test_dispatch_exact_required_no_server_returns_no_compatible_peer() -> None:
+    """EXACT_REQUIRED with no eligible server → NO_COMPATIBLE_PEER (returned, not raised)."""
+    pin = "a" * 64
+    decision = pick_dispatch_target(
+        _inputs(
+            pairings={pin: _stub_pairing(pin_sha256=pin, esphome_version="2026.6.1")},
+            open_peer_links={pin},
+            peer_queue_status={pin: _stub_queue_status(pin_sha256=pin)},
+            offloader_esphome_version="2026.6.0",
+            version_match_policy=VersionMatchPolicy.EXACT_REQUIRED,
+        )
+    )
+    assert decision.outcome is DispatchOutcome.NO_COMPATIBLE_PEER
+    assert "exact_required" in decision.message
+
+
+def test_dispatch_exact_required_disconnected_server_waits() -> None:
+    """EXACT_REQUIRED, compatible server merely offline -> WAIT (may reconnect), not fail."""
+    pin = "a" * 64
+    decision = pick_dispatch_target(
+        _inputs(
+            pairings={pin: _stub_pairing(pin_sha256=pin, esphome_version="2026.6.0")},
+            open_peer_links=set(),  # paired but disconnected
+            peer_queue_status={},
+            offloader_esphome_version="2026.6.0",
+            version_match_policy=VersionMatchPolicy.EXACT_REQUIRED,
+        )
+    )
+    assert decision.outcome is DispatchOutcome.WAIT
+
+
+def test_dispatch_exact_required_busy_server_waits() -> None:
+    """EXACT_REQUIRED with the only compatible server busy → WAIT, never NO_COMPATIBLE_PEER."""
+    pin = "a" * 64
+    decision = pick_dispatch_target(
+        _inputs(
+            pairings={pin: _stub_pairing(pin_sha256=pin, esphome_version="2026.6.0")},
+            open_peer_links={pin},
+            peer_queue_status={pin: _stub_queue_status(pin_sha256=pin)},
+            offloader_esphome_version="2026.6.0",
+            version_match_policy=VersionMatchPolicy.EXACT_REQUIRED,
+            busy_build_server_pins={pin},
+        )
+    )
+    assert decision.outcome is DispatchOutcome.WAIT
+
+
+def test_dispatch_master_switch_off_returns_local() -> None:
+    """``remote_builds_enabled=False`` → LOCAL even with an idle server."""
+    pin = "a" * 64
+    decision = pick_dispatch_target(
+        _inputs(
+            remote_builds_enabled=False,
+            pairings={pin: _stub_pairing(pin_sha256=pin)},
+            open_peer_links={pin},
+            peer_queue_status={pin: _stub_queue_status(pin_sha256=pin)},
+        )
+    )
+    assert decision.outcome is DispatchOutcome.LOCAL

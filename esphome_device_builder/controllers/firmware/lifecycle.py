@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 from ...helpers.process import terminate_subtree_with_grace
-from ...models import EventType, FirmwareJob, JobLifecycleData, JobStatus
-from .helpers import _mark_job_terminal
+from ...models import TERMINAL_JOB_STATUSES, EventType, FirmwareJob, JobStatus
+from .constants import _PREREQUISITE_FAILED_ERROR
+from .helpers import _fire_job_lifecycle, _trim_job_output
 
 if TYPE_CHECKING:
     from ._state import Lane
     from .controller import FirmwareController
+
+_LOGGER = logging.getLogger(__name__)
 
 
 # Terminal :class:`JobStatus` -> the lifecycle event the runner
@@ -23,8 +27,10 @@ _STATUS_TO_TERMINAL_EVENT: dict[JobStatus, EventType] = {
 }
 
 
-def finalize_terminal(controller: FirmwareController, job: FirmwareJob, status: JobStatus) -> None:
-    """Stamp *job* terminal, release the runner slot, fire the matching event.
+def finalize_terminal(
+    controller: FirmwareController, job: FirmwareJob, status: JobStatus, *, error: str | None = None
+) -> None:
+    """Stamp *job* terminal (with *error* if given), release the slot, fire the event.
 
     Step ordering matters: runner-slot release lands *before* the
     ``bus.fire`` so the ``queue_status`` broadcaster's sync
@@ -33,17 +39,54 @@ def finalize_terminal(controller: FirmwareController, job: FirmwareJob, status: 
     ``_peer_queue_status`` cache at ``running=True`` after the
     first remote build, silently falling back to LOCAL on every
     subsequent install.
-
-    Callers riding a payload field (e.g. ``job.error = "..."``)
-    must set it on the job before calling.
     """
-    _mark_job_terminal(job, status)
+    job.mark_terminal(status, error=error)
     _release_lane_slot(controller, job)
-    payload: JobLifecycleData = {"job": job}
-    controller._db.bus.fire(_STATUS_TO_TERMINAL_EVENT[status], payload)
+    _fire_job_lifecycle(job, controller._db.bus, _STATUS_TO_TERMINAL_EVENT[status])
     release_dependents(controller, job)
     # Wake an upload lane held behind a now-finished clean/reset (build gate).
     controller.state.build_gate.set()
+
+
+async def begin_run(controller: FirmwareController, job: FirmwareJob) -> None:
+    """Stamp *job* RUNNING, fire ``JOB_STARTED``, and persist — the shared run prologue.
+
+    Both execution paths call this: the lane runner (after claiming its lane
+    slot, since the receiver's ``compile_queue_status`` reads ``current_job``
+    on ``JOB_STARTED``) and the off-lane dispatch pool. Keeping the prologue
+    here means a new field / gate is added once, not mirrored by hand.
+    """
+    job.mark_running()
+    _fire_job_lifecycle(job, controller._db.bus, EventType.JOB_STARTED)
+    await controller._persist_jobs()
+
+
+async def end_run(controller: FirmwareController, job: FirmwareJob) -> None:
+    """Terminal bookkeeping (trim + prune) then persist — the shared ``finally`` tail.
+
+    The trim/prune is a no-op while the job is still active. Caller releases its
+    own slot (lane ``current_job`` / pool entry) first.
+    """
+    if job.status in TERMINAL_JOB_STATUSES:
+        _trim_job_output(job)
+        controller._prune_history()
+    await controller._persist_jobs()
+
+
+def finalize_unexpected_error(
+    controller: FirmwareController, job: FirmwareJob, exc: BaseException
+) -> None:
+    """Finalize *job* after an uncaught run exception — cancel intent wins, else FAILED.
+
+    Both execution paths guarantee terminality this way: an exception escaping
+    the run must still produce a terminal event, never a job stuck RUNNING.
+    """
+    if job.job_id in controller.state.cancel_requested:
+        finalize_cancelled(controller, job)
+        _LOGGER.info("Job %s cancelled before completion: %s", job.job_id, exc)
+    else:
+        controller._finalize_terminal(job, JobStatus.FAILED, error=str(exc))
+        _LOGGER.exception("Job %s failed", job.job_id)
 
 
 def _release_lane_slot(controller: FirmwareController, job: FirmwareJob) -> None:
@@ -71,8 +114,9 @@ def release_dependents(controller: FirmwareController, job: FirmwareJob) -> bool
         if job.status is JobStatus.COMPLETED:
             controller.state.place_on_lane(dep)
         else:
-            dep.error = "prerequisite job did not complete successfully"
-            controller._finalize_terminal(dep, JobStatus.CANCELLED)
+            controller._finalize_terminal(
+                dep, JobStatus.CANCELLED, error=_PREREQUISITE_FAILED_ERROR
+            )
     return acted
 
 
@@ -87,6 +131,20 @@ def finalize_cancelled(controller: FirmwareController, job: FirmwareJob) -> None
     # Route through the bound-method delegate so test patches on
     # ``controller._finalize_terminal`` intercept this path too.
     controller._finalize_terminal(job, JobStatus.CANCELLED)
+
+
+def cancel_if_requested(controller: FirmwareController, job: FirmwareJob) -> bool:
+    """Finalize *job* CANCELLED if a cancel raced in mid-flow; return whether it did.
+
+    The remote runner re-checks at several post-await seams (a cancel can land
+    between the receiver's terminal frame and the artifact fetch / local flash);
+    each bails its own way, so this returns a flag rather than controlling flow.
+    """
+    if job.job_id in controller.state.cancel_requested:
+        # Delegate so a test patch on ``controller._finalize_cancelled`` still intercepts.
+        controller._finalize_cancelled(job)
+        return True
+    return False
 
 
 def raise_if_cancelled(controller: FirmwareController, job: FirmwareJob, phase: str) -> None:

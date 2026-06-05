@@ -36,13 +36,15 @@ from esphome_device_builder.models import (
     JobStatus,
     JobType,
     PeerQueueStatusSnapshotEntry,
-    PeerStatus,
     StoredPairing,
 )
 from tests.controllers.firmware.conftest import (
     CaptureEnqueueOrderFactory,
     EnqueueStep,
     FirmwareControllerFactory,
+    build_scheduler_inputs,
+    stub_offloader,
+    stub_pairing,
 )
 from tests.controllers.firmware.conftest import (
     upload_of as _upload_of,
@@ -302,17 +304,8 @@ _PIN = "a" * 64
 
 
 def _make_pairing(label: str = "desktop", esphome_version: str = "") -> StoredPairing:
-    """Build a passing :class:`StoredPairing` for the scheduler tests."""
-    return StoredPairing(
-        receiver_hostname="build.local",
-        receiver_port=6055,
-        pin_sha256=_PIN,
-        static_x25519_pub=b"\x01" * 32,
-        label=label,
-        paired_at=1.0,
-        status=PeerStatus.APPROVED,
-        esphome_version=esphome_version,
-    )
+    """Build a passing :class:`StoredPairing` (fixed ``_PIN``) for the scheduler tests."""
+    return stub_pairing(pin_sha256=_PIN, label=label, esphome_version=esphome_version)
 
 
 def _stub_remote_build(
@@ -322,45 +315,20 @@ def _stub_remote_build(
     open_pins: frozenset[str] = frozenset(),
     idle_pins: frozenset[str] = frozenset(),
 ) -> None:
-    """
-    Wire a stub ``_db.remote_build_offloader`` with a scripted scheduler snapshot.
+    """Wire a stub ``_db.remote_build_offloader`` with a scripted scheduler snapshot.
 
-    The scheduler walks ``pairings`` (APPROVED-only) and
-    requires membership in ``open_pins`` for the peer-link
-    session gate. ``idle_pins`` controls which pairings get
-    an ``idle=True`` snapshot entry; pairings *not* listed in
-    ``idle_pins`` have no entry at all. Under the two-tier
-    scheduler policy the first pass picks oldest-idle and
-    the second pass queues on oldest-otherwise — so a busy
-    receiver (open + not idle) routes REMOTE on the second
-    pass when no idle candidate exists. Pre-two-tier this
-    helper's docstring claimed "open_pins + idle entry"
-    *gated* the candidate; that's no longer accurate. Tests
-    that want LOCAL routing have to omit the pairing from
-    ``open_pins`` or skip the pairing fixture entirely.
+    ``idle_pins`` get an ``idle=True`` queue entry; an open-but-not-idle
+    pairing still routes REMOTE (the scheduler's second pass), so LOCAL
+    routing means omitting the pairing from ``open_pins`` entirely.
     """
-    rows = pairings or []
-    pairings_map = {p.pin_sha256: p for p in rows}
-    queue_status = {
-        pin: PeerQueueStatusSnapshotEntry(
-            receiver_hostname="build.local",
-            receiver_port=6055,
-            pin_sha256=pin,
-            idle=True,
-            running=False,
-            queue_depth=0,
-        )
-        for pin in idle_pins
-    }
-    remote_build = MagicMock()
-    remote_build.build_scheduler_snapshot.return_value = BuildSchedulerInputs(
-        remote_builds_enabled=True,
-        pairings=pairings_map,
-        open_peer_links=open_pins,
-        peer_queue_status=queue_status,
+    stub_offloader(
+        controller,
+        build_scheduler_inputs(
+            pairings=pairings or [],
+            open_pins=set(open_pins),
+            idle_pins=set(idle_pins),
+        ),
     )
-    remote_build.get_pairing.side_effect = pairings_map.get
-    controller._db.remote_build_offloader = remote_build
 
 
 async def test_install_routes_to_local_when_no_paired_receivers(
@@ -389,16 +357,11 @@ async def test_install_routes_to_remote_when_pairing_is_idle_and_connected(
     tmp_path: Path, firmware_controller_factory: FirmwareControllerFactory
 ) -> None:
     """
-    An APPROVED + connected + idle pairing routes the install to REMOTE.
+    An eligible pairing marks the install ``REMOTE_PENDING``; the pin binds at dispatch.
 
-    Pins the transparent install flow's user-visible
-    behaviour: Install with a paired build server up routes
-    transparently to that server; the user doesn't choose,
-    the scheduler decides. ``source_pin_sha256`` carries the
-    machine handle the runner uses to look up the
-    PeerLinkClient; ``source_label`` is the display string
-    the install dialog renders as "Building on
-    {receiver_label}".
+    Submit only decides remote-eligibility — the dispatch pool
+    picks *which* server (and stamps the pin / label / version)
+    when one frees, so ``source_pin_sha256`` is empty here.
     """
     controller = firmware_controller_factory(with_queue=True)
     pairing = _make_pairing(label="desktop", esphome_version="2026.5.0")
@@ -412,10 +375,10 @@ async def test_install_routes_to_remote_when_pairing_is_idle_and_connected(
 
     job = await controller.install(configuration="kitchen.yaml")
 
-    assert job.source is JobSource.REMOTE
-    assert job.source_pin_sha256 == _PIN
-    assert job.source_label == "desktop"
-    assert job.source_esphome_version == "2026.5.0"
+    assert job.source is JobSource.REMOTE_PENDING
+    assert job.source_pin_sha256 == ""
+    assert job.source_label == ""
+    assert job.source_esphome_version == ""
 
 
 async def test_install_force_local_bypasses_scheduler(
@@ -514,7 +477,7 @@ async def test_install_force_local_default_false_keeps_scheduler_behaviour(
 
     job = await controller.install(configuration="kitchen.yaml")
 
-    assert job.source is JobSource.REMOTE
+    assert job.source is JobSource.REMOTE_PENDING
 
 
 async def test_install_still_routes_remote_when_receiver_is_busy(
@@ -543,8 +506,8 @@ async def test_install_still_routes_remote_when_receiver_is_busy(
 
     job = await controller.install(configuration="kitchen.yaml")
 
-    assert job.source is JobSource.REMOTE
-    assert job.source_pin_sha256 == _PIN
+    assert job.source is JobSource.REMOTE_PENDING
+    assert job.source_pin_sha256 == ""
 
 
 async def test_install_serial_port_can_route_remote(
@@ -570,8 +533,8 @@ async def test_install_serial_port_can_route_remote(
 
     job = await controller.install(configuration="kitchen.yaml", port="/dev/ttyUSB0")
 
-    assert job.source is JobSource.REMOTE
-    assert job.source_pin_sha256 == _PIN
+    assert job.source is JobSource.REMOTE_PENDING
+    assert job.source_pin_sha256 == ""
 
 
 async def test_install_falls_back_to_local_when_remote_build_controller_absent(
@@ -594,28 +557,17 @@ async def test_install_falls_back_to_local_when_remote_build_controller_absent(
     assert job.source is JobSource.LOCAL
 
 
-async def test_install_falls_back_to_local_when_scheduler_picked_pin_disappeared(
+async def test_install_marks_remote_pending_without_reading_get_pairing(
     tmp_path: Path, firmware_controller_factory: FirmwareControllerFactory
 ) -> None:
     """
-    Scheduler picks a pin → ``get_pairing`` returns ``None`` → falls back to LOCAL.
+    Submit defers the pin: it marks ``REMOTE_PENDING`` without a ``get_pairing`` read.
 
-    Defensive against a TOCTOU window: the scheduler walks
-    one snapshot, then ``_resolve_install_source`` looks up
-    the chosen pin's label from a fresh ``get_pairing`` call.
-    If an ``unpair`` ran on the same loop tick between the
-    two reads, the second read returns ``None`` and we
-    silently fall back to LOCAL — feeding an empty
-    ``source_pin_sha256`` to the runner would otherwise land
-    on its missing-pin FAILED branch.
-
-    Near-impossible in practice but the typed-return surface
-    is the gate, so pin it.
+    The old TOCTOU (snapshot picks a pin, ``get_pairing`` finds it
+    unpaired) moved to dispatch, where ``remote_dispatch`` binds the
+    server. So ``get_pairing`` is never consulted at submit.
     """
     controller = firmware_controller_factory(with_queue=True)
-    # Scheduler picks ``_PIN`` (snapshot says it's APPROVED +
-    # connected + idle), but ``get_pairing(_PIN)`` returns
-    # ``None`` — the unpair landed between the two reads.
     pairing = _make_pairing()
     remote_build = MagicMock()
     remote_build.build_scheduler_snapshot.return_value = BuildSchedulerInputs(
@@ -633,32 +585,20 @@ async def test_install_falls_back_to_local_when_scheduler_picked_pin_disappeared
             ),
         },
     )
-    # ``get_pairing`` returns None — the unpair happened
-    # after the snapshot was taken.
-    remote_build.get_pairing.return_value = None
     controller._db.remote_build_offloader = remote_build
     (tmp_path / "kitchen.yaml").write_text("")
 
     job = await controller.install(configuration="kitchen.yaml")
 
-    assert job.source is JobSource.LOCAL
+    assert job.source is JobSource.REMOTE_PENDING
     assert job.source_pin_sha256 == ""
+    remote_build.get_pairing.assert_not_called()
 
 
 async def test_install_bulk_routes_each_config_through_the_scheduler(
     tmp_path: Path, firmware_controller_factory: FirmwareControllerFactory
 ) -> None:
-    """
-    ``install_bulk`` resolves the install source per-config.
-
-    Every entry in the bulk call goes through
-    ``_resolve_install_source``, so a bulk request lands all
-    eligible jobs as REMOTE when a paired receiver is healthy
-    + idle (and stays LOCAL when none is available). Pins the
-    per-config shape so a future refactor that hoists the
-    scheduler call to call-time-once-and-share doesn't
-    silently drop the per-job ``source_label`` stamp.
-    """
+    """``install_bulk`` resolves each config's source, marking every eligible one REMOTE_PENDING."""
     controller = firmware_controller_factory(with_queue=True)
     pairing = _make_pairing(label="desktop")
     _stub_remote_build(
@@ -675,9 +615,8 @@ async def test_install_bulk_routes_each_config_through_the_scheduler(
         configurations=["kitchen.yaml", "garage.yaml", "office.yaml"]
     )
 
-    assert [j.source for j in jobs] == [JobSource.REMOTE] * 3
-    assert all(j.source_pin_sha256 == _PIN for j in jobs)
-    assert all(j.source_label == "desktop" for j in jobs)
+    assert [j.source for j in jobs] == [JobSource.REMOTE_PENDING] * 3
+    assert all(j.source_pin_sha256 == "" for j in jobs)
 
 
 async def test_install_bulk_serial_port_routes_every_config_remote(
@@ -699,4 +638,4 @@ async def test_install_bulk_serial_port_routes_every_config_remote(
         configurations=["kitchen.yaml", "garage.yaml"], port="/dev/ttyUSB0"
     )
 
-    assert [j.source for j in jobs] == [JobSource.REMOTE, JobSource.REMOTE]
+    assert [j.source for j in jobs] == [JobSource.REMOTE_PENDING, JobSource.REMOTE_PENDING]

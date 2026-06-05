@@ -23,16 +23,21 @@ from typing import TYPE_CHECKING
 from esphome.core import CORE
 
 from ...helpers.atomic_io import atomic_write
-from ...models import TERMINAL_JOB_STATUSES, FirmwareJob, JobStatus, JobType
+from ...models import (
+    TERMINAL_JOB_STATUSES,
+    FirmwareJob,
+    JobStatus,
+    JobType,
+)
 from ..config import _load_metadata, metadata_transaction
 from .constants import (
     _ACTIVE_JOB_STATUSES,
     _JOBS_KEY,
     _MAX_AUX_TERMINAL_JOBS,
     _MAX_PRIMARY_TERMINAL_JOBS,
+    _PREREQUISITE_FAILED_ERROR,
     _PRIMARY_JOB_TYPES,
 )
-from .helpers import _mark_job_terminal
 
 if TYPE_CHECKING:
     from .controller import FirmwareController
@@ -113,9 +118,7 @@ def _restore_job_entry(
         job = FirmwareJob.from_dict(job_data)  # type: ignore[arg-type]
         controller.state.jobs[job.job_id] = job
         if job.status in _ACTIVE_JOB_STATUSES:
-            if job.status == JobStatus.RUNNING:
-                job.reset()
-            job.status = JobStatus.QUEUED
+            job.restore_for_requeue()
             active.append(job)
         elif job.output:
             # Cleared from RAM only after the sidecar write lands, so a
@@ -157,8 +160,7 @@ def _restore_to_lane(controller: FirmwareController, job: FirmwareJob) -> None:
         job.depends_on,
         prereq_status,
     )
-    _mark_job_terminal(job, JobStatus.CANCELLED)
-    job.error = "prerequisite job did not complete successfully"
+    job.mark_terminal(JobStatus.CANCELLED, error=_PREREQUISITE_FAILED_ERROR)
 
 
 async def load_jobs(controller: FirmwareController) -> None:
