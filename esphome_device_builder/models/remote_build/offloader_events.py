@@ -32,6 +32,27 @@ class OffloaderPairStatusChangedData(TypedDict):
     status: Literal["approved", "removed"]
 
 
+class OffloaderPairingAddedData(TypedDict):
+    """
+    Payload for ``EventType.OFFLOADER_PAIRING_ADDED``.
+
+    ``status`` is ``"pending"`` for a fresh request, ``"approved"`` on a
+    re-pair short-circuit.
+    """
+
+    receiver_hostname: str
+    receiver_port: int
+    pin_sha256: str
+    label: str
+    paired_at: float
+    status: Literal["pending", "approved"]
+    connected: bool
+    connecting: bool
+    last_connect_error: str
+    esphome_version: str
+    enabled: bool
+
+
 class OffloaderPairEndpointReboundData(TypedDict):
     """
     Payload for ``EventType.OFFLOADER_PAIR_ENDPOINT_REBOUND``.
