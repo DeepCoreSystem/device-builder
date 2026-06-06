@@ -27,6 +27,7 @@ from __future__ import annotations
 import logging
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -82,6 +83,16 @@ _SECRETS_FILENAME = "secrets.yaml"
 # Glob patterns for the YAML configs this feature versions.
 _YAML_GLOBS = ("*.yaml", "*.yml")
 
+# Min age before a leftover ``index.lock`` counts as stale and is cleared;
+# younger than this a live git may still hold it, so we leave it alone.
+_STALE_LOCK_SECONDS = 30.0
+
+# Repo-local git-config verdict (``true``/``false``) for whether we own a
+# repo. Written at init and cached on the first adopt so ownership survives a
+# restart and the seed-root backfill scan runs at most once per repo. Unset
+# means "not yet resolved"; an adopted user repo ends up cached ``false``.
+_MANAGED_CONFIG_KEY = "device-builder.managed"
+
 # Written only when *we* create the repo and no ``.gitignore`` exists; a
 # pre-existing one is left untouched (the local exclude is what actually
 # protects the secrets above). ``secrets.yaml`` is ignored here — not in
@@ -133,6 +144,10 @@ class GitRepo:
     git_bin: str | None = None
     toplevel: Path | None = None
     enabled: bool = field(default=False)
+    # True for a repo *we* initialised, set from the persisted
+    # _MANAGED_CONFIG_KEY so it survives a restart's adopt path. Gates
+    # stale-index.lock recovery; an adopted user repo is never ours.
+    managed: bool = field(default=False)
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -155,6 +170,7 @@ class GitRepo:
             if toplevel is not None and not _encloses_own_source(toplevel):
                 self.toplevel = toplevel
                 self.enabled = True
+                self.managed = self._adopt_ownership()
                 self._ensure_local_excludes()
                 _LOGGER.debug("Adopted existing git work tree at %s", toplevel)
                 return
@@ -194,6 +210,8 @@ class GitRepo:
         self._run(["init", str(self.config_dir)], cwd=self.config_dir, check=True)
         self.toplevel = self.config_dir
         self.enabled = True
+        self.managed = True
+        self._mark_managed(managed=True)
         self._ensure_local_excludes()
         gitignore = self.config_dir / ".gitignore"
         if not gitignore.exists():
@@ -300,11 +318,11 @@ class GitRepo:
         if not self.enabled or not paths:
             return None
         spec = [str(p) for p in paths]
-        self._run(["add", "-A", "--", *spec], check=True)
+        self._run_write(["add", "-A", "--", *spec])
         staged = self._run(["diff", "--cached", "--quiet", "--", *spec], check=False)
         if staged.returncode == 0:
             return None  # nothing staged for these paths
-        self._run(self._commit_argv(message, tuple(spec)), check=True)
+        self._run_write(self._commit_argv(message, tuple(spec)))
         head = self._run(["rev-parse", "HEAD"], check=False)
         return head.stdout.strip() if head.returncode == 0 else None
 
@@ -410,6 +428,103 @@ class GitRepo:
     # internals
     # ------------------------------------------------------------------
 
+    def _run_write(self, args: list[str]) -> None:
+        """Run a checked git write, clearing a *stale* index.lock and retrying once."""
+        try:
+            self._run(args, check=True)
+        except subprocess.CalledProcessError as exc:
+            if not self._clear_stale_index_lock(exc):
+                raise
+            self._run(args, check=True)
+
+    def _clear_stale_index_lock(self, exc: subprocess.CalledProcessError) -> bool:
+        """
+        Remove the index.lock blamed by *exc* iff it's stale; return whether removed.
+
+        Gated on ownership (only a repo we manage, never an adopted
+        ``/config``) and age (:data:`_STALE_LOCK_SECONDS`), so a lock a
+        live git is actively holding is never deleted out from under it.
+        """
+        if not self.managed or "index.lock" not in (exc.stderr or ""):
+            return False
+        lock = self._index_lock_path()
+        if lock is None or not lock.exists():
+            return False
+        try:
+            age = time.time() - lock.stat().st_mtime
+        except OSError:
+            return False
+        if age < _STALE_LOCK_SECONDS:
+            return False  # fresh — a live git may hold it; don't clobber
+        try:
+            lock.unlink()
+        except OSError as unlink_exc:
+            _LOGGER.warning("Could not remove stale git index.lock at %s: %s", lock, unlink_exc)
+            return False
+        _LOGGER.warning("Removed stale git index.lock at %s (age %.0fs)", lock, age)
+        return True
+
+    def _adopt_ownership(self) -> bool:
+        """
+        Resolve whether an adopted repo is one we own, caching the verdict once.
+
+        A prior run's cached :data:`_MANAGED_CONFIG_KEY` short-circuits.
+        Otherwise the seed-root backfill identifies repos we created before
+        the marker existed; the verdict (ours or not) is stamped so the scan
+        runs at most once. A scan that couldn't run is left uncached.
+        """
+        cached = self._read_managed_flag()
+        if cached is not None:
+            return cached
+        owned = self._looks_self_initialised()
+        if owned is None:
+            return False  # couldn't determine; re-resolve next start
+        self._mark_managed(managed=owned)
+        return owned
+
+    def _mark_managed(self, *, managed: bool) -> None:
+        """Persist the ownership verdict so the next start skips re-deriving it."""
+        value = "true" if managed else "false"
+        result = self._run(["config", "--local", _MANAGED_CONFIG_KEY, value], check=False)
+        if result.returncode != 0:
+            _LOGGER.warning(
+                "Could not stamp managed flag on %s: %s", self.toplevel, result.stderr.strip()
+            )
+
+    def _read_managed_flag(self) -> bool | None:
+        """Return the cached ownership verdict from a prior run, or ``None`` if unresolved."""
+        result = self._run(["config", "--local", "--get", _MANAGED_CONFIG_KEY], check=False)
+        if result.returncode != 0:
+            return None
+        return result.stdout.strip() == "true"
+
+    def _looks_self_initialised(self) -> bool | None:
+        """
+        Whether a root commit was authored by our seed — backfill for pre-marker repos.
+
+        The ``Initialize version history`` seed is authored by our identity,
+        which an adopted user repo's root commit never is; git filters on
+        the author so we only ask whether such a root exists. ``None`` when
+        the query couldn't run (e.g. a repo with no commits yet).
+        """
+        result = self._run(
+            ["log", "--max-parents=0", f"--author={_COMMIT_EMAIL}", "--format=%H"],
+            check=False,
+        )
+        if result.returncode != 0:
+            return None
+        return bool(result.stdout.strip())
+
+    def _index_lock_path(self) -> Path | None:
+        """Resolve the work tree's ``index.lock`` path (handles split git dirs)."""
+        result = self._run(["rev-parse", "--git-path", "index.lock"], check=False)
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        lock = Path(result.stdout.strip())
+        if not lock.is_absolute():
+            lock = (self.toplevel or self.config_dir) / lock
+        return lock
+
     def _rel_to_toplevel(self, path: Path) -> str:
         """Return *path* relative to the work-tree root (git's pathspec base)."""
         assert self.toplevel is not None
@@ -439,8 +554,11 @@ class GitRepo:
         # close_fds=True makes the child iterate the fd table before
         # exec, which is pure overhead on memory-pressured systems; our
         # spawns don't rely on inherited fds being closed at the boundary.
+        # --no-optional-locks stops reads from grabbing index.lock for an
+        # optional refresh, so an unlocked read can't contend with a commit;
+        # the required lock add/commit take is unaffected.
         result = subprocess.run(  # noqa: S603
-            [self.git_bin, *args],
+            [self.git_bin, "--no-optional-locks", *args],
             cwd=str(cwd or self.toplevel or self.config_dir),
             capture_output=True,
             text=True,
