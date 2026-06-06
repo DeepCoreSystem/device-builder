@@ -404,6 +404,64 @@ def test_commit_clears_stale_index_lock_and_retries(tmp_path: Path) -> None:
     assert not lock.exists()
 
 
+def test_commit_paths_skips_gitignored_secrets(tmp_path: Path) -> None:
+    """A commit for a gitignored secrets.yaml is a clean no-op, not a git error."""
+    repo = GitRepo(config_dir=tmp_path)
+    repo.discover_or_init()  # seeds a .gitignore that ignores secrets.yaml
+    secrets = tmp_path / "secrets.yaml"
+    secrets.write_text("wifi_password: hunter2\n", encoding="utf-8")
+
+    assert repo.commit_paths([secrets], "Update secrets") is None
+    assert "secrets.yaml" not in _git(tmp_path, "ls-files").split()
+
+
+def test_commit_paths_commits_others_alongside_an_ignored_one(tmp_path: Path) -> None:
+    """A mixed batch commits the trackable file and drops the ignored one."""
+    repo = GitRepo(config_dir=tmp_path)
+    repo.discover_or_init()
+    kitchen = tmp_path / "kitchen.yaml"
+    kitchen.write_text("esphome:\n  name: kitchen\n", encoding="utf-8")
+    secrets = tmp_path / "secrets.yaml"
+    secrets.write_text("wifi_password: hunter2\n", encoding="utf-8")
+
+    sha = repo.commit_paths([kitchen, secrets], "Add kitchen + secrets")
+
+    assert sha
+    tracked = _git(tmp_path, "ls-files").split()
+    assert "kitchen.yaml" in tracked
+    assert "secrets.yaml" not in tracked
+
+
+def test_ignored_subset_treats_check_ignore_failure_as_nothing_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-0/1 check-ignore exit reports nothing ignored, never a crash."""
+    repo = GitRepo(config_dir=tmp_path)
+    repo.discover_or_init()  # real _run; patch only the check-ignore call below
+    monkeypatch.setattr(
+        GitRepo,
+        "_run",
+        lambda self, *a, **k: subprocess.CompletedProcess(a, 128, stdout="", stderr="boom"),
+    )
+
+    assert repo._ignored_subset([tmp_path / "secrets.yaml"]) == []
+
+
+def test_ignored_subset_skips_a_truncated_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A short (malformed) check-ignore record is skipped, not unpacked into a crash."""
+    repo = GitRepo(config_dir=tmp_path)
+    repo.discover_or_init()  # real _run; patch only the check-ignore call below
+    monkeypatch.setattr(
+        GitRepo,
+        "_run",
+        lambda self, *a, **k: subprocess.CompletedProcess(a, 0, stdout="src\0", stderr=""),
+    )
+
+    assert repo._ignored_subset([tmp_path / "x.yaml"]) == []
+
+
 def test_managed_flag_survives_restart_and_heals(tmp_path: Path) -> None:
     """A repo we created is re-adopted as managed on restart, so the stale-lock heal fires."""
     GitRepo(config_dir=tmp_path).discover_or_init()  # first boot: initialises

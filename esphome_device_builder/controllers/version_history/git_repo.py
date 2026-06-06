@@ -29,6 +29,7 @@ import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field
+from itertools import batched
 from pathlib import Path
 
 import esphome_device_builder
@@ -79,6 +80,10 @@ _EXCLUDE_END = "# <<< ESPHome Device Builder (managed) <<<"
 # (``controllers/config/settings.py``) is a virtual ``CORE.config_path``
 # value, never written to disk, so it can't be globbed and needs no filter.
 _SECRETS_FILENAME = "secrets.yaml"
+
+# Fields ``git check-ignore -v -z`` emits per input path: source, linenum,
+# pattern, pathname. A non-empty pattern marks that path ignored.
+_CHECK_IGNORE_FIELDS = 4
 
 # Glob patterns for the YAML configs this feature versions.
 _YAML_GLOBS = ("*.yaml", "*.yml")
@@ -320,15 +325,17 @@ class GitRepo:
         # A path that's gone from disk and untracked has nothing to commit:
         # the dashboard delete already recorded the removal, or an atomic-save
         # editor briefly removed it. Drop those. A gone-but-tracked path stays
-        # so its deletion is staged (git add -A picks up the removal). The
-        # common create / edit case has no gone paths, so it skips git here.
-        spec: list[str] = []
+        # so its deletion is staged (git add -A picks up the removal).
+        present: list[Path] = []
         gone: list[Path] = []
         for p in paths:
-            if p.exists():
-                spec.append(str(p))
-            else:
-                gone.append(p)
+            (present if p.exists() else gone).append(p)
+        # Drop present paths git would refuse as ignored (e.g. secrets.yaml,
+        # deliberately kept out of history); explicitly listing one makes
+        # ``git add`` fail, and a commit of only such paths is a clean no-op.
+        # Costs one ``check-ignore`` per save, ahead of the add/diff/commit.
+        ignored = set(self._ignored_subset(present))
+        spec: list[str] = [str(p) for p in present if p not in ignored]
         if gone:
             spec += [str(p) for p in self._tracked_subset(gone)]
         if not spec:
@@ -553,6 +560,46 @@ class GitRepo:
         tracked = {rel for rel in result.stdout.split("\0") if rel}
         return [p for p in paths if self._rel_to_toplevel(p) in tracked]
 
+    def _ignored_subset(self, paths: list[Path]) -> list[Path]:
+        """
+        Return the subset of *paths* git would refuse to ``add`` as ignored.
+
+        ``check-ignore`` honours the index, so a tracked path is never
+        reported even if it matches a rule; the result is exactly the set
+        ``git add`` rejects with "paths are ignored". A non-0/1 exit (a
+        genuine failure) is treated as "nothing ignored" so a checkable
+        path is never silently dropped.
+        """
+        if not paths:
+            return []
+        # ``--stdin -v --non-matching -z`` emits one record per input path, in
+        # order, as four NUL-separated fields (source, linenum, pattern,
+        # pathname). We correlate by position and read the pattern field
+        # rather than comparing path strings: git echoes forward slashes while
+        # ``str(p)`` uses backslashes on Windows, so a string match is
+        # unreliable there. Exit 0/1 are both normal (some/none ignored);
+        # anything else is a genuine failure we treat as "nothing ignored".
+        result = self._run(
+            ["check-ignore", "-z", "-v", "--non-matching", "--stdin"],
+            check=False,
+            input_text="\0".join(str(p) for p in paths),
+        )
+        if result.returncode not in (0, 1):
+            return []
+        # One record per input path, in order; correlate by position. The
+        # trailing element from the final NUL is a short record zip() drops.
+        records = batched(result.stdout.split("\0"), _CHECK_IGNORE_FIELDS)
+        ignored: list[Path] = []
+        # strict=False: the split's trailing element is a short final record
+        # zip() stops before, since there's exactly one record per path.
+        for path, record in zip(paths, records, strict=False):
+            if len(record) != _CHECK_IGNORE_FIELDS:
+                continue
+            _source, _linenum, pattern, _pathname = record
+            if pattern:
+                ignored.append(path)
+        return ignored
+
     def _rel_to_toplevel(self, path: Path) -> str:
         """Return *path* relative to the work-tree root (git's pathspec base)."""
         assert self.toplevel is not None
@@ -567,12 +614,15 @@ class GitRepo:
         *,
         check: bool,
         cwd: Path | None = None,
+        input_text: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         """Run ``git`` with *args* in the work tree; capture text output.
 
         Checks the exit status here (rather than via ``check=True``) so a
         failure raises :class:`GitCommandError`, whose ``str`` carries the
         ``fatal:`` stderr line a bare ``CalledProcessError`` would drop.
+        *input_text*, when set, is fed to the child's stdin (e.g. for
+        ``--stdin`` pathspecs).
         """
         assert self.git_bin is not None
         # git_bin is a resolved absolute path from shutil.which and the
@@ -588,6 +638,7 @@ class GitRepo:
         result = subprocess.run(  # noqa: S603
             [self.git_bin, "--no-optional-locks", *args],
             cwd=str(cwd or self.toplevel or self.config_dir),
+            input=input_text,
             capture_output=True,
             text=True,
             check=False,
