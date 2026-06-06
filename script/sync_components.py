@@ -3750,42 +3750,56 @@ def _walk_schema_keys(
 _NOT_A_LIST = object()
 
 
+def _branch_quantifier(validator: Any) -> Callable[[Iterable[object]], bool]:
+    """
+    Return ``all`` for a ``vol.Any`` union, ``any`` otherwise.
+
+    A ``vol.Any`` value satisfies a per-branch property only when *every*
+    branch does (a scalar-or-list union is not a list; a scalar-or-mapping
+    union is not a mapping); a ``vol.All`` value is constrained as soon as
+    *one* branch carries it.
+    """
+    return all if isinstance(validator, vol.Any) else any
+
+
 def _list_element(validator: Any) -> Any:
     """
     Element validator of a list, or ``_NOT_A_LIST``.
 
-    A bare ``[item]`` and a ``vol.All`` carrying a list branch (every branch
-    must pass, so the list branch constrains the value to a list) resolve to
-    the item. A ``vol.Any`` union only counts as a list when *every* branch
-    is a list — a scalar-or-list union (``vol.Any(str, [str])``) keeps its
-    scalar form and must not be forced into a list-only editor.
+    A bare ``[item]`` and a ``vol.All`` carrying a list branch (one list
+    branch constrains the value to a list) resolve to the item. A ``vol.Any``
+    union only counts as a list when *every* branch is a list — a
+    scalar-or-list union (``vol.Any(str, [str])``) keeps its scalar form and
+    must not be forced into a list-only editor.
     """
     if isinstance(validator, list):
         return validator[0] if validator else None
     branches = getattr(validator, "validators", None)
     if not branches:
         return _NOT_A_LIST
-    if isinstance(validator, vol.Any):
-        elements = [_list_element(b) for b in branches]
-        if any(e is _NOT_A_LIST for e in elements):
-            return _NOT_A_LIST
-        return elements[0]
-    # ``vol.All`` (and other all-must-pass combinators): one list branch
-    # is enough to constrain the value to a list.
-    for branch in branches:
-        element = _list_element(branch)
-        if element is not _NOT_A_LIST:
-            return element
+    elements = [_list_element(b) for b in branches]
+    present = [e for e in elements if e is not _NOT_A_LIST]
+    if _branch_quantifier(validator)(e is not _NOT_A_LIST for e in elements):
+        return present[0]
     return _NOT_A_LIST
 
 
 def _validates_mapping(validator: Any) -> bool:
-    """Report whether *validator* validates a YAML mapping (a list-of-dicts element)."""
+    """
+    Report whether *validator* validates a YAML mapping (a list-of-dicts element).
+
+    A ``vol.Any`` union is a mapping only when *every* branch is one — a
+    scalar-or-mapping union (``Any(int, time_period)``, whose ``time_period``
+    branch carries a ``{days, hours, ...}`` dict form) stays a scalar list.
+    Checked before the ``.schema`` fallback: a compiled compound validator's
+    ``.schema`` points at the outer schema, not the branch.
+    """
     if isinstance(validator, dict):
         return True
-    if isinstance(getattr(validator, "schema", None), dict):
-        return True
-    return any(_validates_mapping(v) for v in getattr(validator, "validators", None) or ())
+    branches = getattr(validator, "validators", None)
+    if branches:
+        return _branch_quantifier(validator)(_validates_mapping(b) for b in branches)
+    return isinstance(getattr(validator, "schema", None), dict)
 
 
 def _is_list_validator(validator: Any) -> bool:
@@ -5032,17 +5046,8 @@ def _apply_field_ranges(
     _walk_catalog_entries(entries, visit)
 
 
-def _collect_list_fields(manifest: Any) -> dict[tuple[str, ...], bool]:
-    """Walk the live ``CONFIG_SCHEMA`` for bare-list fields the bundle missed.
-
-    Returns ``{key_path: True}`` for fields whose validator is a
-    voluptuous list (see :func:`_is_list_validator`). Empty dict when
-    the component has no schema.
-    """
-    schema = getattr(manifest, "config_schema", None)
-    if schema is None:
-        return {}
-
+def _list_fields_in_schema(schema: Any) -> dict[tuple[str, ...], bool]:
+    """``{key_path: True}`` for each bare-list field in a single voluptuous *schema*."""
     out: dict[tuple[str, ...], bool] = {}
 
     def visit(_key: Any, _key_name: str, val: Any, path: tuple[str, ...]) -> None:
@@ -5050,6 +5055,54 @@ def _collect_list_fields(manifest: Any) -> dict[tuple[str, ...], bool]:
             out[path] = True
 
     _walk_schema_keys(schema, visit)
+    return out
+
+
+def _registry_from_schema(schema: Any) -> Any:
+    """
+    Return the ESPHome ``Registry`` a ``cv.validate_registry_entry`` schema closes over, or None.
+
+    A registry-typed platform schema (``remote_base``'s per-protocol
+    receiver schemas) is a closure the dict walker can't descend; the
+    registry it validates against lives in one of its closure cells.
+    """
+    if not callable(schema):
+        return None
+    try:
+        from esphome.util import Registry
+    except Exception:
+        return None
+    for cell in getattr(schema, "__closure__", None) or ():
+        try:
+            contents = cell.cell_contents
+        except ValueError:
+            continue
+        if isinstance(contents, Registry):
+            return contents
+    return None
+
+
+def _collect_list_fields(manifest: Any) -> dict[tuple[str, ...], bool]:
+    """Walk the live ``CONFIG_SCHEMA`` for bare-list fields the bundle missed.
+
+    Returns ``{key_path: True}`` for fields whose validator is a
+    voluptuous list (see :func:`_is_list_validator`). A registry-typed
+    schema is descended through the registry it closes over, keying each
+    entry's fields under the entry name to match the nested catalog
+    entries. Empty dict when the component has no schema.
+    """
+    schema = getattr(manifest, "config_schema", None)
+    if schema is None:
+        return {}
+    out = _list_fields_in_schema(schema)
+    registry = _registry_from_schema(schema)
+    if registry is not None:
+        for name, entry in registry.items():
+            entry_schema = getattr(entry, "schema", None)
+            if entry_schema is None:
+                continue
+            for path in _list_fields_in_schema(entry_schema):
+                out[(name, *path)] = True
     return out
 
 

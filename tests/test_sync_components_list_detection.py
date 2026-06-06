@@ -25,6 +25,7 @@ if str(_SCRIPT_DIR) not in sys.path:
 
 import esphome.config_validation as cv  # noqa: E402
 import sync_components  # noqa: E402
+from esphome.util import Registry  # noqa: E402
 
 
 def test_is_list_validator_detects_bare_list() -> None:
@@ -57,6 +58,19 @@ def test_is_list_validator_accepts_a_union_where_every_branch_is_a_list() -> Non
     assert sync_components._is_list_validator(vol.Any([cv.string], [cv.int_])) is True
 
 
+def test_is_list_validator_accepts_a_scalar_or_time_period_list() -> None:
+    """``[Any(int, time_period)]`` — ``remote_receiver``'s ``raw.code``."""
+    element = vol.Any(cv.int_, cv.time_period_microseconds)
+    assert sync_components._is_list_validator(cv.All([element], cv.Length(min=1))) is True
+
+
+def test_validates_mapping_union_needs_every_branch_to_be_a_mapping() -> None:
+    """A union is a mapping only when no branch is a scalar."""
+    schema = cv.Schema({cv.Optional("name"): cv.string})
+    assert sync_components._validates_mapping(vol.Any(cv.int_, schema)) is False
+    assert sync_components._validates_mapping(vol.Any(schema, schema)) is True
+
+
 def test_apply_list_fields_marks_matching_path_multi_value() -> None:
     entries = [
         {"key": "data_pins", "type": "string", "multi_value": False},
@@ -87,6 +101,26 @@ def test_collect_list_fields_flags_data_pins() -> None:
 
 def test_collect_list_fields_empty_for_schemaless_manifest() -> None:
     assert sync_components._collect_list_fields(SimpleNamespace(config_schema=None)) == {}
+
+
+def test_collect_list_fields_descends_a_registry_schema() -> None:
+    """``remote_receiver``'s binary_sensor schema is a registry-entry callable."""
+    loader = sync_components._get_esphome_loader()
+    manifest = loader.get_platform("binary_sensor", "remote_receiver")
+    fields = sync_components._collect_list_fields(manifest)
+    assert fields.get(("raw", "code")) is True
+    assert ("rc_switch_raw", "code") not in fields
+
+
+def test_registry_from_schema_finds_the_closed_over_registry() -> None:
+    loader = sync_components._get_esphome_loader()
+    manifest = loader.get_platform("binary_sensor", "remote_receiver")
+    assert isinstance(sync_components._registry_from_schema(manifest.config_schema), Registry)
+
+
+def test_registry_from_schema_none_for_a_plain_callable() -> None:
+    assert sync_components._registry_from_schema(lambda value: value) is None
+    assert sync_components._registry_from_schema("not callable") is None
 
 
 def test_introspect_component_surfaces_list_fields() -> None:
