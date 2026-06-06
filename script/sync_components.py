@@ -1803,6 +1803,9 @@ def build_component_entry(
     _apply_refined_types(config_entries, introspection.get("refined_types") or {})
     _apply_inclusive_groups(config_entries, introspection.get("inclusive_groups") or {})
     _apply_list_fields(config_entries, introspection.get("list_fields") or {})
+    _apply_exclusive_group(
+        config_entries, introspection.get("registry_members") or {}, component_id
+    )
     _apply_pin_constraints(
         config_entries,
         _collect_pin_constraints(_get_esphome_loader(), domain, stem, top_key),
@@ -3259,6 +3262,7 @@ def introspect_component(component_id: str) -> dict[str, Any]:
     inclusive_groups = merge_from_platforms(_collect_inclusive_groups)
     required_groups = merge_from_platforms(_collect_required_groups)
     list_fields = merge_from_platforms(_collect_list_fields)
+    registry_members = merge_from_platforms(_collect_registry_members)
 
     return {
         "multi_conf": bool(getattr(manifest, "multi_conf", False)),
@@ -3270,6 +3274,7 @@ def introspect_component(component_id: str) -> dict[str, Any]:
         "inclusive_groups": inclusive_groups,
         "required_groups": required_groups,
         "list_fields": list_fields,
+        "registry_members": registry_members,
         "auto_load": auto_load,
     }
 
@@ -5114,6 +5119,31 @@ def _apply_list_fields(entries: list[dict], list_fields: dict[tuple[str, ...], b
     def visit(entry: dict, path: tuple[str, ...]) -> None:
         if list_fields.get(path):
             entry["multi_value"] = True
+
+    _walk_catalog_entries(entries, visit)
+
+
+def _collect_registry_members(manifest: Any) -> dict[str, bool]:
+    """
+    Entry keys of a ``cv.validate_registry_entry`` schema, else empty.
+
+    A registry-backed platform schema (``remote_receiver``'s binary_sensor:
+    one of ``raw`` / ``nec`` / ... per item) is mutually exclusive; the keys
+    drive the editor's pick-one discriminator. Returned as a ``{key: True}``
+    map so it composes with ``merge_from_platforms`` like the other collectors.
+    """
+    registry = _registry_from_schema(getattr(manifest, "config_schema", None))
+    return dict.fromkeys(registry.keys(), True) if registry is not None else {}
+
+
+def _apply_exclusive_group(entries: list[dict], members: dict[str, bool], group_id: str) -> None:
+    """Tag registry-member entries so the editor renders one pick-one dropdown."""
+    if not members:
+        return
+
+    def visit(entry: dict, path: tuple[str, ...]) -> None:
+        if entry.get("key") in members:
+            entry["exclusive_group"] = group_id
 
     _walk_catalog_entries(entries, visit)
 
