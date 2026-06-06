@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING
 
+from esphome.helpers import write_file as atomic_write_file
 from esphome.storage_json import StorageJSON
 
 from ...helpers.api import CommandError
@@ -17,7 +18,7 @@ if TYPE_CHECKING:
     from .controller import DevicesController
 
 
-async def create_device(  # noqa: C901
+async def create_device(  # noqa: C901, PLR0912
     controller: DevicesController,
     *,
     name: str,
@@ -25,6 +26,7 @@ async def create_device(  # noqa: C901
     ssid: str,
     psk: str,
     file_content: str | None,
+    overwrite: bool = False,
 ) -> WizardResponse:
     """
     Create a new device configuration.
@@ -40,7 +42,11 @@ async def create_device(  # noqa: C901
     still land in the editor for repair. ``board_id`` is
     persisted (as a deliberate user pick) only when explicitly
     provided; otherwise the scanner derives it from the YAML on
-    each resolve against the current catalog.
+    each resolve against the current catalog. A filename collision
+    raises ``ALREADY_EXISTS`` unless *overwrite* is set, which
+    replaces the YAML in place and preserves the existing device's
+    metadata (labels / comment, and its board_id unless a new
+    *board_id* is explicitly provided) and StorageJSON.
     """
     # The wizard passes the user's raw input here — capitalisation,
     # inter-word spaces, and unicode all stay intact. ``clean_friendly_name``
@@ -66,12 +72,15 @@ async def create_device(  # noqa: C901
 
     # Fast collision check before the (~hundreds of ms) validator
     # round-trip so a duplicate-name attempt fails on the right
-    # diagnostic. The ``open(..., "x")`` further down is the
-    # actual race-safe write; the check here is a UX optimisation.
+    # diagnostic. ``ALREADY_EXISTS`` (not ``INVALID_ARGS``) so the
+    # frontend can offer an overwrite instead of a dead-end error. The
+    # write further down is the actual race-safe path; this is a UX
+    # optimisation.
     loop_for_check = asyncio.get_running_loop()
-    if await loop_for_check.run_in_executor(None, config_path.exists):
+    file_existed = await loop_for_check.run_in_executor(None, config_path.exists)
+    if file_existed and not overwrite:
         msg = f"Configuration {filename} already exists"
-        raise CommandError(ErrorCode.INVALID_ARGS, msg)
+        raise CommandError(ErrorCode.ALREADY_EXISTS, msg)
 
     # Surface user-correctable failures (unknown board) as typed
     # ``INVALID_ARGS`` so the wizard can show a specific message.
@@ -128,49 +137,50 @@ async def create_device(  # noqa: C901
         with config_path.open("x", encoding="utf-8") as f:
             f.write(yaml_content)
 
-    try:
-        await loop.run_in_executor(None, _write_exclusive)
-    except FileExistsError as exc:
-        msg = f"Configuration {filename} already exists"
-        raise CommandError(ErrorCode.INVALID_ARGS, msg) from exc
+    overwriting = overwrite and file_existed
+    if overwriting:
+        # Atomic in-place rewrite (stage + move) so a crash can't leave a
+        # half-written config; the user explicitly confirmed the overwrite.
+        await loop.run_in_executor(None, atomic_write_file, config_path, yaml_content)
+    else:
+        try:
+            await loop.run_in_executor(None, _write_exclusive)
+        except FileExistsError as exc:
+            msg = f"Configuration {filename} already exists"
+            raise CommandError(ErrorCode.ALREADY_EXISTS, msg) from exc
 
-    def _init_storage() -> None:
+    # Overwriting an existing device keeps its StorageJSON (build state)
+    # and dashboard metadata; only a fresh device gets a new sidecar.
+    if not overwriting:
         platform = str(board.esphome.platform) if board else parsed_platform
-        storage = StorageJSON(
-            storage_version=1,
-            name=name,
-            friendly_name=friendly,
-            comment=None,
-            esphome_version=None,
-            src_version=None,
-            address=f"{name}.local",
-            web_port=None,
-            target_platform=platform,
-            build_path=None,
-            firmware_bin_path=None,
-            loaded_integrations=[],
-            loaded_platforms=[],
-            no_mdns=False,
-        )
-        storage_path = resolve_storage_path(filename)
-        storage_path.parent.mkdir(parents=True, exist_ok=True)
-        storage.save(storage_path)
-
-    await loop.run_in_executor(None, _init_storage)
-    # Archive keeps identity for unarchive; a fresh device at the
-    # same filename must start clean or an archived board_id
-    # silently mis-binds.
-    await controller._delete_device_metadata(filename)
-    if board_id:
-        await controller._persist_device_metadata_async(
-            filename, board_id=board_id, board_id_user_set=True
-        )
-    await controller._commit_history(filename, f"Create {filename}")
-    # _scanner.scan fires _on_scan_change(ADDED) for the new
-    # YAML and that already runs probe_device; don't double-probe.
-    # file_content may carry an esphome.name that differs from
-    # the URL name, in which case the scan-change handler probes
-    # the YAML's name (the right one) and a second probe here
-    # would target the wrong service.
-    await controller._scanner.scan()
+        await loop.run_in_executor(None, init_device_storage, filename, name, friendly, platform)
+    await controller._register_new_device(
+        filename,
+        f"{'Overwrite' if overwriting else 'Create'} {filename}",
+        board_id=board_id,
+        clear_metadata=not overwriting,
+    )
     return WizardResponse(configuration=filename)
+
+
+def init_device_storage(filename: str, name: str, friendly_name: str | None, platform: str) -> None:
+    """Write a fresh StorageJSON sidecar for a newly created / imported device."""
+    storage = StorageJSON(
+        storage_version=1,
+        name=name,
+        friendly_name=friendly_name,
+        comment=None,
+        esphome_version=None,
+        src_version=None,
+        address=f"{name}.local",
+        web_port=None,
+        target_platform=platform,
+        build_path=None,
+        firmware_bin_path=None,
+        loaded_integrations=[],
+        loaded_platforms=[],
+        no_mdns=False,
+    )
+    storage_path = resolve_storage_path(filename)
+    storage_path.parent.mkdir(parents=True, exist_ok=True)
+    storage.save(storage_path)
