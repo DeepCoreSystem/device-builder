@@ -365,17 +365,28 @@ def _scope_component_instances(
     domain: str,
     section: list,
 ) -> list[AvailableComponentInstance]:
-    """Pick configured component instance ids under one domain."""
+    """
+    Pick configured component instance ids under one domain.
+
+    A multi-entity platform also surfaces each ided sub-entity (``parent_id``
+    set) and flags the container ``is_entity_container``.
+    """
     out: list[AvailableComponentInstance] = []
-    for item in section:
+    for idx, item in enumerate(section):
         if not isinstance(item, dict):
             continue
+        catalog_id = parsing.catalog_id(domain, item.get("platform"))
+        subs = list(parsing.iter_subentities(domain, item))
         comp_id = item.get("id")
-        if not comp_id:
-            continue
-        platform = item.get("platform")
-        catalog_id = f"{domain}.{platform}" if platform else domain
-        out.append(_component_instance(catalog_id, str(comp_id), item))
+        if comp_id:
+            # Mark a container only when it actually surfaces ided sub-entities;
+            # a multi-entity platform whose readings carry no id keeps its plain
+            # instance (the frontend hides containers, and would otherwise leave
+            # the user nothing to target).
+            out.append(_component_instance(catalog_id, str(comp_id), item, is_container=bool(subs)))
+        parent_id = str(comp_id) if comp_id else f"{domain}_{idx}"
+        for sub_domain, sub, sub_id, _sub_key in subs:
+            out.append(_component_instance(sub_domain, sub_id, sub, parent_id=parent_id))
     return out
 
 
@@ -391,12 +402,17 @@ def _component_instance(
     component_id: str,
     id_: str,
     section: dict,
+    *,
+    is_container: bool = False,
+    parent_id: str | None = None,
 ) -> AvailableComponentInstance:
     """Build one ``AvailableComponentInstance``, carrying ``name:`` only when declared."""
     return AvailableComponentInstance(
         component_id=component_id,
         id=id_,
         name=str(section["name"]) if "name" in section else None,
+        is_entity_container=is_container,
+        parent_id=parent_id,
     )
 
 

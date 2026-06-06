@@ -61,6 +61,50 @@ def upsert_inline_handler(
     span = _locate_component_instance(lines, component_domain, component_id)
     if span is None:
         return None
+    return _apply_handler_upsert(lines, span, handler_key, rendered_yaml)
+
+
+def upsert_subentity_handler(
+    yaml_text: str,
+    *,
+    parent_domain: str,
+    parent_id: str,
+    sub_key: str,
+    handler_key: str,
+    rendered_yaml: str,
+) -> tuple[str, int, int, str] | None:
+    """
+    Insert or replace ``<handler_key>:`` under a nested sub-entity block.
+
+    Splices at the ``<sub_key>:`` block's child indent inside the
+    ``<parent_id>`` instance under ``<parent_domain>:``. Same return shape as
+    :func:`upsert_inline_handler`; ``None`` when the sub-block isn't found.
+    """
+    lines = yaml_text.splitlines(keepends=True)
+    span = _locate_subentity_instance(lines, parent_domain, parent_id, sub_key)
+    if span is None:
+        return None
+    return _apply_handler_upsert(lines, span, handler_key, rendered_yaml)
+
+
+def _block_end(lines: list[str], start: int, end_bound: int, indent: str) -> int:
+    """First line index after *start* whose indent is <= len(*indent*); *end_bound* if none."""
+    for idx in range(start + 1, end_bound):
+        content = lines[idx].rstrip("\n\r")
+        if not content:
+            continue
+        if len(content) - len(content.lstrip(" ")) <= len(indent):
+            return idx
+    return end_bound
+
+
+def _apply_handler_upsert(
+    lines: list[str],
+    span: tuple[int, int, str],
+    handler_key: str,
+    rendered_yaml: str,
+) -> tuple[str, int, int, str]:
+    """Splice ``<handler_key>:`` into the located *span*; the shared upsert tail."""
     instance_start, instance_end, child_indent = span
 
     # Look for an existing ``<handler_key>:`` line under this
@@ -72,18 +116,7 @@ def upsert_inline_handler(
     for idx in range(instance_start, instance_end):
         if handler_re.match(lines[idx].rstrip("\n\r")):
             handler_start = idx
-            # Walk forward to find the first sibling-indented line
-            # (or instance end).
-            for jdx in range(idx + 1, instance_end):
-                content = lines[jdx].rstrip("\n\r")
-                if not content:
-                    continue
-                leading = len(content) - len(content.lstrip(" "))
-                if leading <= len(child_indent):
-                    handler_end = jdx
-                    break
-            if handler_end is None:
-                handler_end = instance_end
+            handler_end = _block_end(lines, idx, instance_end, child_indent)
             break
 
     rendered_lines = _indent_block(rendered_yaml, child_indent)
@@ -124,23 +157,80 @@ def remove_inline_handler(
     span = _locate_component_instance(lines, component_domain, component_id)
     if span is None:
         return None
+    return _apply_handler_remove(lines, span, handler_key)
+
+
+def remove_subentity_handler(
+    yaml_text: str,
+    *,
+    parent_domain: str,
+    parent_id: str,
+    sub_key: str,
+    handler_key: str,
+) -> tuple[str, int, int] | None:
+    """Delete ``<handler_key>:`` from a nested sub-entity block (inverse of upsert)."""
+    lines = yaml_text.splitlines(keepends=True)
+    span = _locate_subentity_instance(lines, parent_domain, parent_id, sub_key)
+    if span is None:
+        return None
+    return _apply_handler_remove(lines, span, handler_key)
+
+
+def _apply_handler_remove(
+    lines: list[str],
+    span: tuple[int, int, str],
+    handler_key: str,
+) -> tuple[str, int, int] | None:
+    """Drop ``<handler_key>:`` from the located *span*; the shared remove tail."""
     instance_start, instance_end, child_indent = span
     handler_re = re.compile(rf"^{re.escape(child_indent)}{re.escape(handler_key)}:\s*(?:#.*)?$")
     for idx in range(instance_start, instance_end):
         if not handler_re.match(lines[idx].rstrip("\n\r")):
             continue
-        handler_end = instance_end
-        for jdx in range(idx + 1, instance_end):
-            content = lines[jdx].rstrip("\n\r")
-            if not content:
-                continue
-            leading = len(content) - len(content.lstrip(" "))
-            if leading <= len(child_indent):
-                handler_end = jdx
-                break
+        handler_end = _block_end(lines, idx, instance_end, child_indent)
         new_lines = [*lines[:idx], *lines[handler_end:]]
         return "".join(new_lines), idx + 1, handler_end
     return None
+
+
+def _locate_subentity_instance(
+    lines: list[str],
+    parent_domain: str,
+    parent_id: str,
+    sub_key: str,
+) -> tuple[int, int, str] | None:
+    """
+    Find the line range of a ``<sub_key>:`` block inside a parent instance.
+
+    Locates the ``<parent_id>`` instance under ``<parent_domain>:``, then the
+    ``<sub_key>:`` header among its child fields. Returns ``(start, end,
+    child_indent)`` where *start* is the header line, *end* one past the
+    sub-block's last line, and *child_indent* the leading whitespace of the
+    sub-block's own fields (where a sibling handler is spliced). ``None`` when
+    the parent or the sub-block isn't present.
+    """
+    span = _locate_component_instance(lines, parent_domain, parent_id)
+    if span is None:
+        return None
+    instance_start, instance_end, parent_child_indent = span
+    header_re = re.compile(rf"^{re.escape(parent_child_indent)}{re.escape(sub_key)}:\s*(?:#.*)?$")
+    sub_start: int | None = None
+    for idx in range(instance_start, instance_end):
+        if header_re.match(lines[idx].rstrip("\n\r")):
+            sub_start = idx
+            break
+    if sub_start is None:
+        return None
+    sub_end = _block_end(lines, sub_start, instance_end, parent_child_indent)
+    # Child indent = the first non-blank child's leading whitespace; for an
+    # empty sub-block (no fields yet) splice one indent level in.
+    sub_child_indent = parent_child_indent + ESPHOME_YAML_INDENT
+    for idx in range(sub_start + 1, sub_end):
+        content = lines[idx].rstrip("\n\r")
+        if content:
+            sub_child_indent = " " * (len(content) - len(content.lstrip(" ")))
+            break
+    return sub_start, sub_end, sub_child_indent
 
 
 def _locate_component_instance(  # noqa: C901

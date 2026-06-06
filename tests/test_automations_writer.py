@@ -18,8 +18,14 @@ from pathlib import Path
 import pytest
 
 from esphome_device_builder.controllers.automations import writing
-from esphome_device_builder.controllers.automations.parsing import parse_device_yaml
+from esphome_device_builder.controllers.automations.parsing import (
+    ComponentTarget,
+    parse_device_yaml,
+)
 from esphome_device_builder.controllers.automations.writing import (
+    _delete_subentity_on,
+    _subentity_context,
+    _upsert_subentity_on,
     render_delete,
     render_upsert,
 )
@@ -1659,3 +1665,150 @@ def test_idless_positional_index_out_of_range_is_refused() -> None:
             ),
             location=ComponentOnLocation(component_id="binary_sensor_5", trigger="on_press"),
         )
+
+
+# ---------------------------------------------------------------------------
+# Multi-entity sub-entity handlers (#1263)
+# ---------------------------------------------------------------------------
+
+
+_AHT10 = (
+    "esphome:\n  name: x\n"
+    "sensor:\n"
+    "  - platform: aht10\n"
+    "    id: aht20\n"
+    "    variant: AHT20\n"
+    "    temperature:\n"
+    "      id: aht20_temperature\n"
+    "      name: Kit Temperature\n"
+    "    humidity:\n"
+    "      id: aht20_humidity\n"
+    "      name: Kit Humidity\n"
+)
+
+
+def _value_range_tree() -> AutomationTree:
+    return AutomationTree(
+        trigger_id="sensor.on_value_range",
+        trigger_params={"above": 10, "below": 20},
+        actions=[ActionNode(action_id="light.toggle", params={"id": "led"})],
+    )
+
+
+def test_upsert_subentity_splices_under_nested_id() -> None:
+    """``on_value_range`` on a sub-sensor lands under its block, not the platform item."""
+    new_text, _diff = render_upsert(
+        _AHT10,
+        tree=_value_range_tree(),
+        location=ComponentOnLocation(component_id="aht20_temperature", trigger="on_value_range"),
+    )
+    # The handler sits between the temperature id and the humidity block — i.e.
+    # under temperature, at its child indent, never on the platform item.
+    temp_idx = new_text.index("id: aht20_temperature")
+    on_idx = new_text.index("on_value_range:")
+    hum_idx = new_text.index("id: aht20_humidity")
+    assert temp_idx < on_idx < hum_idx, "handler landed outside the temperature block"
+    lines = new_text.split("\n")
+    # The handler sits at the sub-block child indent (6 spaces), never at the
+    # platform item's field indent (4 spaces).
+    assert "      on_value_range:" in lines
+    assert "    on_value_range:" not in lines
+
+
+def test_upsert_subentity_leaves_sibling_subsensor_untouched() -> None:
+    """Adding a handler to one sub-sensor doesn't disturb the sibling sub-sensor."""
+    new_text, _diff = render_upsert(
+        _AHT10,
+        tree=_value_range_tree(),
+        location=ComponentOnLocation(component_id="aht20_temperature", trigger="on_value_range"),
+    )
+    assert "id: aht20_humidity" in new_text
+    assert "name: Kit Humidity" in new_text
+
+
+def test_round_trip_subentity_handler_is_parsed_back() -> None:
+    """A spliced sub-entity handler re-parses to the same sub-entity location."""
+    loc = ComponentOnLocation(component_id="aht20_temperature", trigger="on_value_range")
+    new_text, _diff = render_upsert(_AHT10, tree=_value_range_tree(), location=loc)
+    parsed = parse_device_yaml(new_text)
+    assert len(parsed) == 1
+    assert parsed[0].location == loc
+    assert [a.action_id for a in parsed[0].automation.actions] == ["light.toggle"]
+
+
+def test_delete_subentity_handler_round_trips_to_original() -> None:
+    """Deleting the sub-entity handler restores the byte-identical original."""
+    loc = ComponentOnLocation(component_id="aht20_temperature", trigger="on_value_range")
+    new_text, _diff = render_upsert(_AHT10, tree=_value_range_tree(), location=loc)
+    back, _ddiff = render_delete(new_text, location=loc)
+    assert back == _AHT10
+
+
+def test_two_subsensors_on_one_platform_target_independently() -> None:
+    """Handlers on temperature and humidity land in their own blocks."""
+    after_temp, _ = render_upsert(
+        _AHT10,
+        tree=_value_range_tree(),
+        location=ComponentOnLocation(component_id="aht20_temperature", trigger="on_value_range"),
+    )
+    both, _ = render_upsert(
+        after_temp,
+        tree=_value_range_tree(),
+        location=ComponentOnLocation(component_id="aht20_humidity", trigger="on_value_range"),
+    )
+    targeted = {(p.location.component_id, p.location.trigger) for p in parse_device_yaml(both)}
+    assert ("aht20_temperature", "on_value_range") in targeted
+    assert ("aht20_humidity", "on_value_range") in targeted
+
+
+_AHT10_NO_HUMIDITY = (
+    "sensor:\n  - platform: aht10\n    id: aht20\n    temperature:\n      id: aht20_temperature\n"
+)
+
+
+def test_upsert_subentity_raises_when_parent_absent() -> None:
+    """A sub-entity target whose parent isn't in the YAML can't be spliced."""
+    target = ComponentTarget(
+        domain="sensor",
+        is_sub_entity=True,
+        parent_domain="sensor",
+        parent_id="ghost",
+        sub_key="temperature",
+    )
+    loc = ComponentOnLocation(component_id="ghost_temperature", trigger="on_value_range")
+    with pytest.raises(CommandError):
+        _upsert_subentity_on(_AHT10_NO_HUMIDITY, _value_range_tree(), loc, target)
+
+
+def test_upsert_subentity_raises_when_subblock_absent() -> None:
+    """The parent exists but lacks the named sub-block — refuse, don't mis-splice."""
+    target = ComponentTarget(
+        domain="sensor",
+        is_sub_entity=True,
+        parent_domain="sensor",
+        parent_id="aht20",
+        sub_key="humidity",
+    )
+    loc = ComponentOnLocation(component_id="aht20_humidity", trigger="on_value_range")
+    with pytest.raises(CommandError):
+        _upsert_subentity_on(_AHT10_NO_HUMIDITY, _value_range_tree(), loc, target)
+
+
+def test_delete_subentity_raises_when_parent_absent() -> None:
+    """Deleting a sub-entity handler off a missing parent is a clean NOT_FOUND."""
+    target = ComponentTarget(
+        domain="sensor",
+        is_sub_entity=True,
+        parent_domain="sensor",
+        parent_id="ghost",
+        sub_key="temperature",
+    )
+    loc = ComponentOnLocation(component_id="ghost_temperature", trigger="on_value_range")
+    with pytest.raises(CommandError):
+        _delete_subentity_on(_AHT10_NO_HUMIDITY, loc, target)
+
+
+def test_subentity_context_rejects_incomplete_target() -> None:
+    """A sub-entity target missing its parent context raises rather than leaking None."""
+    with pytest.raises(CommandError):
+        _subentity_context(ComponentTarget(domain="sensor", is_sub_entity=True))

@@ -29,7 +29,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from functools import partial
 from importlib import resources
-from typing import Any
+from typing import Any, NamedTuple
 
 from ...helpers.api import CommandError
 from ...helpers.json import loads as json_loads
@@ -79,9 +79,13 @@ __all__ = [
     "_key_range",
     "_render_params",
     "_render_value",
+    "catalog_id",
+    "iter_subentities",
     "make_yaml",
     "parse_device_yaml",
+    "platform_subentity_keys",
     "resolve_component_domain",
+    "resolve_component_target",
     "singleton_component_id",
 ]
 
@@ -294,52 +298,121 @@ def singleton_component_id(section: dict, domain: str) -> str:
     return str(section.get("id") or domain)
 
 
+class ComponentTarget(NamedTuple):
+    """
+    Where a *component_id* resolves in the YAML.
+
+    A top-level instance, or a nested sub-entity carrying the parent context
+    (``parent_domain`` / ``parent_id`` / ``sub_key``) the writer splices under.
+    """
+
+    domain: str
+    is_sub_entity: bool = False
+    parent_domain: str | None = None
+    parent_id: str | None = None
+    sub_key: str | None = None
+
+
 def resolve_component_domain(yaml_text: str, component_id: str) -> str | None:
     """
     Return the top-level domain whose instance declares *component_id*.
 
-    Shares the :func:`_iter_component_instances` walk so the writer
-    attributes an id to the same domain/instance the parser did — list
-    instances on ``id`` (or the synthetic ``<domain>_<idx>``), flat
-    singletons on :func:`singleton_component_id`. Resolves any component
-    domain (not only trigger-hosting ones), so component action-list
-    fields on e.g. ``cover`` resolve too. Only declared instance ids
-    match; an action *reference* (``id:`` nested in a handler body)
-    never does. ``None`` when no instance matches or the YAML won't load.
+    Thin wrapper over :func:`resolve_component_target` returning the
+    top-level domain (the parent's for a sub-entity). ``None`` when no
+    instance matches or the YAML won't load.
+    """
+    target = resolve_component_target(yaml_text, component_id)
+    if target is None:
+        return None
+    return target.parent_domain or target.domain
+
+
+def resolve_component_target(yaml_text: str, component_id: str) -> ComponentTarget | None:
+    """
+    Resolve *component_id* to a top-level instance or a nested sub-entity.
+
+    Walks declared instance ids — list instances on ``id`` (or the synthetic
+    ``<domain>_<idx>``), flat singletons on :func:`singleton_component_id` —
+    and each instance's catalog sub-entity blocks. Only declared ids match;
+    an action *reference* nested in a handler body never does. ``None`` when
+    no instance matches or the YAML won't load.
     """
     yaml = make_yaml()
     try:
         root = yaml.load(yaml_text)
     except Exception:  # noqa: BLE001 — any load failure falls back to the catalog guess
         return None
-    for domain, _instance, comp_id in _iter_component_instances(root):
+    for _domain, _instance, comp_id, target in _iter_instance_targets(root):
         if comp_id == component_id:
-            return domain
+            return target
     return None
+
+
+def _instance_id(domain: str, instance: dict, idx: int, *, is_list: bool) -> str:
+    """Reconstruct the id the parser attributes to one instance."""
+    if is_list:
+        return str(instance.get("id") or f"{domain}_{idx}")
+    return singleton_component_id(instance, domain)
+
+
+def _iter_instance_targets(
+    root: Any,
+) -> Iterator[tuple[str, dict, str, ComponentTarget]]:
+    """
+    Yield ``(domain, instance, comp_id, target)`` for every instance + sub-entity.
+
+    The one document walk shared by :func:`_iter_component_instances` and
+    :func:`resolve_component_target` (list instances, flat singletons, nested
+    sub-entities).
+    """
+    if not isinstance(root, dict):
+        return
+    for domain, section in root.items():
+        is_list = isinstance(section, list)
+        items = section if is_list else [section] if isinstance(section, dict) else []
+        for idx, instance in enumerate(items):
+            if not isinstance(instance, dict):
+                continue
+            comp_id = _instance_id(str(domain), instance, idx, is_list=is_list)
+            yield str(domain), instance, comp_id, ComponentTarget(domain=str(domain))
+            for sub_domain, sub, sub_id, sub_key in iter_subentities(str(domain), instance):
+                yield (
+                    sub_domain,
+                    sub,
+                    sub_id,
+                    ComponentTarget(
+                        domain=sub_domain,
+                        is_sub_entity=True,
+                        parent_domain=str(domain),
+                        parent_id=comp_id,
+                        sub_key=sub_key,
+                    ),
+                )
 
 
 def _iter_component_instances(
     root: Any,
 ) -> Iterator[tuple[str, dict, str]]:
-    """
-    Yield ``(domain, instance, comp_id)`` for every configured component.
+    """Yield ``(domain, instance, comp_id)`` for every instance + sub-entity."""
+    for domain, instance, comp_id, _target in _iter_instance_targets(root):
+        yield domain, instance, comp_id
 
-    Handles list-domain instances (``switch:`` is a list) and flat
-    singleton components (``sun:`` / ``mqtt:`` are a single mapping).
-    The id matches what :func:`resolve_component_domain` reconstructs,
-    so the parser and writer attribute the same id to the same instance.
-    Shared by the inline-``on_*`` and component-action-field passes so
-    the instance-walk lives in one place.
-    """
-    if not isinstance(root, dict):
-        return
-    for domain, section in root.items():
-        if isinstance(section, list):
-            for idx, instance in enumerate(section):
-                if isinstance(instance, dict):
-                    yield str(domain), instance, str(instance.get("id") or f"{domain}_{idx}")
-        elif isinstance(section, dict):
-            yield str(domain), section, singleton_component_id(section, str(domain))
+
+def catalog_id(domain: str, platform: Any) -> str:
+    """Return the component's catalog id: ``<domain>.<platform>``, or the bare domain."""
+    return f"{domain}.{platform}" if isinstance(platform, str) and platform else domain
+
+
+def iter_subentities(
+    domain: str,
+    instance: dict,
+) -> Iterator[tuple[str, dict, str, str]]:
+    """Yield ``(platform_type, sub_instance, sub_id, sub_key)`` for ided sub-blocks."""
+    cat_id = catalog_id(domain, instance.get("platform"))
+    for sub_key, sub_domain in platform_subentity_keys(cat_id):
+        sub = instance.get(sub_key)
+        if isinstance(sub, dict) and sub.get("id") is not None:
+            yield sub_domain, sub, str(sub["id"]), sub_key
 
 
 def _parse_inline_component_triggers(root: Any) -> list[ParsedAutomation]:
@@ -353,43 +426,85 @@ def _parse_inline_component_triggers(root: Any) -> list[ParsedAutomation]:
     return out
 
 
+def _component_body_entries(catalog_id: str) -> list[Any]:
+    """
+    Return *catalog_id*'s top-level ``config_entries`` list (``[]`` when absent).
+
+    Reads the shipped component body JSON (the same the components controller
+    serves). Only ``FileNotFoundError`` is swallowed — the expected "no shipped
+    catalog entry" case; a real read error or a missing definitions package
+    (``ModuleNotFoundError``, a packaging defect that would otherwise silently
+    disable the feature process-wide) propagates instead.
+    """
+    if is_unsafe_catalog_id(catalog_id):
+        return []
+    try:
+        raw = resources.files(_COMPONENTS_PACKAGE).joinpath(f"{catalog_id}.json").read_bytes()
+    except FileNotFoundError:
+        return []
+    if not raw:  # pragma: no cover - shipped catalog bodies are never empty
+        return []
+    return json_loads(raw).get("config_entries") or []
+
+
 # Per-``<domain>.<platform>`` set of ``type: trigger`` action-list field
 # keys, read from the component bodies on first use (process cache).
 _ACTION_FIELD_INDEX: dict[str, frozenset[str]] = {}
 
 
 def _component_action_fields(catalog_id: str) -> frozenset[str]:
-    """
-    Return the ``type: trigger`` action-list field keys for *catalog_id*.
-
-    Reads the component body's top-level ``config_entries`` (the same
-    JSON the components controller serves) once per id. Empty when the
-    body is absent or carries no such field.
-    """
+    """Return the ``type: trigger`` action-list field keys for *catalog_id*."""
     cached = _ACTION_FIELD_INDEX.get(catalog_id)
-    if cached is not None:
-        return cached
-    fields: set[str] = set()
-    if not is_unsafe_catalog_id(catalog_id):
-        try:
-            raw = resources.files(_COMPONENTS_PACKAGE).joinpath(f"{catalog_id}.json").read_bytes()
-        except FileNotFoundError:
-            # Absent body — the expected "component has no shipped catalog
-            # entry" case. Only this is swallowed: a real read error or a
-            # missing definitions package (ModuleNotFoundError — a packaging
-            # defect that would otherwise silently disable the whole feature
-            # process-wide via the empty-set cache) propagates instead.
-            raw = b""
-        if raw:
-            body = json_loads(raw)
-            for entry in body.get("config_entries") or []:
-                if isinstance(entry, dict) and entry.get("type") == "trigger":
-                    key = entry.get("key")
-                    if isinstance(key, str):
-                        fields.add(key)
-    frozen = frozenset(fields)
-    _ACTION_FIELD_INDEX[catalog_id] = frozen
-    return frozen
+    if cached is None:
+        cached = frozenset(
+            entry["key"]
+            for entry in _component_body_entries(catalog_id)
+            if isinstance(entry, dict)
+            and entry.get("type") == "trigger"
+            and isinstance(entry.get("key"), str)
+        )
+        _ACTION_FIELD_INDEX[catalog_id] = cached
+    return cached
+
+
+# Per-``<domain>.<platform>`` tuple of ``(sub_key, platform_type)`` pairs for
+# the component's nested sub-entity blocks, read once per id (process cache).
+_PLATFORM_SUBENTITY_INDEX: dict[str, tuple[tuple[str, str], ...]] = {}
+
+
+def platform_subentity_keys(catalog_id: str) -> tuple[tuple[str, str], ...]:
+    """
+    Return ``(sub_key, platform_type)`` for *catalog_id*'s sub-entity blocks.
+
+    A sub-entity block is a ``type: nested`` entry with a ``platform_type`` and
+    its own ``id`` (``temperature`` on ``sensor.aht10``); plain groups
+    (``availability:``) are excluded.
+    """
+    cached = _PLATFORM_SUBENTITY_INDEX.get(catalog_id)
+    if cached is None:
+        cached = tuple(
+            (entry["key"], entry["platform_type"])
+            for entry in _component_body_entries(catalog_id)
+            if _is_subentity_block(entry)
+        )
+        _PLATFORM_SUBENTITY_INDEX[catalog_id] = cached
+    return cached
+
+
+def _is_subentity_block(entry: Any) -> bool:
+    """Return True for a nested config entry that is itself an id'd platform sub-entity."""
+    if not isinstance(entry, dict) or entry.get("type") != "nested":
+        return False
+    platform_type = entry.get("platform_type")
+    return (
+        isinstance(entry.get("key"), str)
+        and isinstance(platform_type, str)
+        and bool(platform_type)
+        and any(
+            isinstance(sub, dict) and sub.get("key") == "id"
+            for sub in entry.get("config_entries") or []
+        )
+    )
 
 
 def _parse_component_action_fields(root: Any) -> list[ParsedAutomation]:
@@ -403,13 +518,13 @@ def _parse_component_action_fields(root: Any) -> list[ParsedAutomation]:
     inline ``on_*`` handlers (``trigger_id`` is ``None`` — no trigger).
     """
     out: list[ParsedAutomation] = []
-    for domain, instance, comp_id in _iter_component_instances(root):
-        # Catalog id mirrors the sync's: ``<domain>.<platform>`` for a
-        # platform component (``cover: - platform: feedback``), the bare
-        # ``<domain>`` for a single-mapping hub (``opentherm:``).
-        platform = instance.get("platform")
-        catalog_id = f"{domain}.{platform}" if platform else domain
-        fields = _component_action_fields(catalog_id)
+    for domain, instance, comp_id, target in _iter_instance_targets(root):
+        # Action-list fields (``open_action`` …) are a top-level-component
+        # concern; the shared walk also yields sub-entities (for inline
+        # ``on_*`` parsing), so skip them here to keep the scope unchanged.
+        if target.is_sub_entity:
+            continue
+        fields = _component_action_fields(catalog_id(domain, instance.get("platform")))
         if not fields:
             continue
         comp_name = str(instance.get("name") or comp_id)

@@ -427,11 +427,18 @@ class AvailableScript(DataClassORJSONMixin):
 
 @dataclass
 class AvailableComponentInstance(DataClassORJSONMixin):
-    """A configured component instance the user can target from an action."""
+    """
+    A configured component instance the user can target from an action.
+
+    A multi-entity platform surfaces each nested entity as its own instance
+    (``parent_id`` set) plus a container instance (``is_entity_container``).
+    """
 
     component_id: str
     id: str
     name: str | None = None
+    is_entity_container: bool = False
+    parent_id: str | None = None
 
 
 @dataclass
