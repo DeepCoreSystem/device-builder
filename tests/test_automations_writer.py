@@ -20,6 +20,7 @@ import pytest
 from esphome_device_builder.controllers.automations import writing
 from esphome_device_builder.controllers.automations.parsing import (
     ComponentTarget,
+    ParsedAutomation,
     parse_device_yaml,
 )
 from esphome_device_builder.controllers.automations.writing import (
@@ -531,6 +532,72 @@ def test_delete_light_effect_removes_one_list_item() -> None:
     # ``flicker`` is gone, ``pulse`` remains.
     assert "flicker" not in new_text
     assert "pulse" in new_text
+
+
+def _effect_parse(text: str, index: int) -> ParsedAutomation:
+    """Return the parsed light-effect entry at *index*."""
+    return next(
+        p
+        for p in parse_device_yaml(text)
+        if p.location.kind == "light_effect" and p.location.index == index
+    )
+
+
+def test_upsert_light_effect_preserves_sibling_effects() -> None:
+    """Editing effects[0] keeps effects[1] in place (not a whole-block replace)."""
+    text = _load("light_effects.yaml")
+    target = _effect_parse(text, 0)
+    new_text, diff = render_upsert(text, tree=target.automation, location=target.location)
+    assert "flicker:" in new_text
+    assert "pulse" in new_text
+    # The frontend-applied diff reproduces the same document.
+    assert _apply_diff(text, diff) == new_text
+    reparsed = [p for p in parse_device_yaml(new_text) if p.location.kind == "light_effect"]
+    assert [p.location.index for p in reparsed] == [0, 1]
+
+
+def test_upsert_light_effect_appends_at_end() -> None:
+    """An index == len(effects) appends without disturbing existing entries."""
+    text = _load("light_effects.yaml")
+    target = _effect_parse(text, 0)
+    append_loc = LightEffectLocation(component_id="my_lamp", index=2)
+    new_text, _diff = render_upsert(text, tree=target.automation, location=append_loc)
+    assert new_text.count("flicker:") == 2
+    assert "pulse" in new_text
+
+
+def test_upsert_light_effect_out_of_range_raises_invalid_args() -> None:
+    """An index past the end (and not the append slot) is INVALID_ARGS."""
+    text = _load("light_effects.yaml")
+    target = _effect_parse(text, 0)
+    with pytest.raises(CommandError) as exc:
+        render_upsert(
+            text,
+            tree=target.automation,
+            location=LightEffectLocation(component_id="my_lamp", index=99),
+        )
+    assert exc.value.code == ErrorCode.INVALID_ARGS
+
+
+def test_upsert_light_effect_non_list_effects_raises_invalid_args() -> None:
+    """A present-but-non-list ``effects:`` is refused, not silently overwritten."""
+    list_text = _load("light_effects.yaml")
+    target = _effect_parse(list_text, 0)
+    mapping_text = (
+        "esphome:\n"
+        "  name: x\n"
+        "light:\n"
+        "  - platform: binary\n"
+        "    name: 'Lamp'\n"
+        "    id: my_lamp\n"
+        "    output: lamp_out\n"
+        "    effects:\n"
+        "      flicker:\n"
+        "        alpha: 0.9\n"
+    )
+    with pytest.raises(CommandError) as exc:
+        render_upsert(mapping_text, tree=target.automation, location=target.location)
+    assert exc.value.code == ErrorCode.INVALID_ARGS
 
 
 # ---------------------------------------------------------------------------
