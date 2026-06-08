@@ -277,10 +277,11 @@ def test_parse_on_value_range_float_params_are_json_serialisable() -> None:
 
 
 def test_parse_oversized_lvgl_action_falls_back_to_raw_yaml() -> None:
-    """An oversized LVGL action parses as an unknown id (raw-YAML fallback)."""
+    """An oversized LVGL action is flagged unsupported (raw-YAML fallback)."""
     parsed = parse_device_yaml(_load("lvgl_action_unsupported.yaml"))
     assert len(parsed) == 1
     assert parsed[0].error is not None
+    assert parsed[0].unsupported is True
     assert parsed[0].automation.actions == []
 
 
@@ -289,7 +290,49 @@ def test_parse_small_lvgl_action_stays_editable() -> None:
     parsed = parse_device_yaml(_load("lvgl_action_small_editable.yaml"))
     assert len(parsed) == 1
     assert parsed[0].error is None
+    assert parsed[0].unsupported is False
     assert [a.action_id for a in parsed[0].automation.actions] == ["lvgl.pause"]
+
+
+def test_parse_unknown_action_id_is_not_flagged_unsupported() -> None:
+    """A genuine typo keeps ``unsupported=False`` so the editor shows the error."""
+    yaml = (
+        "esphome:\n"
+        "  name: x\n"
+        "  on_boot:\n"
+        "    then:\n"
+        "      - not_a_real.action:\n"
+        "          foo: bar\n"
+    )
+    parsed = parse_device_yaml(yaml)
+    assert len(parsed) == 1
+    assert parsed[0].error is not None
+    assert parsed[0].unsupported is False
+
+
+def test_parse_oversized_lvgl_shorthand_is_flagged_unsupported() -> None:
+    """The single-action shorthand form also flags a known-but-unsupported action."""
+    yaml = (
+        "esphome:\n"
+        "  name: x\n"
+        "  on_boot:\n"
+        "    lvgl.label.update:\n"
+        "      id: my_label\n"
+        "      text: hello\n"
+    )
+    parsed = parse_device_yaml(yaml)
+    assert len(parsed) == 1
+    assert parsed[0].error is not None
+    assert parsed[0].unsupported is True
+    assert parsed[0].automation.actions == []
+
+
+def test_parse_unknown_action_shorthand_is_not_flagged_unsupported() -> None:
+    """A non-catalogued key in shorthand form is a trigger param, never unsupported."""
+    yaml = "esphome:\n  name: x\n  on_boot:\n    not_a_real.action:\n      foo: bar\n"
+    parsed = parse_device_yaml(yaml)
+    assert len(parsed) == 1
+    assert parsed[0].unsupported is False
 
 
 # ---------------------------------------------------------------------------

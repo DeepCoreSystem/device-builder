@@ -21,6 +21,11 @@ from ...models.api import ErrorCode
 from ...models.automations import ActionNode, AutomationTree, ConditionNode
 from . import catalog
 
+
+class UnsupportedActionError(CommandError):
+    """A known action with no structured form (oversized LVGL ``*.update``)."""
+
+
 # Action-body keys that introduce a condition gate rather than plain params.
 _CONDITION_GATE_KEYS: frozenset[str] = frozenset({"condition", "all", "any"})
 
@@ -31,7 +36,7 @@ DEFAULT_SHORTHAND_KEY = "id"
 
 def _safe_tree(
     build: Callable[[], AutomationTree], *, trigger_id: str | None
-) -> tuple[AutomationTree, str | None]:
+) -> tuple[AutomationTree, str | None, bool]:
     """
     Run *build*, isolating a per-automation decompose failure.
 
@@ -40,12 +45,17 @@ def _safe_tree(
     here contains the fault to this one entry — it comes back with an
     empty tree plus the message while its siblings parse. A document
     that won't load at all is the separate whole-file failure raised by
-    :func:`parse_device_yaml` upstream.
+    :func:`parse_device_yaml` upstream. The third tuple field flags an
+    :class:`UnsupportedActionError` — a known action with no form.
     """
     try:
-        return build(), None
+        return build(), None, False
+    except UnsupportedActionError as err:
+        empty = AutomationTree(trigger_id=trigger_id, trigger_params={}, actions=[])
+        return empty, err.message, True
     except CommandError as err:
-        return AutomationTree(trigger_id=trigger_id, trigger_params={}, actions=[]), err.message
+        empty = AutomationTree(trigger_id=trigger_id, trigger_params={}, actions=[])
+        return empty, err.message, False
 
 
 def _block_tree(trigger_params: dict[str, Any], then_body: Any) -> AutomationTree:
@@ -86,12 +96,13 @@ def _decompose_trigger_mapping(body: dict[str, Any], *, trigger_id: str | None) 
     if "then" in body:
         actions = _decompose_action_list(body["then"])
     else:
-        # Single-action shortcut: the body's keys are a mix of
-        # trigger params and known catalog action ids.
-        # ``_collect_block_params`` naively absorbed both; pull
-        # the action keys back out by catalog lookup and rebuild
-        # ``trigger_params`` without them.
-        action_body = {k: v for k, v in body.items() if catalog.action_by_id(k) is not None}
+        # Single-action shortcut: the body mixes trigger params and
+        # action ids. Pull the action keys back out and rebuild
+        # ``trigger_params`` without them. Match on ``is_known_action``,
+        # not ``action_by_id``, so a known-but-non-editable LVGL
+        # ``*.update`` reaches the UnsupportedActionError fallback
+        # instead of being mislabelled a trigger param.
+        action_body = {k: v for k, v in body.items() if catalog.is_known_action(k)}
         actions = []
         if action_body:
             actions = _decompose_action_list([action_body])
@@ -126,6 +137,9 @@ def _decompose_action(action_id: str, raw_params: Any) -> ActionNode:
     """Build one :class:`ActionNode` from a registry-shaped mapping entry."""
     action = catalog.action_by_id(action_id)
     if action is None:
+        if catalog.is_known_action(action_id):
+            msg = f"No structured editor for action {action_id!r}"
+            raise UnsupportedActionError(ErrorCode.INVALID_ARGS, msg)
         msg = f"Unknown action id: {action_id!r}"
         raise CommandError(ErrorCode.INVALID_ARGS, msg)
     children: dict[str, list[ActionNode]] = {}
