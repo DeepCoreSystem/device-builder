@@ -200,6 +200,20 @@ def test_upsert_device_on_boot_index_out_of_range_raises() -> None:
         )
 
 
+def test_indexed_upsert_wraps_device_shorthand_action_list() -> None:
+    """A 2nd on_boot handler wraps the bare action-list body, preserving actions (#1305)."""
+    text = "esphome:\n  name: x\n  on_boot:\n    - delay: 1s\n    - delay: 2s\n"
+    new_text, _diff = render_upsert(
+        text,
+        tree=AutomationTree(trigger_id="on_boot", trigger_params={}, actions=[]),
+        location=DeviceOnLocation(trigger="on_boot", index=1),
+    )
+    parsed = parse_device_yaml(new_text)
+    assert len(parsed) == 2
+    assert [a.action_id for a in parsed[0].automation.actions] == ["delay", "delay"]
+    assert parsed[1].automation.actions == []
+
+
 def test_upsert_device_on_boot_indexed_refuses_single_mapping() -> None:
     """An indexed upsert against a single-mapping on_boot refuses rather than rewriting it."""
     text = _load("device_on_boot.yaml")  # single-mapping form
@@ -228,6 +242,57 @@ def test_round_trip_inline_on_press_preserves_actions() -> None:
     assert [a.action_id for a in parsed_second[0].automation.actions] == [
         a.action_id for a in parsed_first.automation.actions
     ]
+
+
+_SHORTHAND_ON_PRESS = (
+    "esphome:\n  name: x\n"
+    "button:\n"
+    "  - platform: template\n"
+    "    name: B\n"
+    "    id: bid\n"
+    "    on_press:\n"
+    "      - switch.turn_off: relay\n"
+    '      - uart.write: "go\\r\\n"\n'
+    "      - delay: 1s\n"
+)
+
+
+def test_indexed_upsert_wraps_shorthand_action_list(tmp_path: Path) -> None:
+    """Adding a 2nd handler to a bare action list wraps it, preserving every action (#1305)."""
+    tree = AutomationTree(trigger_id="on_press", trigger_params={}, actions=[])
+    new_text, _diff = render_upsert(
+        _SHORTHAND_ON_PRESS,
+        tree=tree,
+        location=ComponentOnLocation(component_id="bid", trigger="on_press", index=1),
+    )
+    parsed = [p for p in parse_device_yaml(new_text) if p.location.component_id == "bid"]
+    assert len(parsed) == 2
+    # The original three actions land on the first handler; none clobbered.
+    assert [a.action_id for a in parsed[0].automation.actions] == [
+        "switch.turn_off",
+        "uart.write",
+        "delay",
+    ]
+    assert parsed[1].automation.actions == []
+    assert "then: []\n      - then:" not in new_text  # no then-in-then nesting
+
+
+def test_indexed_upsert_does_not_double_wrap_handler_list() -> None:
+    """An existing list of ``then:`` handlers appends without re-wrapping."""
+    text = (
+        "esphome:\n  name: x\n"
+        "button:\n"
+        "  - platform: template\n    name: B\n    id: bid\n"
+        "    on_press:\n      - then:\n          - delay: 1s\n"
+    )
+    new_text, _diff = render_upsert(
+        text,
+        tree=AutomationTree(trigger_id="on_press", trigger_params={}, actions=[]),
+        location=ComponentOnLocation(component_id="bid", trigger="on_press", index=1),
+    )
+    parsed = [p for p in parse_device_yaml(new_text) if p.location.component_id == "bid"]
+    assert len(parsed) == 2
+    assert [a.action_id for a in parsed[0].automation.actions] == ["delay"]
 
 
 def test_upsert_inline_on_press_leaves_sibling_components_untouched() -> None:

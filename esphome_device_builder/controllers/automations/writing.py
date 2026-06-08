@@ -211,6 +211,7 @@ def _upsert_device_on_entry(
         item=emit_trigger_list_item(tree),
         index=index,
         strategy=_DEVICE_STRATEGY,
+        trigger=catalog.trigger_by_id(trigger),
     )
 
 
@@ -246,6 +247,7 @@ def _upsert_component_on(
             domain=instance_domain,
             component_id=location.component_id,
             trigger_key=location.trigger,
+            trigger=trigger,
             index=location.index,
         )
     domain = trigger.applies_to[0] if trigger.applies_to else ""
