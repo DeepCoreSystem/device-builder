@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 from esphome.const import __version__ as esphome_version
@@ -11,7 +12,12 @@ from esphome.util import get_serial_ports
 
 from ...constants import __version__ as server_version
 from ...helpers.api import CommandError, api_command
-from ...helpers.secrets_state import read_secrets_yaml
+from ...helpers.secrets_state import (
+    SecretsContentError,
+    is_valid_secret_key,
+    read_secrets_yaml,
+    write_secret,
+)
 from ...helpers.storage_path import resolve_storage_path
 from ...models import ErrorCode, UserPreferences
 from .chip_detect import (
@@ -118,6 +124,37 @@ class ConfigController:
         # to string keys before sorting — non-string keys aren't
         # usable in ``!secret`` references anyway.
         return sorted(k for k in data if isinstance(k, str))
+
+    @api_command("config/set_secret")
+    async def set_secret(
+        self, *, key: str, value: str, overwrite: bool = True, **kwargs: Any
+    ) -> dict:
+        """
+        Atomically set one key in ``secrets.yaml``; return ``{created}``.
+
+        The read-modify-write runs under the shared secrets write lock so
+        concurrent secrets.yaml mutations don't clobber each other.
+        ``overwrite=False`` leaves an existing key untouched (create-if-absent).
+        """
+        if not is_valid_secret_key(key):
+            raise CommandError(ErrorCode.INVALID_ARGS, "invalid secret key")
+        if not isinstance(value, str):
+            raise CommandError(ErrorCode.INVALID_ARGS, "value must be a string")
+        if not isinstance(overwrite, bool):
+            raise CommandError(ErrorCode.INVALID_ARGS, "overwrite must be a boolean")
+        loop = asyncio.get_running_loop()
+        config_dir = self._db.settings.config_dir
+        async with self._db.secrets_write_lock:
+            try:
+                created = await loop.run_in_executor(
+                    None,
+                    partial(write_secret, config_dir, key, value, overwrite=overwrite),
+                )
+            except SecretsContentError as err:
+                raise CommandError(
+                    ErrorCode.INVALID_ARGS, f"refusing to save invalid secrets.yaml: {err}"
+                ) from err
+        return {"created": created}
 
     @api_command("config/get_info")
     async def get_info(self, *, configuration: str, **kwargs: Any) -> dict | None:
