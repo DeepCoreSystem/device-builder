@@ -1871,7 +1871,14 @@ def build_component_entry(
     introspection = introspect_component(stem if domain else top_key)
     _apply_platform_defaults(config_entries, introspection.get("platform_defaults") or {})
     _apply_platform_constraints(config_entries, introspection.get("platform_constraints") or {})
-    _apply_field_ranges(config_entries, introspection.get("field_ranges") or {})
+    field_ranges = introspection.get("field_ranges") or {}
+    if domain:
+        # Platform build: drop hub-bounded ranges that bleed onto a
+        # platform field this domain redefines unbounded (e.g. the
+        # modbus_controller item ``address``). Hub builds keep them.
+        bleed = (introspection.get("field_range_bleed_keys") or {}).get(domain, set())
+        field_ranges = {k: v for k, v in field_ranges.items() if k not in bleed}
+    _apply_field_ranges(config_entries, field_ranges)
     _apply_refined_types(config_entries, introspection.get("refined_types") or {})
     _apply_inclusive_groups(config_entries, introspection.get("inclusive_groups") or {})
     _apply_list_fields(config_entries, introspection.get("list_fields") or {})
@@ -3426,7 +3433,8 @@ def introspect_component(component_id: str) -> dict[str, Any]:
     # specific fields (``reference_voltage``, etc.). Walk the
     # platform manifests too so unit-coerced validators on those
     # fields get refined like the bus-component ones.
-    platform_manifests = _enumerate_platform_manifests(loader, component_id)
+    platform_manifests_by_domain = _enumerate_platform_manifests_by_domain(loader, component_id)
+    platform_manifests = [pm for _domain, pm in platform_manifests_by_domain]
 
     raw_auto_load = manifest.auto_load
     auto_load: list[str] = list(raw_auto_load) if isinstance(raw_auto_load, list) else []
@@ -3453,12 +3461,39 @@ def introspect_component(component_id: str) -> dict[str, Any]:
     list_fields = merge_from_platforms(_collect_list_fields)
     registry_members = merge_from_platforms(_collect_registry_members)
 
+    # A range bounded on the bare/hub manifest must not bleed onto a
+    # platform component's same-named-but-different field. ``address`` is
+    # the canonical case: the modbus_controller hub's ``cv.hex_uint8_t``
+    # device address (0–255) collides with the items' unbounded
+    # ``cv.positive_int`` register address. Flag hub-bounded keys that a
+    # platform schema redefines without bounding so platform builds can
+    # drop them (``build_component_entry``); hub builds keep them.
+    #
+    # Keyed per platform domain, not aggregated: one platform bounding a
+    # key must not spare a sibling platform that leaves the same key
+    # unbounded from shedding the hub's bound.
+    #
+    # Only an *unbounded* platform redefinition is shed (the ``not in
+    # bounded`` guard). A platform that re-bounds a shared key
+    # differently would still inherit the hub's bound, since
+    # ``merge_from_platforms`` is keep-first on the hub's field_ranges;
+    # no catalog component hits that case today.
+    hub_ranges = _collect_field_ranges(manifest)
+    field_range_bleed_keys: dict[str, set[tuple[str, ...]]] = {}
+    for domain, platform_manifest in platform_manifests_by_domain:
+        keys = _platform_field_keys([platform_manifest])
+        bounded = set(_collect_field_ranges(platform_manifest))
+        bled = {path for path in hub_ranges if path in keys and path not in bounded}
+        if bled:
+            field_range_bleed_keys[domain] = bled
+
     return {
         "multi_conf": bool(getattr(manifest, "multi_conf", False)),
         "is_target_platform": bool(getattr(manifest, "is_target_platform", False)),
         "platform_defaults": _collect_platform_defaults(manifest),
         "platform_constraints": platform_constraints,
         "field_ranges": field_ranges,
+        "field_range_bleed_keys": field_range_bleed_keys,
         "refined_types": refined_types,
         "inclusive_groups": inclusive_groups,
         "required_groups": required_groups,
@@ -3601,7 +3636,12 @@ def _enumerate_platform_manifests(loader: Any, stem: str) -> list[Any]:
     ``setdefault`` keep-first downstream picks whichever domain
     came up first).
     """
-    out: list[Any] = []
+    return [pm for _domain, pm in _enumerate_platform_manifests_by_domain(loader, stem)]
+
+
+def _enumerate_platform_manifests_by_domain(loader: Any, stem: str) -> list[tuple[str, Any]]:
+    """``(domain, manifest)`` pairs for *stem*'s platform schemas (sorted)."""
+    out: list[tuple[str, Any]] = []
     for domain in sorted(_PLATFORM_DOMAINS):
         try:
             platform_manifest = loader.get_platform(domain, stem)
@@ -3609,7 +3649,7 @@ def _enumerate_platform_manifests(loader: Any, stem: str) -> list[Any]:
             continue
         if platform_manifest is None:
             continue
-        out.append(platform_manifest)
+        out.append((domain, platform_manifest))
     return out
 
 
@@ -5231,6 +5271,17 @@ def _collect_field_ranges(
 
     _walk_schema_keys(schema, visit)
     return out
+
+
+def _platform_field_keys(platform_manifests: list[Any]) -> set[tuple[str, ...]]:
+    """Every config-var key path defined across *platform_manifests*' schemas."""
+    keys: set[tuple[str, ...]] = set()
+    for manifest in platform_manifests:
+        schema = getattr(manifest, "config_schema", None)
+        if schema is None:
+            continue
+        _walk_schema_keys(schema, lambda _k, _kn, _v, path: keys.add(path))
+    return keys
 
 
 def _apply_field_ranges(

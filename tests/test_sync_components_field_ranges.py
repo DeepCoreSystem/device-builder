@@ -38,6 +38,8 @@ from script.sync_components import (  # type: ignore[import-not-found]
     _apply_field_ranges,
     _collect_field_ranges,
     _numeric_range_bounds,
+    _platform_field_keys,
+    introspect_component,
 )
 
 
@@ -285,3 +287,71 @@ def test_collect_against_live_bluetooth_proxy_manifest() -> None:
     lower, upper = out[("connection_slots",)]
     assert lower == 1
     assert isinstance(upper, int) and 1 < upper <= 64
+
+
+def test_platform_field_keys_unions_across_platform_schemas() -> None:
+    """Every key path any platform schema defines is collected, presence-only."""
+    a = _FakeManifest({cv.Optional("address"): cv.positive_int})
+    b = _FakeManifest({cv.Optional("register_type"): cv.string})
+    assert _platform_field_keys([a, b]) == {("address",), ("register_type",)}
+
+
+def test_platform_field_keys_skips_schemaless_manifests() -> None:
+    """A platform manifest without a ``config_schema`` contributes nothing."""
+
+    class NoSchema:
+        config_schema = None
+
+    assert _platform_field_keys([NoSchema()]) == set()
+
+
+def test_modbus_address_flagged_as_platform_range_bleed() -> None:
+    """The hub's uint8 device address must not clamp the items' register address.
+
+    The ``modbus_controller`` hub bounds ``address`` to ``[0, 255]``
+    (``cv.hex_uint8_t``); the item platforms redefine ``address`` as an
+    unbounded ``cv.positive_int``. The hub bound must be flagged per item
+    platform domain so platform builds drop it instead of falsely
+    clamping the register address.
+    """
+    pytest.importorskip("esphome.components.modbus_controller")
+    bleed = introspect_component("modbus_controller")["field_range_bleed_keys"]
+    for domain in ("sensor", "binary_sensor", "number", "select", "switch", "text_sensor"):
+        assert ("address",) in bleed.get(domain, set()), domain
+
+
+def test_mpr121_platform_rebounds_are_not_flagged_as_bleed() -> None:
+    """A field the platform itself bounds (mpr121 thresholds) is kept, not flagged."""
+    pytest.importorskip("esphome.components.mpr121")
+    bleed = introspect_component("mpr121")["field_range_bleed_keys"]
+    flagged = {path for keys in bleed.values() for path in keys}
+    assert ("touch_threshold",) not in flagged
+    assert ("release_threshold",) not in flagged
+
+
+def test_per_domain_bleed_does_not_aggregate_across_platforms() -> None:
+    """A domain that leaves a key unbounded sheds the hub bound even when a sibling bounds it.
+
+    Pins the per-domain keying: aggregating ``platform_bounded`` across
+    every manifest would spare the unbounded domain just because a
+    sibling domain bounds the same key.
+    """
+    hub = _FakeManifest({cv.Optional("address"): cv.hex_uint8_t})
+    bounded = _FakeManifest({cv.Optional("address"): cv.All(cv.int_, cv.Range(min=5, max=48))})
+    unbounded = _FakeManifest({cv.Optional("address"): cv.positive_int})
+    hub_ranges = _collect_field_ranges(hub)
+    bleed: dict[str, set] = {}
+    for domain, pm in (("a", bounded), ("b", unbounded)):
+        keys = _platform_field_keys([pm])
+        pbounded = set(_collect_field_ranges(pm))
+        bled = {p for p in hub_ranges if p in keys and p not in pbounded}
+        if bled:
+            bleed[domain] = bled
+    assert ("address",) not in bleed.get("a", set())  # a bounds it -> keep
+    assert ("address",) in bleed.get("b", set())  # b unbounded -> shed
+
+
+def test_no_platform_component_has_no_range_bleed() -> None:
+    """A component with no platform manifests can't bleed (guards #426)."""
+    pytest.importorskip("esphome.components.bluetooth_proxy")
+    assert introspect_component("bluetooth_proxy")["field_range_bleed_keys"] == {}
