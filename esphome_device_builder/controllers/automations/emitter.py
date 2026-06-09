@@ -31,6 +31,7 @@ from ruamel.yaml.comments import CommentedMap, CommentedSeq, TaggedScalar
 from ruamel.yaml.scalarstring import LiteralScalarString
 from ruamel.yaml.tag import Tag
 
+from ...helpers.yaml.scalar import is_lambda_sentinel
 from ...models.automations import (
     ActionNode,
     AutomationAction,
@@ -217,11 +218,7 @@ def encode_value(value: Any) -> Any:
     tag (dropping it would turn the C++ lambda into a string literal,
     silently breaking the firmware). Nested dicts and lists recurse.
     """
-    if (
-        isinstance(value, dict)
-        and value.keys() <= {"_lambda", "_tag"}
-        and isinstance(value.get("_lambda"), str)
-    ):
+    if is_lambda_sentinel(value):
         return _encode_lambda(value["_lambda"], value.get("_tag"))
     if isinstance(value, dict):
         out = CommentedMap()
