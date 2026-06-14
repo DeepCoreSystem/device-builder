@@ -114,6 +114,7 @@ from _catalog_split import (  # noqa: E402
 from esphome_device_builder.controllers.components import (  # noqa: E402
     INTERNAL_COMPONENT_IDS as _INTERNAL_COMPONENT_IDS,
 )
+from esphome_device_builder.controllers.components import variant_to_key  # noqa: E402
 from esphome_device_builder.helpers.automation_keys import is_trigger_key  # noqa: E402
 from esphome_device_builder.models import (  # noqa: E402
     AutomationAction,
@@ -1968,6 +1969,7 @@ def build_component_entry(
     bus_constraints = _collect_bus_constraints(_get_esphome_loader(), domain, stem, top_key)
     _apply_unit_of_measurement_options(config_entries)
     _apply_board_options(component_id, config_entries)
+    _apply_logger_uart_options(component_id, config_entries)
     _promote_multi_value_keys(config_entries)
     _promote_template_controls(component_id, config_entries)
 
@@ -5151,6 +5153,53 @@ def _apply_board_options(component_id: str, entries: list[dict]) -> None:
     for entry in entries:
         if entry.get("key") == "board":
             entry["options"] = options
+            entry["allow_custom_value"] = True
+            break
+
+
+def _logger_uart_platform_options() -> dict[str, list[dict[str, str]]]:
+    """Per-variant logger ``hardware_uart`` choices from the live logger module.
+
+    A custom ``uart_selection`` validator gates the set, so the schema bundle
+    can't carry it; introspected from ``UART_SELECTION_*`` and keyed via the
+    shared ``variant_to_key`` so lookups hit. Empty when esphome's logger
+    isn't importable; other failures propagate to fail the build loudly.
+    """
+    try:
+        from esphome.components import logger as _logger
+    except ImportError:
+        _LOGGER.warning("esphome logger not importable — hardware_uart combobox skipped")
+        return {}
+    out: dict[str, list[dict[str, str]]] = {}
+
+    def add(raw_key: str, values: list[str]) -> None:
+        out[variant_to_key(raw_key)] = [{"label": v, "value": v} for v in values]
+
+    for variant, values in _logger.UART_SELECTION_ESP32.items():
+        add(variant, values)
+    for component, values in _logger.UART_SELECTION_LIBRETINY.items():
+        add(component, values)
+    add("esp8266", _logger.UART_SELECTION_ESP8266)
+    add("rp2040", _logger.UART_SELECTION_RP2040)
+    add("nrf52", _logger.UART_SELECTION_NRF52)
+    return out
+
+
+_LOGGER_UART_PLATFORM_OPTIONS: dict[str, list[dict[str, str]]] = _logger_uart_platform_options()
+
+
+def _apply_logger_uart_options(component_id: str, entries: list[dict]) -> None:
+    """Make logger ``hardware_uart`` a per-platform UART combobox.
+
+    Attaches the per-variant choices as ``platform_options`` (resolved to
+    ``options`` per target by the component controller) plus
+    ``allow_custom_value`` so the frontend renders a pick-or-type combobox.
+    """
+    if component_id != "logger" or not _LOGGER_UART_PLATFORM_OPTIONS:
+        return
+    for entry in entries:
+        if entry.get("key") == "hardware_uart":
+            entry["platform_options"] = _LOGGER_UART_PLATFORM_OPTIONS
             entry["allow_custom_value"] = True
             break
 

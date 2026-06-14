@@ -526,6 +526,69 @@ def test_resolve_platform_returns_none_for_unknown_board_id() -> None:
     assert cat._resolve_platform(None, board_id="no-such-board-zzz") is None
 
 
+def test_resolve_variant_maps_board_to_chip_key() -> None:
+    """ESP32 boards resolve to their variant key; non-ESP32 boards have none."""
+    boards_cat = BoardCatalog()
+    boards_cat.load()
+    cat = ComponentCatalog(_Container(boards=boards_cat))
+    assert cat._resolve_variant("esp32-c3-devkitm-1") == "esp32_c3"
+    assert cat._resolve_variant("generic-esp32") == "esp32"
+    assert cat._resolve_variant("nodemcuv2") is None
+    assert cat._resolve_variant("no-such-board-zzz") is None
+    assert cat._resolve_variant(None) is None
+
+
+async def test_logger_hardware_uart_resolves_per_variant() -> None:
+    """Logger ``hardware_uart`` becomes a per-variant combobox; ESP32-C3 differs from base ESP32."""
+    boards_cat = BoardCatalog()
+    cat = ComponentCatalog(_Container(boards=boards_cat))
+    # ``load()`` does blocking disk I/O; keep it off the event loop.
+    await asyncio.to_thread(boards_cat.load)
+    await asyncio.to_thread(cat.load)
+
+    async def uart_entry(board_id: str) -> ConfigEntry:
+        bodies = await cat.get_component_bodies(component_ids=["logger"], board_id=board_id)
+        return next(e for e in bodies["logger"].config_entries if e.key == "hardware_uart")
+
+    c3 = await uart_entry("esp32-c3-devkitm-1")
+    assert c3.allow_custom_value is True
+    assert [o.value for o in c3.options] == ["UART0", "UART1", "USB_CDC", "USB_SERIAL_JTAG"]
+    assert c3.default_value == "USB_SERIAL_JTAG"
+    # platform_* maps are sync-time only and must not reach the frontend.
+    assert c3.platform_options is None
+    assert c3.platform_defaults is None
+
+    base = await uart_entry("generic-esp32")
+    assert [o.value for o in base.options] == ["UART0", "UART1", "UART2"]
+    assert base.default_value == "UART0"
+
+
+async def test_variant_resolution_applies_to_remote_transmitter_default() -> None:
+    """Variant-first resolution is global: it activates non-logger variant platform_defaults.
+
+    ``remote_transmitter.rmt_symbols`` already shipped variant keys that the
+    old platform-only lookup never reached. An ESP32-C3 board now resolves to
+    48 (its variant value) instead of the base esp32 64; an S2 board keeps 64.
+    """
+    boards_cat = BoardCatalog()
+    cat = ComponentCatalog(_Container(boards=boards_cat))
+    await asyncio.to_thread(boards_cat.load)
+    await asyncio.to_thread(cat.load)
+
+    async def rmt_symbols(board_id: str) -> object:
+        bodies = await cat.get_component_bodies(
+            component_ids=["remote_transmitter"], board_id=board_id
+        )
+        entry = next(
+            e for e in bodies["remote_transmitter"].config_entries if e.key == "rmt_symbols"
+        )
+        assert entry.platform_defaults is None  # cleared before reaching the frontend
+        return entry.default_value
+
+    assert await rmt_symbols("esp32-c3-devkitm-1") == 48
+    assert await rmt_symbols("generic-esp32s2") == 64
+
+
 def test_featured_record_carries_underlying_id() -> None:
     """``_FeaturedRecord.underlying_id`` is the catalog id the body lookups go through."""
     record = _FeaturedRecord(
