@@ -661,6 +661,27 @@ _FIELD_OVERRIDES: dict[tuple[str, str], dict[str, Any]] = {
     },
 }
 
+# UART ``bus_constraints`` the schema can't express, filled into the captured
+# constraints (captured wins). Keyed by the catalog id whose "+ Add UART" detour
+# reads it. A scalar is a fixed rate; a list narrows the detour's baud combo box
+# to those choices, default-first. The fixed-baud rows are a stopgap until
+# upstream validates each rate and a re-sync captures it; CN105's choice is
+# permanent (variable by heat-pump model).
+_CURATED_BUS_CONSTRAINTS: dict[str, dict[str, dict[str, Any]]] = {
+    "climate.mitsubishi_cn105": {"uart": {"baud_rate": [2400, 9600]}},
+    "sensor.bl0940": {"uart": {"baud_rate": 4800}},
+    "sensor.pzem004t": {"uart": {"baud_rate": 9600}},
+    "sensor.senseair": {"uart": {"baud_rate": 9600}},
+    "sensor.sds011": {"uart": {"baud_rate": 9600}},
+    "sensor.sm300d2": {"uart": {"baud_rate": 9600}},
+    "rdm6300": {"uart": {"baud_rate": 9600}},
+    "fingerprint_grow": {"uart": {"baud_rate": 57600}},
+    "climate.midea": {"uart": {"baud_rate": 9600}},
+    "rf_bridge": {"uart": {"baud_rate": 19200}},
+    "light.shelly_dimmer": {"uart": {"baud_rate": 115200}},
+    "sim800l": {"uart": {"baud_rate": 9600}},
+}
+
 # Base-schema references that mark a field as a *sub-reading* of a
 # multi-sensor platform (DHT exposes ``temperature:`` / ``humidity:``;
 # debug exposes ``free:`` / ``block:`` / etc). Sub-readings are
@@ -2000,6 +2021,7 @@ def build_component_entry(
         _collect_pin_constraints(_get_esphome_loader(), domain, stem, top_key),
     )
     bus_constraints = _collect_bus_constraints(_get_esphome_loader(), domain, stem, top_key)
+    _apply_curated_bus_constraints(component_id, bus_constraints)
     _apply_unit_of_measurement_options(config_entries)
     _apply_board_options(component_id, config_entries)
     _apply_logger_uart_options(component_id, config_entries)
@@ -4939,6 +4961,19 @@ def _apply_pin_constraints(
 _BUS_FINAL_VALIDATE_HELPERS = frozenset({"i2c", "spi", "uart"})
 
 
+def _apply_curated_bus_constraints(
+    component_id: str, bus_constraints: dict[str, dict[str, Any]]
+) -> None:
+    """Fill curated constraints for *component_id*; a captured key of the same name wins."""
+    curated = _CURATED_BUS_CONSTRAINTS.get(component_id)
+    if not curated:
+        return
+    for bus, kv in curated.items():
+        target = bus_constraints.setdefault(bus, {})
+        for key, value in kv.items():
+            target.setdefault(key, value)
+
+
 def _collect_bus_constraints(
     loader: Any,
     domain: str | None,
@@ -4974,7 +5009,12 @@ def _collect_bus_constraints(
 
 @cache
 def _bus_constraints_from_source(src_file: str) -> dict[str, dict[str, Any]]:
-    """Parse ``FINAL_VALIDATE_SCHEMA = <bus>.final_validate_device_schema(...)``."""
+    """
+    Bus constraints from ``FINAL_VALIDATE_SCHEMA``'s ``final_validate_device_schema``.
+
+    Walks the assignment value so a ``cv.All(...)``-wrapped call (mitsubishi_cn105)
+    is found, not just a bare right-hand side.
+    """
     try:
         tree = ast.parse(Path(src_file).read_text(encoding="utf-8"))
     except (OSError, SyntaxError):
@@ -4987,18 +5027,18 @@ def _bus_constraints_from_source(src_file: str) -> dict[str, dict[str, Any]]:
             isinstance(t, ast.Name) and t.id == "FINAL_VALIDATE_SCHEMA" for t in node.targets
         ):
             continue
-        call = node.value
-        if not (
-            isinstance(call, ast.Call)
-            and isinstance(call.func, ast.Attribute)
-            and call.func.attr == "final_validate_device_schema"
-            and isinstance(call.func.value, ast.Name)
-            and call.func.value.id in _BUS_FINAL_VALIDATE_HELPERS
-        ):
-            continue
-        constraints = _bus_constraint_kwargs(call)
-        if constraints:
-            out[call.func.value.id] = constraints
+        for call in ast.walk(node.value):
+            if not (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "final_validate_device_schema"
+                and isinstance(call.func.value, ast.Name)
+                and call.func.value.id in _BUS_FINAL_VALIDATE_HELPERS
+            ):
+                continue
+            constraints = _bus_constraint_kwargs(call)
+            if constraints:
+                out[call.func.value.id] = constraints
     return out
 
 
