@@ -339,6 +339,9 @@ class DeviceBuilder:
         # Seed the RAM-canonical preferences (and migrate them out of the shared
         # sidecar on first run) before onboarding reads or mutates them.
         await self.config.async_load()
+        # Default pre-existing installs to the YAML experience before
+        # any onboarding command can be served.
+        await self.onboarding.migrate_preexisting_install()
         await self.devices.start()
         await self.firmware.start()
         await self.editor.start()
