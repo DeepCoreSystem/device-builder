@@ -315,6 +315,41 @@ async def test_get_boards_sorts_featured_first_generic_after_featured(
     assert ids[-1] == "m5stack-cores3"
 
 
+async def test_get_boards_sorts_wifi_first_within_generic_and_nongeneric_tiers() -> None:
+    """Pin tier order: featured, WiFi generic, generic, WiFi non-generic, non-generic."""
+    cat = BoardCatalog()
+    _seed_catalog(
+        cat,
+        [
+            _board(board_id="featured", name="Featured Board", featured=True),
+            # WiFi generic named after the plain generic; WiFi wins the
+            # tie-break despite the later name.
+            _board(
+                board_id="generic-wifi",
+                name="Generic Zzz",
+                tags=[BoardTag.WIFI],
+                is_generic=True,
+            ),
+            _board(board_id="generic-plain", name="Generic Aaa", is_generic=True),
+            # Alphabetically-first WiFi non-generic; still sorts below both
+            # generics (generics-first outranks both name and WiFi).
+            _board(board_id="nongeneric-wifi", name="Aaa Vendor", tags=[BoardTag.WIFI]),
+            _board(board_id="nongeneric-plain", name="Zzz Vendor"),
+        ],
+    )
+
+    resp = await cat.get_boards()
+    ids = [b.id for b in resp.boards]
+
+    assert ids == [
+        "featured",
+        "generic-wifi",
+        "generic-plain",
+        "nongeneric-wifi",
+        "nongeneric-plain",
+    ]
+
+
 async def test_get_boards_paginates_via_offset_and_limit(
     catalog: BoardCatalog,
 ) -> None:

@@ -29,9 +29,14 @@ _LOGGER = logging.getLogger(__name__)
 _BODY_CACHE_MAXSIZE = 128
 
 
-def _board_sort_key(board: BoardCatalogIndex) -> tuple[bool, bool, str]:
-    """Catalog display order: featured first, generics next, then by name."""
-    return (not board.featured, not board.is_generic, board.name.lower())
+def _board_sort_key(board: BoardCatalogIndex) -> tuple[bool, bool, bool, str]:
+    """Catalog display order: featured, generics, WiFi-capable within each, then by name."""
+    return (
+        not board.featured,
+        not board.is_generic,
+        BoardTag.WIFI not in board.tags,
+        board.name.lower(),
+    )
 
 
 class BoardCatalog:
@@ -77,10 +82,10 @@ class BoardCatalog:
         Get boards with optional filtering, search, and pagination.
 
         ``query`` matches the board id, name, manufacturer, description
-        and tags. Featured boards are sorted first; generic fallback
-        boards next; the rest alphabetically. Returns slim
-        :class:`BoardCatalogIndex` entries — the frontend's board
-        detail view fetches full bodies via ``boards/get_board``.
+        and tags. Sort order: featured first; generics next; WiFi-capable
+        boards ahead of non-WiFi within each group; then alphabetically.
+        Returns slim :class:`BoardCatalogIndex` entries — the frontend's
+        board detail view fetches full bodies via ``boards/get_board``.
         """
         results: list[BoardCatalogIndex] = self._boards
 
