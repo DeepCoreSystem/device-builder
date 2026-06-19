@@ -20,6 +20,8 @@ from ._generation import (
     NETWORK_PROVIDER_COMPONENT_IDS,
     _has_native_wifi,
     _infer_native_wifi,
+    board_provides_network,
+    board_requires_wifi,
     generate_device_yaml,
     generate_minimal_stub_yaml,
 )
@@ -55,6 +57,8 @@ __all__ = [
     "_has_native_wifi",
     "_infer_native_wifi",
     "_parse_inline_value",
+    "board_provides_network",
+    "board_requires_wifi",
     "compute_has_pending_changes",
     "config_has_top_level_block",
     "configuration_stem",

@@ -22,6 +22,7 @@ from ...constants import is_secrets_file
 from ...helpers.api import CommandError, api_command
 from ...helpers.build_size import BuildSizeRefreshResult
 from ...helpers.device_yaml import (
+    board_requires_wifi,
     configuration_stem,
 )
 from ...helpers.event_bus import Event
@@ -29,7 +30,9 @@ from ...helpers.secrets_state import (
     SecretsContentError,
     read_secrets_yaml,
     validate_secrets_content,
+    validate_wifi_credentials,
     wifi_secrets_defined,
+    write_wifi_secrets,
 )
 from ...helpers.storage import ShutdownCallback
 from ...models import (
@@ -509,18 +512,57 @@ class DevicesController(  # noqa: PLR0904 (grandfathered; new public methods nee
         ssid: str,
         psk: str,
     ) -> tuple[str, mutations_yaml.CreateYamlSource]:
-        # Read secrets only where the generator may emit !secret: skip
-        # file_content (user YAML as-is) and a literal ssid (inlines). The stub
-        # and a board template with no literal ssid qualify; a no-native-Wi-Fi
-        # board with no ssid also reads here but ignores the result (gating that
-        # out would need the board's Wi-Fi capability before the read).
+        """
+        Build the YAML body for ``devices/create``, resolving Wi-Fi.
+
+        Provided credentials are persisted to ``secrets.yaml`` (validated)
+        and the config emits ``!secret`` — bare credentials are never
+        written into the device YAML. A supplied *ssid* is an explicit "use
+        Wi-Fi" intent, so it keeps the ``wifi:`` block even on an
+        onboard-network board (no Ethernet auto-pull). An empty *ssid* reuses
+        whatever ``secrets.yaml`` already holds and lets a networked board
+        default to Ethernet (or a no-Wi-Fi board fall to the no-network stub).
+        """
         wifi_secrets_available = True
-        if not file_content and not (board and ssid):
+        # A supplied ssid means "this device uses Wi-Fi": keep the wifi block
+        # even on a board that would otherwise auto-pull onboard Ethernet.
+        wifi_requested = False
+        if file_content:
+            pass  # user YAML written as-is; ssid/psk ignored
+        elif ssid:
+            # Persist the user's Wi-Fi to secrets.yaml and emit !secret rather
+            # than inlining bare credentials into the device config. The write
+            # must land *before* the caller validates the generated YAML —
+            # validation runs ``esphome config``, which resolves
+            # ``!secret wifi_ssid`` against the on-disk file. A later
+            # generate/validate failure therefore leaves the secret persisted;
+            # that's benign — ``wifi_ssid`` / ``wifi_password`` is a shared,
+            # idempotent upsert (identical to ``config/set_wifi_credentials``)
+            # that the next device reuses, not per-device state.
+            try:
+                validate_wifi_credentials(ssid, psk)
+            except SecretsContentError as err:
+                raise CommandError(ErrorCode.INVALID_ARGS, str(err)) from err
+            await self._db.write_secrets_locked(
+                write_wifi_secrets, self._db.settings.config_dir, ssid, psk
+            )
+            ssid, psk = "", ""  # force the !secret path in the generator
+            wifi_requested = True
+        else:
             loop = asyncio.get_running_loop()
             secrets = await loop.run_in_executor(
                 None, read_secrets_yaml, self._db.settings.config_dir
             )
             wifi_secrets_available = wifi_secrets_defined(secrets)
+            # A Wi-Fi-only board with no secrets would generate an unflashable
+            # no-network stub (its api/ota/web_server defaults need a network).
+            # Refuse cleanly instead of letting it surface as a generator bug.
+            if not wifi_secrets_available and board is not None and board_requires_wifi(board):
+                raise CommandError(
+                    ErrorCode.INVALID_ARGS,
+                    "This board connects over Wi-Fi; provide an SSID or set "
+                    "Wi-Fi credentials first.",
+                )
         return await mutations_yaml.yaml_content_for_create(
             name,
             friendly,
@@ -529,6 +571,7 @@ class DevicesController(  # noqa: PLR0904 (grandfathered; new public methods nee
             ssid,
             psk,
             wifi_secrets_available=wifi_secrets_available,
+            wifi_requested=wifi_requested,
             catalog=self._db.components,
         )
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, ClassVar
 from unittest import mock
 
@@ -25,6 +26,8 @@ from esphome_device_builder.helpers import device_yaml
 from esphome_device_builder.helpers.device_yaml import (
     _has_native_wifi,
     _parse_inline_value,
+    board_provides_network,
+    board_requires_wifi,
     compute_has_pending_changes,
     configuration_stem,
     extract_esphome_meta_from_config,
@@ -2707,3 +2710,46 @@ async def test_every_curated_ethernet_board_generates_wired_only_config(
     assert parsed["ethernet"]["clk"] == clk
     assert parsed["ethernet"]["mdc_pin"] == "GPIO23"
     assert parsed["ethernet"]["mdio_pin"] == "GPIO18"
+
+
+def _board(
+    *,
+    featured: list[str] | None = None,
+    default: list[str] | None = None,
+    connectivity: list[str] | None = None,
+) -> Any:
+    """Build a board stub with only the network fields the helpers read."""
+    return SimpleNamespace(
+        featured_components=[SimpleNamespace(component_id=c) for c in (featured or [])],
+        default_components=[SimpleNamespace(id=c) for c in (default or [])],
+        hardware=SimpleNamespace(
+            connectivity=[SimpleNamespace(value=c) for c in (connectivity or [])]
+        ),
+    )
+
+
+def test_board_provides_network_detects_featured_ethernet() -> None:
+    assert board_provides_network(_board(featured=["ethernet"])) is True
+
+
+def test_board_provides_network_detects_bare_default_component() -> None:
+    assert board_provides_network(_board(default=["ethernet"])) is True
+
+
+def test_board_provides_network_false_for_wifi_only_board() -> None:
+    assert board_provides_network(_board(featured=["relay"], default=["status_led"])) is False
+
+
+def test_board_requires_wifi_for_wifi_only_board() -> None:
+    """Native Wi-Fi with no onboard network ⇒ Wi-Fi can't be skipped."""
+    assert board_requires_wifi(_board(connectivity=["wifi"])) is True
+
+
+def test_board_requires_wifi_false_when_board_has_onboard_ethernet() -> None:
+    """A Wi-Fi board that also has onboard Ethernet uses the wired default."""
+    assert board_requires_wifi(_board(connectivity=["wifi"], featured=["ethernet"])) is False
+
+
+def test_board_requires_wifi_false_for_non_wifi_board() -> None:
+    """No native Wi-Fi ⇒ not required (handled by the no-network / Thread path)."""
+    assert board_requires_wifi(_board(connectivity=["ethernet"], featured=["ethernet"])) is False
