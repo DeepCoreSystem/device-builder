@@ -59,11 +59,19 @@ class ApiInfoSource:
         self._wake = asyncio.Event()
         # name -> monotonic deadline before which we won't retry a fetch.
         self._cooldown: dict[str, float] = {}
+        # Device names to probe once even though they already have mac+version
+        # (post-flash version verification); cleared after one probe attempt.
+        self._force_reprobe: set[str] = set()
         # One-shot latch for the systemic WARNING; re-arms once the count of
         # distinct devices stuck failing drops back below the threshold.
         self._warned_systemic = False
         if monitor._presence is not None:
             monitor._presence.add_subscriber_callback(self._wake.set)
+
+    def request_reprobe(self, name: str) -> None:
+        """Force one probe of *name* on the next sweep, ignoring the mac+version guard."""
+        self._force_reprobe.add(name)
+        self._wake.set()
 
     async def run(self) -> None:
         # ``find_spec`` resolves without importing, so ``aioesphomeapi``
@@ -97,6 +105,7 @@ class ApiInfoSource:
         # not a fleet sweep — serialising keeps it unobtrusive.
         live = {device.name for device in self._monitor._get_devices()}
         self._cooldown = {name: t for name, t in self._cooldown.items() if name in live}
+        self._force_reprobe &= live
         # Cap probes per sweep so an mDNS-dark fleet where every probe runs
         # the full subprocess timeout doesn't churn out back-to-back
         # interpreter spawns for minutes. The overflow rolls to the next
@@ -130,25 +139,35 @@ class ApiInfoSource:
         Report whether *device* needs an API probe, ignoring cooldown.
 
         Due means: online, exposes a Native API, not owned by the mDNS source
-        (so the ``_esphomelib._tcp`` TXT records aren't arriving), still missing
-        a field, and reachable by IP.
+        (so the ``_esphomelib._tcp`` TXT records aren't arriving), reachable by
+        IP, and either still missing a field or flagged for a forced re-probe
+        (post-flash version verification, which probes even when both fields
+        are already filled).
         """
         monitor = self._monitor
         return (
             device.state is DeviceState.ONLINE
             and device.api_enabled
             and monitor.priority_for(device.name) != ReachabilitySource.MDNS
-            and not (device.mac_address and device.deployed_version)
+            and (
+                device.name in self._force_reprobe
+                or not (device.mac_address and device.deployed_version)
+            )
             and bool(self._candidate_addresses(device))
         )
 
     def _select_targets(self) -> list[Device]:
-        """Due devices that are off cooldown — the probe candidates for this sweep."""
+        """
+        Due devices that are off cooldown — the probe candidates for this sweep.
+
+        A forced re-probe ignores cooldown: it's a deliberate one-shot request.
+        """
         now = time.monotonic()
         return [
             device
             for device in self._monitor._get_devices()
-            if self._is_due(device) and self._cooldown.get(device.name, 0.0) <= now
+            if self._is_due(device)
+            and (device.name in self._force_reprobe or self._cooldown.get(device.name, 0.0) <= now)
         ]
 
     @staticmethod
@@ -169,6 +188,14 @@ class ApiInfoSource:
 
     async def _fetch(self, device: Device) -> None:
         monitor = self._monitor
+        # One-shot, consumed up front — before the dial / key-resolve
+        # early-returns below — so a device we can't even reach (no address,
+        # unresolvable Noise key) isn't force-probed every sweep, since a
+        # forced probe bypasses cooldown. The trade-off is deliberate: that
+        # device's post-flash rollback check is skipped, but it can't be
+        # API-verified anyway.
+        forced = device.name in self._force_reprobe
+        self._force_reprobe.discard(device.name)
         addresses = self._candidate_addresses(device)
         if not addresses:
             # select→fetch TOCTOU: an mDNS/ping callback emptied the address
@@ -210,6 +237,13 @@ class ApiInfoSource:
         filled_mac = monitor.apply_mac_address(device.name, info.get("mac_address", ""))
         filled_version = monitor.apply_version(device.name, info.get("esphome_version", ""))
         if filled_mac or filled_version:
+            return
+        # A forced re-probe that connected (``info`` truthy) but changed
+        # nothing confirmed the existing version — a success, not a miss, so
+        # don't cool it down. The normal path still cools down here: it was
+        # due *because* a field was missing, so "nothing newly filled" is a
+        # real miss to retry later.
+        if forced and info:
             return
         self._record_failure(device)
 
