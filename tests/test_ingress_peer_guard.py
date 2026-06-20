@@ -78,3 +78,28 @@ def test_create_app_wires_peer_guard_on_trusted_site_only(tmp_path: Path) -> Non
     assert auth_middleware not in trusted.middlewares
     assert ingress_peer_guard not in public.middlewares
     assert auth_middleware in public.middlewares
+
+
+def test_create_app_front_door_open_drops_peer_guard_but_keeps_origin_gate(
+    tmp_path: Path,
+) -> None:
+    """The front-door-open public app is LAN-reachable but keeps the origin/CSRF gate.
+
+    ``peer_guard=False`` removes the loopback/supervisor restriction the trusted
+    ingress site relies on, so a non-loopback LAN peer (the VS Code plugin) reaches
+    it. ``trusted=False`` leaves ``trusted_site`` off so the WS origin/Host gate
+    still rejects a plain cross-origin browser drive-by; ``auth_middleware`` is
+    present but a runtime no-op because the add-on configures no password (it
+    short-circuits on ``not using_password``), so legit same-origin and
+    Origin-less clients stay unauthenticated.
+    """
+    settings = DashboardSettings()
+    settings.config_dir = tmp_path
+    settings.absolute_config_dir = tmp_path.resolve()
+    db = DeviceBuilder(settings)
+
+    front_door = db.create_app(trusted=False, peer_guard=False, with_lifecycle=False)
+
+    assert ingress_peer_guard not in front_door.middlewares
+    assert auth_middleware in front_door.middlewares
+    assert front_door["trusted_site"] is False
