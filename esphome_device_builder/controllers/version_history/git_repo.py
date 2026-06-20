@@ -131,6 +131,10 @@ class GitCommandError(subprocess.CalledProcessError):
         return f"{base}: {detail}" if detail else base
 
 
+class GitIndexLockBusyError(GitCommandError):
+    """A live writer holds the ``index.lock``; the async caller should retry."""
+
+
 @dataclass(slots=True)
 class CommitInfo:
     """One commit touching a file, as surfaced to the history UI."""
@@ -452,13 +456,58 @@ class GitRepo:
     # ------------------------------------------------------------------
 
     def _run_write(self, args: list[str]) -> None:
-        """Run a checked git write, clearing a *stale* index.lock and retrying once."""
+        """
+        Run a checked git write, handling index.lock contention.
+
+        A stale lock is cleared and the write retried in place (once); a
+        fresh lock raises :class:`GitIndexLockBusyError` for the async
+        caller to back off and retry. Any other failure propagates.
+        """
+        cleared_stale = False
+        while True:
+            try:
+                self._run(args, check=True)
+            except subprocess.CalledProcessError as exc:
+                if not self._is_index_lock_error(exc):
+                    raise
+                # Clear a stale lock once and retry in place; a re-collision
+                # after that (a fresh writer grabbed it) drops to the
+                # freshness check below and becomes a retryable busy.
+                if not cleared_stale and self._clear_stale_index_lock(exc):
+                    cleared_stale = True
+                    continue
+                if not self._index_lock_is_fresh():
+                    # Stale but unclearable (an adopted repo we won't touch, or
+                    # a lock we couldn't unlink): it won't free itself, so
+                    # surface the original failure instead of spinning on it.
+                    raise
+                # A fresh lock is a live concurrent writer; tell the async
+                # caller to back off and retry.
+                raise GitIndexLockBusyError(
+                    exc.returncode, exc.cmd, output=exc.output, stderr=exc.stderr
+                ) from exc
+            else:
+                return
+
+    @staticmethod
+    def _is_index_lock_error(exc: subprocess.CalledProcessError) -> bool:
+        """Whether *exc*'s stderr blames a contended ``index.lock``."""
+        return "index.lock" in (exc.stderr or "")
+
+    def _index_lock_is_fresh(self) -> bool:
+        """Whether the index.lock is young enough that a live writer may hold it.
+
+        A vanished or unreadable lock counts as fresh (the retry resolves
+        it); one aged past :data:`_STALE_LOCK_SECONDS` won't free itself.
+        """
+        lock = self._index_lock_path()
+        if lock is None:
+            return True
         try:
-            self._run(args, check=True)
-        except subprocess.CalledProcessError as exc:
-            if not self._clear_stale_index_lock(exc):
-                raise
-            self._run(args, check=True)
+            age = time.time() - lock.stat().st_mtime
+        except OSError:
+            return True
+        return age < _STALE_LOCK_SECONDS
 
     def _clear_stale_index_lock(self, exc: subprocess.CalledProcessError) -> bool:
         """
@@ -468,7 +517,7 @@ class GitRepo:
         ``/config``) and age (:data:`_STALE_LOCK_SECONDS`), so a lock a
         live git is actively holding is never deleted out from under it.
         """
-        if not self.managed or "index.lock" not in (exc.stderr or ""):
+        if not self.managed or not self._is_index_lock_error(exc):
             return False
         lock = self._index_lock_path()
         if lock is None or not lock.exists():
