@@ -17,10 +17,7 @@ hardware:
   - bluetooth
   - wifi
 tags:
-- esp32-s3
-- wifi
 - rgb-led
-- bluetooth
 - compact
 - usb-c
 docs_url: https://esphome.io/components/esp32.html
@@ -275,25 +272,25 @@ pins:
   features:
   - pwm
   available: null
-  notes:  Solderpad on bottom
+  notes: Solderpad on bottom
 - gpio: 40
   label: GPIO40
   features:
   - pwm
   available: null
-  notes:  Solderpad on bottom
+  notes: Solderpad on bottom
 - gpio: 41
   label: GPIO41
   features:
   - pwm
   available: null
-  notes:  Solderpad on bottom
+  notes: Solderpad on bottom
 - gpio: 42
   label: GPIO42
   features:
   - pwm
   available: null
-  notes:  Solderpad on bottom
+  notes: Solderpad on bottom
 - gpio: 43
   label: GPIO43
   features:
