@@ -23,17 +23,27 @@ The YAML manifests under ``definitions/boards/<id>/manifest.yaml``
 remain the human-editable source of truth; this script is the only
 thing that writes the three artefacts.
 
+Single-board mode (``BOARD_ID``) must run against the same ESPHome the
+rest of the committed catalog was generated against
+(``esphome_schema_version`` in ``components.index.json``), since it
+rebuilds the shared index from every board; it refuses on a mismatch. A
+full sync regenerates everything from the installed ESPHome and is
+internally consistent regardless, so it does not check.
+
 Usage
 -----
 
-    python script/sync_boards.py
+    python script/sync_boards.py              # regenerate every board
+    python script/sync_boards.py BOARD_ID     # regenerate only one board
 """
 
 from __future__ import annotations
 
+import argparse
 import importlib
 import logging
 import re
+import shutil
 import sys
 from dataclasses import replace
 from operator import attrgetter
@@ -811,6 +821,21 @@ def build_catalog() -> BoardCatalogResponse:
 
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    parser = argparse.ArgumentParser(
+        description="Regenerate the board catalog JSON from the YAML manifests."
+    )
+    parser.add_argument(
+        "board",
+        nargs="?",
+        help="Board id (the folder name under esphome_device_builder/definitions/boards/) "
+        "to regenerate on its own. Omit to regenerate the whole catalog.",
+    )
+    args = parser.parse_args()
+
+    # Only single-board mode needs the match: it rebuilds the shared index from
+    # every board, so a mismatched esphome drifts the others' index entries.
+    if args.board:
+        _require_matching_esphome()
 
     # Abort the sync on the first bad manifest — partial output here
     # would silently ship a board-shaped hole to every install.
@@ -819,6 +844,10 @@ def main() -> int:
     # ``to_dict`` here already applies the omit_default Configs, so
     # body files and index entries both ship the stripped wire shape.
     full_payloads = [board.to_dict() for board in catalog.boards]
+
+    if args.board:
+        return _emit_single_board(catalog.boards, full_payloads, args.board)
+
     _emit_split_catalog(catalog.boards, full_payloads)
     _emit_featured_components_index(catalog.boards)
 
@@ -830,6 +859,45 @@ def main() -> int:
         _FEATURED_INDEX_FILE,
     )
     return 0
+
+
+def _emit_single_board(
+    boards: list[BoardCatalogEntry], full_payloads: list[dict[str, Any]], board_id: str
+) -> int:
+    """
+    Rewrite one board's body file, then refresh the index and featured map.
+
+    Only the target's ``board_bodies/<id>.json`` is rewritten; the index and
+    featured-components files are full rebuilds whose other entries are
+    byte-identical (the version guard rules out drift), so the diff stays
+    scoped to the edited board. This assumes only *board_id* was edited:
+    naming one board while another's manifest is also dirty rewrites the
+    other's index entry but not its body, which the consistency test flags.
+    """
+    idx = next((i for i, board in enumerate(boards) if board.id == board_id), None)
+    if idx is None:
+        raise SystemExit(
+            f"sync_boards: no board with id {board_id!r}; "
+            f"expected a folder name under {_DEFINITIONS_DIR / 'boards'}"
+        )
+    _emit_body_atomically(full_payloads[idx], board_id)
+    _write_index(full_payloads)
+    _emit_featured_components_index(boards)
+    _LOGGER.info("Regenerated board_bodies/%s.json + refreshed index and featured map", board_id)
+    return 0
+
+
+def _emit_body_atomically(payload: dict[str, Any], board_id: str) -> None:
+    """Write one body file via stage-then-replace so an interrupted write can't truncate it."""
+    staging = _BODIES_DIR.parent / "board_bodies.single"
+    prepare_next_bodies_dir(staging)
+    try:
+        emit_body_with_roundtrip(
+            payload, board_id, staging, BoardCatalogEntry, log_label="Board", sort_keys=True
+        )
+        (staging / f"{board_id}.json").replace(_BODIES_DIR / f"{board_id}.json")
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 def _emit_split_catalog(
@@ -853,21 +921,85 @@ def _emit_split_catalog(
             sort_keys=True,
         )
 
-    index_payload = {
-        "boards": sorted(
-            (_strip_body_fields(payload) for payload in full_payloads),
-            key=lambda p: p["id"],
-        ),
-    }
     swap_split_catalog_in(
         next_bodies=next_bodies,
         live_bodies=_BODIES_DIR,
-        index_payload=index_payload,
+        index_payload=_index_payload(full_payloads),
         live_index=_INDEX_FILE,
         index_cls=BoardCatalogIndex,
         index_entries_key="boards",
         sort_keys=True,
     )
+
+
+def _index_payload(full_payloads: list[dict[str, Any]]) -> dict[str, Any]:
+    """Build the slim index payload, stamped with the ESPHome it was generated from."""
+    return {
+        "esphome_version": _installed_esphome_version(),
+        "boards": sorted(
+            (_strip_body_fields(payload) for payload in full_payloads),
+            key=lambda p: p["id"],
+        ),
+    }
+
+
+# ESPHome betas/dev builds (``2026.7.0b1``, ``2026.7.0-dev``) share board tables
+# with their base release, so canonicalize to the base for both the stamp and
+# the guard or a beta would false-mismatch its own release.
+_ESPHOME_BASE_VERSION_RE = re.compile(r"^(\d+\.\d+\.\d+)")
+
+
+def _canonical_esphome_version(version: str) -> str:
+    """Drop a prerelease/dev suffix: ``2026.7.0b1`` -> ``2026.7.0``."""
+    match = _ESPHOME_BASE_VERSION_RE.match(version)
+    return match.group(1) if match else version
+
+
+def _installed_esphome_version() -> str:
+    from esphome.const import __version__
+
+    return _canonical_esphome_version(__version__)
+
+
+def _write_index(full_payloads: list[dict[str, Any]]) -> None:
+    """Rewrite ``boards.index.json`` only, leaving the body files untouched."""
+    index_payload = _index_payload(full_payloads)
+    for entry in index_payload["boards"]:
+        BoardCatalogIndex.from_dict(entry)
+    next_index = _INDEX_FILE.with_suffix(".json.next")
+    next_index.write_bytes(
+        orjson.dumps(index_payload, option=orjson.OPT_SORT_KEYS | orjson.OPT_APPEND_NEWLINE)
+    )
+    next_index.replace(_INDEX_FILE)
+
+
+def _require_matching_esphome() -> None:
+    """Abort unless installed ESPHome matches the ``esphome_version`` boards.index.json was built with."""
+    try:
+        expected = orjson.loads(_INDEX_FILE.read_bytes())["esphome_version"]
+    except (OSError, orjson.JSONDecodeError, KeyError):
+        raise SystemExit(
+            f"sync_boards: could not read esphome_version from {_INDEX_FILE}.\n"
+            f"To fix, regenerate the whole catalog first: python script/sync_boards.py"
+        ) from None
+    try:
+        from esphome.const import __version__ as raw_installed
+    except ImportError:
+        raise SystemExit(
+            f"sync_boards: ESPHome is not importable in this interpreter ({sys.executable}).\n"
+            f"To fix, install it into the project venv and re-run:\n"
+            f"    uv pip install 'esphome=={expected}'   # or: pip install 'esphome=={expected}'"
+        ) from None
+    installed = _canonical_esphome_version(raw_installed)
+    if installed != expected:
+        raise SystemExit(
+            f"sync_boards: single-board mode needs ESPHome {expected} (the version "
+            f"boards.index.json was generated with), but {installed} is installed.\n"
+            f"To fix, install the matching version into this venv and re-run:\n"
+            f"    uv pip install 'esphome=={expected}'   # or: pip install 'esphome=={expected}'\n"
+            f"Or regenerate the whole catalog against your installed ESPHome instead:\n"
+            f"    python script/sync_boards.py"
+        )
 
 
 def _emit_featured_components_index(boards: list[BoardCatalogEntry]) -> None:
