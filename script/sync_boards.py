@@ -24,11 +24,11 @@ remain the human-editable source of truth; this script is the only
 thing that writes the three artefacts.
 
 Single-board mode (``BOARD_ID``) must run against the same ESPHome the
-rest of the committed catalog was generated against
-(``esphome_schema_version`` in ``components.index.json``), since it
-rebuilds the shared index from every board; it refuses on a mismatch. A
-full sync regenerates everything from the installed ESPHome and is
-internally consistent regardless, so it does not check.
+rest of the committed catalog was generated against (the
+``esphome_version`` a full sync stamps into ``boards.index.json``),
+since it rebuilds the shared index from every board; it refuses on a
+mismatch. A full sync regenerates everything from the installed ESPHome
+and re-stamps that version, so it does not check.
 
 Usage
 -----
@@ -61,6 +61,7 @@ from _catalog_split import (  # noqa: E402
     prepare_next_bodies_dir,
     swap_split_catalog_in,
 )
+from _esphome_version import assert_installed_esphome  # noqa: E402
 
 from esphome_device_builder.definitions import (  # noqa: E402
     build_board_catalog_from_manifests,
@@ -982,24 +983,15 @@ def _require_matching_esphome() -> None:
             f"sync_boards: could not read esphome_version from {_INDEX_FILE}.\n"
             f"To fix, regenerate the whole catalog first: python script/sync_boards.py"
         ) from None
-    try:
-        from esphome.const import __version__ as raw_installed
-    except ImportError:
-        raise SystemExit(
-            f"sync_boards: ESPHome is not importable in this interpreter ({sys.executable}).\n"
-            f"To fix, install it into the project venv and re-run:\n"
-            f"    uv pip install 'esphome=={expected}'   # or: pip install 'esphome=={expected}'"
-        ) from None
-    installed = _canonical_esphome_version(raw_installed)
-    if installed != expected:
-        raise SystemExit(
-            f"sync_boards: single-board mode needs ESPHome {expected} (the version "
-            f"boards.index.json was generated with), but {installed} is installed.\n"
-            f"To fix, install the matching version into this venv and re-run:\n"
-            f"    uv pip install 'esphome=={expected}'   # or: pip install 'esphome=={expected}'\n"
-            f"Or regenerate the whole catalog against your installed ESPHome instead:\n"
-            f"    python script/sync_boards.py"
-        )
+    assert_installed_esphome(
+        expected,
+        what="sync_boards single-board mode",
+        normalize=_canonical_esphome_version,
+        alt_fix=(
+            "Or regenerate the whole catalog against your installed ESPHome instead:\n"
+            "    python script/sync_boards.py"
+        ),
+    )
 
 
 def _emit_featured_components_index(boards: list[BoardCatalogEntry]) -> None:
