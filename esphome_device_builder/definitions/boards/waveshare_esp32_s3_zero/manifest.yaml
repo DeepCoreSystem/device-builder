@@ -23,6 +23,10 @@ tags:
 docs_url: https://esphome.io/components/esp32.html
 product_url: https://www.waveshare.com/wiki/ESP32-S3-Zero
 pins:
+- gpio: 0
+  label: GPIO0
+  available: false
+  notes: Directly connected to the Boot button
 - gpio: 1
   label: GPIO1
   features:
@@ -189,8 +193,11 @@ pins:
   notes: Not available
 - gpio: 21
   label: GPIO21
-  available: false
-  notes: Not available
+  features:
+  - rgb_led
+  available: null
+  occupied_by: WS2812 RGB LED
+  notes: Onboard RGB LED (WS2812)
 - gpio: 22
   label: GPIO22
   available: false
@@ -245,52 +252,53 @@ pins:
 - gpio: 33
   label: GPIO33
   available: false
+  notes: Not available — No external connection
 - gpio: 34
   label: GPIO34
   available: false
-  notes: Not available
+  notes: Not available — No external connection
 - gpio: 35
   label: GPIO35
   available: false
-  notes: Not available
+  notes: Not available — No external connection
 - gpio: 36
   label: GPIO36
   available: false
-  notes: Not available
+  notes: Not available — No external connection
 - gpio: 37
   label: GPIO37
   available: false
-  notes: Not available
+  notes: Not available — No external connection
 - gpio: 38
   label: GPIO38
   features:
-  - rgb_led
-  occupied_by: WS2812 RGB LED
-  notes: Onboard RGB LED (WS2812) — Solderpad on bottom
+  - pwm
+  available: null
+  notes: Solderpad on bottom
 - gpio: 39
   label: GPIO39
   features:
   - pwm
   available: null
-  notes: Solderpad on bottom
+  notes: Solderpad on bottom — Default JTAG debugging TCK pin
 - gpio: 40
   label: GPIO40
   features:
   - pwm
   available: null
-  notes: Solderpad on bottom
+  notes: Solderpad on bottom — Default JTAG debugging TDO pin
 - gpio: 41
   label: GPIO41
   features:
   - pwm
   available: null
-  notes: Solderpad on bottom
+  notes: Solderpad on bottom — Default JTAG debugging TDI pin
 - gpio: 42
   label: GPIO42
   features:
   - pwm
   available: null
-  notes: Solderpad on bottom
+  notes: Solderpad on bottom — Default JTAG debugging TMS pin
 - gpio: 43
   label: GPIO43
   features:
@@ -315,11 +323,12 @@ pins:
 - gpio: 46
   label: GPIO46
   available: false
-  notes: Not available
+  notes: Not available — No external connection
 - gpio: 47
   label: GPIO47
   available: false
+  notes:  Not available — No external connection
 - gpio: 48
   label: GPIO48
   available: false
-  notes: Not available
+  notes: Not available — No external connection
