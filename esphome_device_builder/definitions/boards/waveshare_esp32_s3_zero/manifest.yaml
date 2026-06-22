@@ -150,17 +150,16 @@ pins:
   label: GPIO15
   features:
   - adc
-  - touch
   - pwm
   available: null
-  notes: ADC2_CH4, Touch12, UART1 RX — Solderpad on top
+  notes: ADC2_CH4, XTAL_32K_P — Solderpad on top
 - gpio: 16
   label: GPIO16
   features:
   - adc
   - pwm
   available: null
-  notes: ADC2_CH5, UART1 TX — Solderpad on top
+  notes: ADC2_CH5, XTAL_32K_N — Solderpad on top
 - gpio: 17
   label: GPIO17
   features:
