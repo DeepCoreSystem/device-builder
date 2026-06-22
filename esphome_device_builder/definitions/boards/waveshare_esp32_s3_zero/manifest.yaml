@@ -326,7 +326,7 @@ pins:
 - gpio: 47
   label: GPIO47
   available: false
-  notes:  Not available — No external connection
+  notes: Not available — No external connection
 - gpio: 48
   label: GPIO48
   available: false
