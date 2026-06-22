@@ -44,7 +44,7 @@ _LOGGER = logging.getLogger(__name__)
 # Resolved from the package itself so it survives this module being moved.
 _OWN_SOURCE_ROOT = Path(esphome_device_builder.__file__).resolve().parent
 
-# Errors a commit attempt raises for genuine git / environment reasons
+# Errors a git invocation raises for genuine git / environment reasons
 # (a failed ``git`` invocation, the binary vanishing) as opposed to a
 # programming bug. Callers swallow these as best-effort and let anything
 # else propagate so real bugs surface instead of being mislabelled.
@@ -191,9 +191,30 @@ class GitRepo:
                     self.config_dir,
                     toplevel,
                 )
+            elif (self.config_dir / ".git").exists():
+                # rev-parse found no work tree yet ``.git`` is present: an
+                # unusable git dir (a submodule / worktree pointer whose
+                # target isn't mounted, or a corrupt repo). Re-initialising
+                # over it fails, so disable rather than crash on init.
+                _LOGGER.info(
+                    "Config dir %s has a .git git can't use here (likely a submodule or "
+                    "worktree whose git dir isn't mounted); version history disabled",
+                    self.config_dir,
+                )
+                self._disable()
+                return
             self._init_repo()
-        except OSError as exc:
+        except GIT_COMMIT_ERRORS as exc:
+            # Never leave the repo half-enabled: a failure after the adopt
+            # branch set ``enabled`` would otherwise strand it.
+            self._disable()
             _LOGGER.warning("Could not set up version-history git repo: %s", exc)
+
+    def _disable(self) -> None:
+        """Reset to the fully-disabled state (no work tree adopted or created)."""
+        self.enabled = False
+        self.toplevel = None
+        self.managed = False
 
     def _discover_toplevel(self) -> Path | None:
         """Return the enclosing work tree's root, or ``None`` if there is none."""

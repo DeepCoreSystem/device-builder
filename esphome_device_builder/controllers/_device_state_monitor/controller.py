@@ -19,12 +19,14 @@ and so stays out of the precedence ledger.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 from esphome.zeroconf import AsyncEsphomeZeroconf
 
+from ...helpers.async_ import create_eager_task
 from ...helpers.subscriber_presence import SubscriberPresence
 from ...models import AdoptableDevice, Device, DeviceState, ReachabilitySource
 from .._reachability_tracker import MdnsCacheInfo, ReachabilityTracker
@@ -41,6 +43,8 @@ from .ping import PingSource
 from .shared import _SOURCE_PRIORITY
 
 _LOGGER = logging.getLogger(__name__)
+# Cap on draining the ping / API-info / resolve tasks at shutdown.
+_STOP_DRAIN_TIMEOUT = 2.0
 # Padding added to the cached A record's TTL when the drawer's
 # refresh loop schedules its next probe. Sleeping ``ttl + this``
 # guarantees ``async_resolve_host`` falls through its cache short-
@@ -161,12 +165,15 @@ class DeviceStateMonitor(TaskControllerBase):  # noqa: PLR0904 (grandfathered; n
         self._api_info_task.add_done_callback(self._log_api_info_task_exit)
 
     async def stop(self) -> None:
-        """Tear down the browser and cancel the ping + API info loops."""
+        """Tear down the browser and drain the ping + API-info + resolve tasks (bounded)."""
+        drain: list[asyncio.Task[Any]] = []
         if self._ping_task is not None:
             self._ping_task.cancel()
+            drain.append(self._ping_task)
             self._ping_task = None
         if self._api_info_task is not None:
             self._api_info_task.cancel()
+            drain.append(self._api_info_task)
             self._api_info_task = None
         # Cancel the browser FIRST so it stops dispatching new mDNS
         # callbacks; otherwise the drain below would race against
@@ -174,10 +181,18 @@ class DeviceStateMonitor(TaskControllerBase):  # noqa: PLR0904 (grandfathered; n
         await self._mdns.cancel_browser()
         for task in self._tasks:
             task.cancel()
-        if self._tasks:
-            await asyncio.gather(*self._tasks, return_exceptions=True)
-            self._tasks.clear()
-        await self._mdns.close_zeroconf()
+        drain.extend(self._tasks)
+        self._tasks.clear()
+        # Close zeroconf eagerly so 5353 frees now, overlapping the task drain.
+        close = create_eager_task(self._mdns.close_zeroconf())
+        if drain:
+            # Drain bounded here so the cancelled tasks don't leak to aiohttp's
+            # unbounded terminal sweep.
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(
+                    asyncio.gather(*drain, return_exceptions=True), _STOP_DRAIN_TIMEOUT
+                )
+        await close
 
     @staticmethod
     def _log_api_info_task_exit(task: asyncio.Task) -> None:
