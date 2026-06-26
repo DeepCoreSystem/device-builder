@@ -21,6 +21,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import orjson
 import pytest
 
 from esphome_device_builder import definitions
@@ -33,12 +34,14 @@ from esphome_device_builder.controllers.devices.helpers import (
 )
 from esphome_device_builder.definitions import (
     _coerce_field_preset,
+    _load_component_multi_conf,
     _load_featured_bundle,
     _load_featured_component,
 )
 from esphome_device_builder.helpers.api import CommandError
 from esphome_device_builder.helpers.yaml import generate_component_yaml
 from esphome_device_builder.models import ComponentCategory, ErrorCode
+from esphome_device_builder.models.boards import FeaturedComponent
 from esphome_device_builder.models.common import FieldPreset
 
 # Pin every test in the file onto the same xdist worker as the rest of
@@ -101,6 +104,74 @@ def test_load_featured_component_image_url_passthrough() -> None:
         {"id": "dht", "component_id": "sensor.dht", "image_url": url}, Path("boards/x")
     )
     assert fc.image_url == url
+
+
+def test_load_featured_component_multi_conf_from_map() -> None:
+    """multi_conf comes from the component map; an unknown id defaults True."""
+    m = {"sensor.dht": True, "ethernet": False}
+
+    def load(cid: str) -> FeaturedComponent:
+        return _load_featured_component({"id": "x", "component_id": cid}, Path("boards/x"), m)
+
+    assert load("sensor.dht").multi_conf is True
+    assert load("ethernet").multi_conf is False
+    assert load("nonexistent").multi_conf is True
+
+
+def test_load_component_multi_conf_reads_index() -> None:
+    """The real component index resolves to a non-empty id->multi_conf map."""
+    m = _load_component_multi_conf()
+    assert m["ethernet"] is False
+    assert m["switch.gpio"] is True
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        None,  # missing file
+        b"not json",
+        b'{"no_components_key": 1}',
+        b'{"components": "not-a-list"}',  # iterates to chars -> TypeError
+        b'{"components": [{"multi_conf": true}]}',  # entry missing id -> KeyError
+    ],
+)
+def test_load_component_multi_conf_logs_and_empties_on_bad_index(
+    content: bytes | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A missing or malformed index yields an empty map with a logged error."""
+    path = tmp_path / "missing.json"
+    if content is not None:
+        path.write_bytes(content)
+    monkeypatch.setattr(definitions, "_COMPONENTS_INDEX_JSON", path)
+    with caplog.at_level("ERROR"):
+        assert _load_component_multi_conf() == {}
+    assert "components.index.json" in caplog.text
+
+
+def test_load_component_multi_conf_strict_reraises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Strict (sync/CI) builds surface a corrupt index instead of degrading."""
+    monkeypatch.setattr(definitions, "_COMPONENTS_INDEX_JSON", Path("/no/such/index.json"))
+    with pytest.raises(FileNotFoundError):
+        _load_component_multi_conf(strict=True)
+
+
+def test_committed_featured_multi_conf_matches_catalog() -> None:
+    """Each committed featured entry's multi_conf mirrors its underlying component."""
+    defs = Path(definitions.__file__).parent
+    comps = {
+        c["id"]: c.get("multi_conf", False)
+        for c in orjson.loads((defs / "components.index.json").read_bytes())["components"]
+    }
+    featured = orjson.loads((defs / "featured_components.index.json").read_bytes())
+    for board, entries in featured.items():
+        for e in entries:
+            expected = comps.get(e["component_id"], True)
+            assert e.get("multi_conf", True) == expected, (
+                f"{board}/{e['id']}: multi_conf {e.get('multi_conf', True)} != {expected}"
+            )
 
 
 def test_load_featured_bundle() -> None:
