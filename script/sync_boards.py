@@ -78,6 +78,7 @@ from esphome_device_builder.models import (  # noqa: E402
     PinFeature,
     Platform,
 )
+from esphome_device_builder.models.boards import BOARD_PIN_KEYS  # noqa: E402
 
 _LOGGER = logging.getLogger("sync_boards")
 
@@ -811,14 +812,6 @@ def _component_pin_keys(component_id: str) -> frozenset[str]:
     return frozenset(e["key"] for e in body.get("config_entries", []) if e.get("type") == "pin")
 
 
-# Sub-keys of an internal-GPIO pin mapping. A pin dict carrying any other key
-# references an I/O expander hub (``{number: 3, pcf8574: hub}``) — an
-# expander-local channel, not a board GPIO, so it must not be recorded.
-_BOARD_PIN_KEYS = frozenset(
-    {"number", "mode", "inverted", "ignore_strapping_warning", "allow_other_uses", "drive_strength"}
-)
-
-
 def _canonical_gpio(value: Any) -> int | None:
     """Reduce a manifest pin value (bare int, ``GPIOn`` string, ``{number: n}``) to a board GPIO int."""
     if isinstance(value, bool):
@@ -827,7 +820,7 @@ def _canonical_gpio(value: Any) -> int | None:
         return value
     if isinstance(value, dict):
         # Skip expander pins: a hub-referencing key means a channel, not a GPIO.
-        if value.keys() - _BOARD_PIN_KEYS:
+        if value.keys() - BOARD_PIN_KEYS:
             return None
         return _canonical_gpio(value.get("number"))
     if isinstance(value, str):
@@ -835,6 +828,27 @@ def _canonical_gpio(value: Any) -> int | None:
         if match:
             return int(match.group(1))
     return None
+
+
+def _canonical_pin(value: Any) -> int | str | None:
+    """
+    Reduce a manifest pin value to its occupied-pin identity.
+
+    A board GPIO is an int; a pin on an I/O expander
+    (``{number: 0, pcf8574: hub}``) is the namespaced token
+    ``"<provider>:<hub_id>:<channel>"`` so an expander channel never aliases a
+    board GPIO of the same number. ``None`` when no concrete pin is present.
+    """
+    if isinstance(value, dict):
+        expander = value.keys() - BOARD_PIN_KEYS
+        if expander:
+            provider = sorted(expander)[0]
+            hub = value.get(provider)
+            channel = value.get("number")
+            if isinstance(hub, str) and isinstance(channel, int) and not isinstance(channel, bool):
+                return f"{provider}:{hub}:{channel}"
+            return None
+    return _canonical_gpio(value)
 
 
 def _stamp_featured_locked_pins(boards: list[BoardCatalogEntry]) -> None:
@@ -846,9 +860,9 @@ def _stamp_featured_locked_pins(boards: list[BoardCatalogEntry]) -> None:
                 continue
             for key, preset in fc.fields.items():
                 if key in pin_keys and preset.locked:
-                    gpio = _canonical_gpio(preset.value)
-                    if gpio is not None:
-                        fc.locked_pins[key] = gpio
+                    pin = _canonical_pin(preset.value)
+                    if pin is not None:
+                        fc.locked_pins[key] = pin
 
 
 def build_catalog() -> BoardCatalogResponse:
