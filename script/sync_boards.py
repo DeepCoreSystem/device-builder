@@ -46,6 +46,7 @@ import re
 import shutil
 import sys
 from dataclasses import replace
+from functools import cache
 from operator import attrgetter
 from pathlib import Path
 from typing import Any
@@ -84,6 +85,7 @@ _DEFINITIONS_DIR = _REPO_ROOT / "esphome_device_builder" / "definitions"
 _INDEX_FILE = _DEFINITIONS_DIR / "boards.index.json"
 _BODIES_DIR = _DEFINITIONS_DIR / "board_bodies"
 _FEATURED_INDEX_FILE = _DEFINITIONS_DIR / "featured_components.index.json"
+_COMPONENTS_DIR = _DEFINITIONS_DIR / "components"
 
 # Fields stripped from the slim index entry — they belong on the
 # per-board body file only.
@@ -798,6 +800,57 @@ def _augment_rmii_data_pins(boards: list[BoardCatalogEntry]) -> None:
         board.pins = list(merged.values())
 
 
+@cache
+def _component_pin_keys(component_id: str) -> frozenset[str]:
+    """Top-level config_entry keys of ``type: pin`` for *component_id* (empty if unknown)."""
+    path = _COMPONENTS_DIR / f"{component_id}.json"
+    try:
+        body = orjson.loads(path.read_bytes())
+    except (OSError, ValueError):
+        return frozenset()
+    return frozenset(e["key"] for e in body.get("config_entries", []) if e.get("type") == "pin")
+
+
+# Sub-keys of an internal-GPIO pin mapping. A pin dict carrying any other key
+# references an I/O expander hub (``{number: 3, pcf8574: hub}``) — an
+# expander-local channel, not a board GPIO, so it must not be recorded.
+_BOARD_PIN_KEYS = frozenset(
+    {"number", "mode", "inverted", "ignore_strapping_warning", "allow_other_uses", "drive_strength"}
+)
+
+
+def _canonical_gpio(value: Any) -> int | None:
+    """Reduce a manifest pin value (bare int, ``GPIOn`` string, ``{number: n}``) to a board GPIO int."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, dict):
+        # Skip expander pins: a hub-referencing key means a channel, not a GPIO.
+        if value.keys() - _BOARD_PIN_KEYS:
+            return None
+        return _canonical_gpio(value.get("number"))
+    if isinstance(value, str):
+        match = re.match(r"^\s*(?:GPIO)?(\d+)\s*$", value, re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _stamp_featured_locked_pins(boards: list[BoardCatalogEntry]) -> None:
+    """Fill each featured component's ``locked_pins`` from the underlying PIN schema."""
+    for board in boards:
+        for fc in board.featured_components:
+            pin_keys = _component_pin_keys(fc.component_id)
+            if not pin_keys:
+                continue
+            for key, preset in fc.fields.items():
+                if key in pin_keys and preset.locked:
+                    gpio = _canonical_gpio(preset.value)
+                    if gpio is not None:
+                        fc.locked_pins[key] = gpio
+
+
 def build_catalog() -> BoardCatalogResponse:
     """
     Build the catalog as emitted: manifests + ESPHome-derived per-platform pins.
@@ -816,6 +869,7 @@ def build_catalog() -> BoardCatalogResponse:
     _augment_esp8266_boards(catalog.boards)
     _augment_nrf52_boards(catalog.boards)
     _augment_rmii_data_pins(catalog.boards)
+    _stamp_featured_locked_pins(catalog.boards)
     catalog.boards.sort(key=attrgetter("id"))
     return catalog
 
