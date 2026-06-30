@@ -908,6 +908,17 @@ esp8266:
     assert parse_platform_from_yaml(yaml_content) == ("esp8266", "nodemcuv2", "")
 
 
+def test_parse_platform_recognizes_renamed_rp2_key() -> None:
+    """The renamed ``rp2:`` top-level block is detected as a platform."""
+    yaml_content = """
+rp2:
+  board: rpipico
+"""
+    platform, pio_board, _ = parse_platform_from_yaml(yaml_content)
+    assert platform == "rp2"
+    assert pio_board == "rpipico"
+
+
 # ----------------------------------------------------------------------
 # detect_platform_from_yaml — scan platform-detection
 # ----------------------------------------------------------------------
@@ -2215,6 +2226,29 @@ def test_load_device_uses_storage_core_platform_over_yaml(tmp_path: Path) -> Non
             "core_platform": "rp2040",
             "esp_platform": "RP2040",
             "target_platform": "RP2040",
+        },
+    )
+
+    device = load_device_from_storage(yaml_path)
+
+    assert device.target_platform == "rp2040"
+
+
+@pytest.mark.usefixtures("_redirect_ext_storage")
+def test_load_device_folds_renamed_rp2_core_platform_to_rp2040(tmp_path: Path) -> None:
+    """A newer esphome's ``core_platform == "rp2"`` folds to the rp2040 catalog key."""
+    yaml_path = tmp_path / "pico.yaml"
+    yaml_path.write_text(
+        "esphome:\n  name: pico\nrp2:\n  board: rpipico\n",
+        encoding="utf-8",
+    )
+    write_storage_json(
+        tmp_path,
+        "pico.yaml",
+        overrides={
+            "core_platform": "rp2",
+            "esp_platform": "RP2",
+            "target_platform": "RP2",
         },
     )
 
