@@ -826,6 +826,21 @@ def _component_pin_keys(component_id: str) -> frozenset[str]:
 
 
 @cache
+def _component_reference_keys(component_id: str) -> frozenset[str]:
+    """Config-entry keys (any depth) that cross-reference another component by id."""
+    keys: set[str] = set()
+
+    def _walk(entries: list[dict[str, Any]] | None) -> None:
+        for entry in entries or []:
+            if entry.get("references_component") and entry.get("key"):
+                keys.add(entry["key"])
+            _walk(entry.get("config_entries"))
+
+    _walk(_component_body(component_id).get("config_entries"))
+    return frozenset(keys)
+
+
+@cache
 def _component_pin_paths(component_id: str) -> tuple[tuple[str, ...], ...]:
     """Config-entry paths of every ``type: pin`` field for *component_id*, nested pins included."""
     paths: list[tuple[str, ...]] = []
@@ -909,6 +924,67 @@ def _stamp_featured_locked_pins(boards: list[BoardCatalogEntry]) -> None:
                 pin = _canonical_pin(_locked_pin_value(fc, pin_path))
                 if pin is not None:
                     fc.locked_pins[".".join(pin_path)] = pin
+
+
+def _stamp_featured_requires(boards: list[BoardCatalogEntry]) -> None:
+    """
+    Fill each featured component's ``requires`` from cross-references to siblings.
+
+    A featured field whose value equals a *sibling* featured component's emitted
+    id (its ``id`` preset) is a prerequisite — an ``rtttl`` ``output:`` pointing
+    at a sibling ``output.ledc``, a sensor ``i2c_id:`` at its bus. That sibling
+    must be added first or the config references an undefined id. Inferred ids
+    union with hand-authored ``requires`` and are flattened transitively, since
+    the frontend resolves only a component's direct list.
+    """
+    for board in boards:
+        direct = _direct_featured_requires(board.featured_components)
+        for fc in board.featured_components:
+            fc.requires = _flatten_requires(fc.id, direct)
+
+
+def _direct_featured_requires(
+    components: list[FeaturedComponent],
+) -> dict[str, list[str]]:
+    """Direct prereqs per featured id: hand-authored first, then inferred sibling references."""
+    by_emitted_id: dict[str, str] = {}
+    for fc in components:
+        preset = fc.fields.get("id")
+        if preset is not None and isinstance(preset.value, str):
+            by_emitted_id.setdefault(preset.value, fc.id)
+    direct: dict[str, list[str]] = {}
+    for fc in components:
+        deps = list(fc.requires)
+        # Only a genuine cross-reference field (``output``, ``i2c_id``, a light's
+        # colour channels) points at a sibling; a free-text field whose value
+        # happens to match an id (a ``name``) must not infer a dependency.
+        reference_keys = _component_reference_keys(fc.component_id)
+        for key, preset in fc.fields.items():
+            if key not in reference_keys or not isinstance(preset.value, str):
+                continue
+            target = by_emitted_id.get(preset.value)
+            if target is not None and target != fc.id and target not in deps:
+                deps.append(target)
+        direct[fc.id] = deps
+    return direct
+
+
+def _flatten_requires(local_id: str, direct: dict[str, list[str]]) -> list[str]:
+    """Transitive prereq closure of *local_id*, deps ordered before dependents (cycle-safe)."""
+    ordered: list[str] = []
+    seen: set[str] = set()
+
+    def visit(node: str, stack: frozenset[str]) -> None:
+        for dep in direct.get(node, ()):
+            if dep in stack:  # cycle guard
+                continue
+            visit(dep, stack | {node})
+            if dep not in seen:
+                seen.add(dep)
+                ordered.append(dep)
+
+    visit(local_id, frozenset({local_id}))
+    return ordered
 
 
 _ALL_RECOMMENDED_BUNDLE_ID = "all_recommended"
@@ -1023,6 +1099,7 @@ def build_catalog() -> BoardCatalogResponse:
     _augment_nrf52_boards(catalog.boards)
     _augment_rmii_data_pins(catalog.boards)
     _stamp_featured_locked_pins(catalog.boards)
+    _stamp_featured_requires(catalog.boards)
     _consolidate_full_setup_bundles(catalog.boards)
     catalog.boards.sort(key=attrgetter("id"))
     return catalog
