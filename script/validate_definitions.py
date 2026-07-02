@@ -547,9 +547,20 @@ def _validate_field_preset(
                 continue
             if is_imported:
                 # Imported boards have synthesized pin entries with no
-                # features filled in — skip the intersection check.
-                # Pin-declared check above still runs.
+                # features filled in and every pin available: false — skip
+                # the intersection and reserved-lock checks, which only
+                # carry signal on hand-authored pin maps. Pin-declared
+                # check above still runs.
                 continue
+            if raw is value and pin.get("available") is False and not locked:
+                # The editor disables reserved-pin options unless the board's
+                # locked_pins rescues them, and locked_pins is stamped only
+                # from locked presets — an unlocked preset on a reserved pin
+                # renders as an empty Pin field.
+                errors.append(
+                    f"{path}.fields.{fkey}: GPIO {gpio} is reserved "
+                    "(available: false) but the preset is not locked"
+                )
             pin_features = set(pin.get("features") or [])
             missing = required_features - pin_features
             if missing:
