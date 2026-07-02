@@ -14,11 +14,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ...helpers.api import CommandError, api_command
+from ...helpers.async_ import drain_tasks
 from ...models import ErrorCode, EventType
 from .git_repo import GIT_COMMIT_ERRORS, GitIndexLockBusyError, GitRepo
 
@@ -78,6 +78,9 @@ class VersionHistoryController:
         # Consecutive-failure tracking for the degraded signal.
         self._consecutive_failures = 0
         self._degraded = False
+        # ``version_history_enabled`` mirror; gates writes only (reads/restore
+        # key on the repo being present). Seeded at start, live via set_auto_commit.
+        self._auto_commit_enabled = True
 
     @property
     def enabled(self) -> bool:
@@ -95,12 +98,43 @@ class VersionHistoryController:
         return self._degraded
 
     async def start(self) -> None:
-        """Probe for git, adopt / init the repo, and watch for disk changes."""
+        """
+        Probe for git and watch for disk changes, honouring the preference.
+
+        Opted in: adopt or init the repo and subscribe. Opted out: discover an
+        existing repo read-only so its history stays readable, but create
+        nothing and never commit.
+        """
+        assert self._db.config is not None  # type narrowing — loaded before start()
+        self._auto_commit_enabled = self._db.config.prefs.snapshot().version_history_enabled
+        if not self._auto_commit_enabled:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self._repo.discover_existing)
+            if self._repo.enabled:
+                _LOGGER.info(
+                    "Version history read-only (auto-commit off; git work tree: %s)",
+                    self._repo.toplevel,
+                )
+            else:
+                _LOGGER.info("Version history disabled by preference")
+            return
+        await self._activate()
+
+    async def _activate(self) -> None:
+        """
+        Adopt or init the repo and (re)subscribe to external-edit events.
+
+        Always runs ``discover_or_init`` so enabling upgrades a read-only
+        discover (from an opted-out start) into a writable adopt; idempotent
+        across a re-enable, which finds the repo already set up.
+        """
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._repo.discover_or_init)
         if not self._repo.enabled:
             return
         _LOGGER.info("Version history active (git work tree: %s)", self._repo.toplevel)
+        # Reached with no listeners attached (start runs once; a re-enable
+        # clears them first), so this never double-subscribes.
         # Catch-all for edits made outside the dashboard. DEVICE_YAML_UPDATED
         # fires only when the scanner detects a YAML change on disk (mtime/
         # size/inode), so runtime mDNS / ping ticks and metadata reloads
@@ -109,23 +143,52 @@ class VersionHistoryController:
         for event_type in _EXTERNAL_MESSAGE:
             self._unsubs.append(self._db.bus.add_listener(event_type, self._on_disk_change))
 
+    async def set_auto_commit(self, *, enabled: bool) -> None:
+        """
+        Apply a live ``version_history_enabled`` change.
+
+        Off→on activates the repo lazily; on→off stops watching and drops
+        any queued commit, leaving an existing repo intact for reads. The
+        mirror is restored if activation / teardown raises, so it can't drift
+        from the persisted preference (which its caller rolls back in turn).
+        """
+        if enabled == self._auto_commit_enabled:
+            return
+        self._auto_commit_enabled = enabled
+        try:
+            if enabled:
+                await self._activate()
+            else:
+                self._pending.clear()
+                await self._teardown()
+        except Exception:
+            self._auto_commit_enabled = not enabled
+            raise
+
     async def stop(self) -> None:
         """
         Detach listeners, cancel the debounce timer, and flush what's queued.
 
-        The final drain commits an edit caught in the debounce window
+        The final flush commits an edit caught in the debounce window
         rather than dropping it on shutdown.
+        """
+        await self._teardown()
+        await self._flush_pending()
+
+    async def _teardown(self) -> None:
+        """Detach the external-edit listeners and drain the debounced flush task.
+
+        Shared by ``stop`` and the disable path of ``set_auto_commit``;
+        the queue is the only thing they treat differently (flush vs drop),
+        so it stays with the callers.
         """
         for unsub in self._unsubs:
             unsub()
         self._unsubs.clear()
         task = self._flush_task
         self._flush_task = None
-        if task is not None and not task.done():
-            task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
-        await self._flush_pending()
+        if task is not None:
+            await drain_tasks((task,), log_exceptions=True)
 
     async def commit(self, paths: list[Path], message: str) -> str | None:
         """
@@ -134,7 +197,7 @@ class VersionHistoryController:
         ``None`` means nothing changed (or disabled); a genuine git
         failure **raises** so callers can tell the two apart.
         """
-        if not self._repo.enabled or not paths:
+        if not self._repo.enabled or not self._auto_commit_enabled or not paths:
             return None
         async with self._lock:
             backoff = _LOCK_RETRY_BACKOFF
