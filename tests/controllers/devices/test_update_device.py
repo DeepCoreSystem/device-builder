@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from unittest.mock import MagicMock
 
 from esphome_device_builder.controllers.config import (
     get_device_metadata,
@@ -192,3 +193,27 @@ async def test_update_device_persists_via_executor(
     # The atomic-replace landed a real JSON file on disk.
     sidecar = tmp_path / ".device-builder.json"
     assert sidecar.exists()
+
+
+def test_set_queued_update_updates_and_persists(make_controller, tmp_path):
+    """Flipping the queued flag updates memory, disk, and the frontend."""
+    controller = make_controller(config_dir=tmp_path)
+    dev = make_device("kitchen")
+    dev.queued_update = False
+    controller._scanner.devices = [dev]
+    controller._metadata_store = MagicMock()
+    controller._fire_device_updated = MagicMock()
+
+    assert controller.set_queued_update("kitchen.yaml") is True
+
+    assert dev.queued_update is True
+    controller._metadata_store.update.assert_called_once_with("kitchen.yaml", queued_update=True)
+    controller._fire_device_updated.assert_called_once_with(dev)
+
+
+def test_set_queued_update_handles_unknown_configuration(make_controller, tmp_path):
+    """An unknown configuration is a no-op False, not an error."""
+    controller = make_controller(config_dir=tmp_path)
+    controller._scanner.devices = []
+
+    assert controller.set_queued_update("missing.yaml") is False

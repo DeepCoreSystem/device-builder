@@ -22,9 +22,13 @@ from typing import TYPE_CHECKING, Any
 from ...helpers.api import CommandError, api_command
 from ...helpers.async_ import create_eager_task, drain_tasks, run_in_executor
 from ...helpers.device_yaml import configuration_filename
+from ...helpers.event_bus import Event
 from ...models import (
     LOCAL_JOB_BUILD_SOURCE,
+    OTA_PORT,
+    DeviceState,
     ErrorCode,
+    EventType,
     FirmwareJob,
     JobBuildSource,
     JobStatus,
@@ -81,10 +85,78 @@ class FirmwareController:  # noqa: PLR0904 (grandfathered; new public methods ne
         # overwrite fresher state on disk).
         self._persist_lock = asyncio.Lock()
 
+        self._unsub_device_wake = self.bus.add_listener(
+            EventType.DEVICE_STATE_CHANGED, self._handle_device_wake
+        )
+        # Rides the bus (not the lane runner) so pool-dispatched remote
+        # compiles arm the queued update too.
+        self._unsub_job_completed = self.bus.add_listener(
+            EventType.JOB_COMPLETED, self._handle_job_completed
+        )
+
+    def stop(self) -> None:
+        """Tear down bus subscriptions registered in __init__."""
+        self._unsub_device_wake()
+        self._unsub_job_completed()
+
     @property
     def bus(self) -> EventBus:
         """The event bus for lifecycle / output events — read-only shorthand for ``_db.bus``."""
         return self._db.bus
+
+    def _disarm_all_queued_updates(self) -> None:
+        """Clear every armed device — a global wipe leaves nothing to flash.
+
+        Without this, a still-armed device would OTA-fail on every wake.
+        """
+        if self._db.devices is None:
+            return
+        for device in self._db.devices.get_devices():
+            if device.queued_update:
+                self._db.devices.clear_queued_update(device.configuration)
+
+    def _dispatch_queued_upload(self, configuration: str) -> None:
+        """Queue the deferred OTA flash for *configuration*.
+
+        The job is created synchronously so a flapping device's second
+        wake sees it in ``active_jobs()`` before the async enqueue runs —
+        the window that let a flap dispatch a superseding second OTA.
+        *configuration* comes from our own device events, so the WS
+        boundary/port validation ``upload()`` performs is tautological.
+        """
+        job = self._create_job(configuration, JobType.UPLOAD, port=OTA_PORT)
+        self._db.create_background_task(self._enqueue(job))
+
+    def _device_for_configuration(self, configuration: str) -> Any | None:
+        """Resolve a Device by its configuration filename."""
+        if self._db.devices is None:
+            return None
+
+        return self._db.devices.get_by_configuration(configuration)
+
+    def _handle_device_wake(self, event: Event) -> None:
+        """Trigger a device's queued update when it comes online.
+
+        ``Device.queued_update`` is the single arm state — no
+        controller-side set to go stale when a rename moves the
+        configuration filename. The active-flash check is the flap
+        guard: a wake bouncing mid-flash must not supersede the
+        upload that's already running.
+        """
+        if event.data["state"] != DeviceState.ONLINE.value:
+            return
+
+        config = event.data["configuration"]
+        device = self._device_for_configuration(config)
+        if not device or not device.queued_update:
+            return
+        if any(
+            job.is_network_flash and job.configuration == config for job in self.state.active_jobs()
+        ):
+            return
+
+        _LOGGER.info("Device %s woke up. Triggering queued offline update.", config)
+        self._dispatch_queued_upload(config)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -176,7 +248,24 @@ class FirmwareController:  # noqa: PLR0904 (grandfathered; new public methods ne
 
     @api_command("firmware/clean")
     async def clean(self, *, configuration: str, **kwargs: Any) -> FirmwareJob:
+        # Disarm a queued update — the wipe leaves nothing to flash, and a
+        # still-armed device would OTA-fail on every wake.
+        if self._db.devices is not None:
+            self._db.devices.clear_queued_update(configuration)
         return await clean_mod.clean(self, configuration=configuration)
+
+    @api_command("firmware/clear_queued_update")
+    async def clear_queued_update(self, *, configuration: str, **kwargs: Any) -> None:
+        """Manually clear the queued_update flag for a device."""
+        await self._validate_configuration_boundary(configuration)
+
+        devices = self._db.devices
+        device = self._device_for_configuration(configuration)
+        if devices is None or not device or not device.queued_update:
+            return
+
+        devices.clear_queued_update(configuration)
+        _LOGGER.info("Queued update cleared for device %s", configuration)
 
     @api_command("firmware/reset_build_env")
     async def reset_build_env(self, **kwargs: Any) -> FirmwareJob:
@@ -193,6 +282,7 @@ class FirmwareController:  # noqa: PLR0904 (grandfathered; new public methods ne
         Cancels every other in-flight job first so the wipe can't race a live
         compile or upload running concurrently on either lane.
         """
+        self._disarm_all_queued_updates()
         job = self._create_job("", JobType.RESET_BUILD_ENV)
         # The global sweep re-raises on a state-out-of-sync RuntimeError; roll the
         # just-created RESET job back so the orphan can't wedge the upload lane
@@ -209,7 +299,7 @@ class FirmwareController:  # noqa: PLR0904 (grandfathered; new public methods ne
         self,
         *,
         configuration: str,
-        port: str = "OTA",
+        port: str = OTA_PORT,
         force_local: bool = False,
         **kwargs: Any,
     ) -> FirmwareJob:
@@ -225,6 +315,17 @@ class FirmwareController:  # noqa: PLR0904 (grandfathered; new public methods ne
         """
         _validate_port(port)
         await self._validate_configuration_boundary(configuration)
+
+        if port == OTA_PORT:
+            device = self._device_for_configuration(configuration)
+            # Gated ONLY on OFFLINE, avoiding UNKNOWN startup states
+            if device and device.state == DeviceState.OFFLINE:
+                _LOGGER.info("Device %s is offline. Queuing compile-only job.", configuration)
+                build_source = self._resolve_install_source(force_local=force_local)
+                job = self._create_job(configuration, JobType.COMPILE, build_source=build_source)
+                job.is_deferred_install = True
+                return await self._enqueue(job)
+
         build_source = self._resolve_install_source(force_local=force_local)
         # Install is a compile + a dependent local upload. The compile (local
         # or dispatched to a receiver) materialises the binary locally; the
@@ -302,7 +403,7 @@ class FirmwareController:  # noqa: PLR0904 (grandfathered; new public methods ne
 
     @api_command("firmware/install_bulk")
     async def install_bulk(
-        self, *, configurations: list[str], port: str = "OTA", **kwargs: Any
+        self, *, configurations: list[str], port: str = OTA_PORT, **kwargs: Any
     ) -> list[FirmwareJob]:
         return await bulk.install_bulk(self, configurations=configurations, port=port)
 
@@ -411,6 +512,58 @@ class FirmwareController:  # noqa: PLR0904 (grandfathered; new public methods ne
 
     async def _execute_job(self, job: FirmwareJob, lane: Lane) -> None:
         await runner.execute_job(self, job, lane)
+
+    def _handle_job_completed(self, event: Event) -> None:
+        job = event.data["job"]
+        self._handle_deferred_compile_completion(job)
+        self._handle_ota_upload_completion(job)
+
+    def _handle_deferred_compile_completion(self, job: FirmwareJob) -> None:
+        """After a deferred-install COMPILE finishes, upload now or arm for later.
+
+        Only a successfully-completed COMPILE queued via the offline-install
+        path (``is_deferred_install``) does anything here — a plain compile,
+        or one that failed, has nothing to act on.
+        """
+        if not job.is_deferred_compile_success:
+            return
+
+        devices = self._db.devices
+        if not devices:
+            return
+
+        device = self._device_for_configuration(job.configuration)
+        if not device:
+            return
+
+        # Arm first on every path — a failed immediate OTA must find the flag
+        # set so the device stays armed for its next wake. Anything short of
+        # confirmed ONLINE (OFFLINE, or the narrow UNKNOWN window from a
+        # scanner rebuild with previous=None) just waits for that wake.
+        devices.set_queued_update(job.configuration)
+        if device.state == DeviceState.ONLINE:
+            _LOGGER.info(
+                "Device %s is online after deferred compile. Triggering upload now.",
+                job.configuration,
+            )
+            self._dispatch_queued_upload(job.configuration)
+
+    def _handle_ota_upload_completion(self, job: FirmwareJob) -> None:
+        """Disarm a queued update once its OTA delivery lands.
+
+        A failed / cancelled attempt never reaches the JOB_COMPLETED
+        listener, so the flag stays set and the device stays armed for
+        its next wake.
+        """
+        devices = self._db.devices
+        if devices is None or not job.is_completed_ota_upload:
+            return
+
+        device = self._device_for_configuration(job.configuration)
+        if not device or not device.queued_update:
+            return
+
+        devices.clear_queued_update(job.configuration)
 
     async def _execute_remote_job(self, job: FirmwareJob) -> None:
         await runner.execute_remote_job(self, job)

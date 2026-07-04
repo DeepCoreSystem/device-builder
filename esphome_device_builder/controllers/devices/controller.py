@@ -37,6 +37,7 @@ from ...helpers.secrets_state import (
 )
 from ...helpers.storage import ShutdownCallback
 from ...models import (
+    OTA_PORT,
     AddComponentResponse,
     Device,
     DeviceEventData,
@@ -339,9 +340,34 @@ class DevicesController(  # noqa: PLR0904 (grandfathered; new public methods nee
 
     def get_ota_address_cache_args(self, configuration: str, port: str | None) -> list[str]:
         """Return cache args when ``port == "OTA"`` (or ``None`` for always-OTA flows)."""
-        if port is not None and port != "OTA":
+        if port is not None and port != OTA_PORT:
             return []
         return self.get_address_cache_args(configuration)
+
+    def set_queued_update(self, configuration: str) -> bool:
+        """Arm *configuration*'s queued update; True when the flag flipped."""
+        return self._set_queued_update(configuration, is_queued=True)
+
+    def clear_queued_update(self, configuration: str) -> bool:
+        """Disarm *configuration*'s queued update; True when the flag flipped."""
+        return self._set_queued_update(configuration, is_queued=False)
+
+    def _set_queued_update(self, configuration: str, *, is_queued: bool) -> bool:
+        """Set a device's queued-update flag; persist + fire on change.
+
+        Keyed on *configuration* — the unique per-device key — not the
+        ``esphome.name`` fan-out the monitor's broadcast-driven fields
+        use: a queued install is per-config, and only the compiled
+        config should ever be armed. Not monitor-mediated for the same
+        reason — no broadcast ever carries this flag.
+        """
+        device = self._scanner.get_by_configuration(configuration)
+        if device is None or device.queued_update == is_queued:
+            return False
+        device.queued_update = is_queued
+        self._metadata_store.update(device.configuration, queued_update=is_queued)
+        self._fire_device_updated(device)
+        return True
 
     # ------------------------------------------------------------------
     # API commands — listing
