@@ -14,8 +14,9 @@ from esphome.storage_json import StorageJSON
 from ...models import Device, DeviceState
 from ...models.boards import normalize_platform
 from ..mac_addresses import derive_interface_macs
-from ..storage_path import resolve_storage_path
+from ..storage_path import resolve_compiled_config_path, resolve_storage_path
 from ._parsing import (
+    _CONF_ALLOW_PARTITION_ACCESS,
     _extract_resolved_substitutions,
     _is_valid_esphome_name,
     _pick_meta,
@@ -25,6 +26,7 @@ from ._parsing import (
     extract_directly_referenced_integrations,
     extract_esphome_meta_from_config,
     extract_logger_baud_rate,
+    extract_ota_partition_access,
     get_api_encryption_block,
     parse_esphome_meta,
     yaml_has_api_encryption,
@@ -362,6 +364,18 @@ def load_device_from_storage(
         build_size_bytes=build_size_bytes,
         labels=list(labels),
         logger_baud_rate=logger_baud_rate,
+        # Gates the install dialog's OTA bootloader-update action; esp32-only
+        # (the esphome schema rejects the flag elsewhere). Union of two
+        # signals: the in-process resolved YAML (immediate on edit) and the
+        # last compile's validated-config cache — which catches a flag pulled
+        # in via remote packages / Jinja the in-process loader can't resolve
+        # (same gap the ``api_enabled`` union closes via
+        # ``loaded_integrations``; this flag has no StorageJSON field).
+        ota_partition_access=target_platform == "esp32"
+        and (
+            extract_ota_partition_access(resolved_config)
+            or compiled_config_has_ota_partition_access(filename)
+        ),
     )
 
 
@@ -495,3 +509,35 @@ def load_device_yaml(path: Path) -> dict | None:
     # return so the public ``dict | None`` signature is honest
     # without forcing every caller to re-narrow on receive.
     return cast("dict[Any, Any] | None", config)
+
+
+def compiled_config_has_ota_partition_access(configuration: str) -> bool:
+    """
+    Report whether the last compile's validated-config cache enables partition access.
+
+    ``<data_dir>/storage/<basename>.validated.yaml`` is written by every
+    esphome compile with substitutions, packages (including remote ones
+    the in-process loader can't fetch), and secrets fully resolved. The
+    raw-text scan short-circuits the full parse for the common no-flag
+    case — the cache is the whole resolved config, materially larger than
+    the source YAML, and this runs per device reload. ``clear_secrets=False``
+    mirrors ``esphome.compiled_config``: the read must not wipe the
+    process-wide secrets registry mid-scan.
+    """
+    path = resolve_compiled_config_path(configuration)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    if _CONF_ALLOW_PARTITION_ACCESS not in text:
+        return False
+    try:
+        config = yaml_util.load_yaml(path, clear_secrets=False)
+    except EsphomeError as err:
+        # Reached only after the raw-text scan matched, so a cache esphome
+        # itself wrote won't parse — log it or the vanished dialog option is
+        # undiagnosable. Class only: yaml error marks can quote lines from
+        # the secrets-bearing cache.
+        _LOGGER.debug("Validated-config cache %s did not parse (%s)", path, type(err).__name__)
+        return False
+    return isinstance(config, dict) and extract_ota_partition_access(config)

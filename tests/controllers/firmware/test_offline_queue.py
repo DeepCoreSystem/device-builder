@@ -8,8 +8,16 @@ import pytest
 from esphome_device_builder.controllers.devices.controller import DevicesController
 from esphome_device_builder.controllers.firmware._state import FirmwareState
 from esphome_device_builder.controllers.firmware.controller import FirmwareController
+from esphome_device_builder.helpers.api import CommandError
 from esphome_device_builder.helpers.event_bus import Event
-from esphome_device_builder.models import DeviceState, EventType, FirmwareJob, JobStatus, JobType
+from esphome_device_builder.models import (
+    DeviceState,
+    ErrorCode,
+    EventType,
+    FirmwareJob,
+    JobStatus,
+    JobType,
+)
 
 
 def _job(
@@ -87,6 +95,38 @@ async def test_install_queues_deferred_compile_for_offline_device(
         called_job = mock_enqueue.call_args[0][0]
         assert called_job.job_type == JobType.COMPILE
         assert called_job.is_deferred_install is True
+
+
+@pytest.mark.asyncio
+async def test_install_bootloader_refuses_offline_device(
+    firmware_controller: FirmwareController,
+    mock_device: MagicMock,
+) -> None:
+    """A bootloader install never defers — the wake dispatch flashes the app, not the bootloader."""
+    mock_device.state = DeviceState.OFFLINE
+
+    with pytest.raises(CommandError) as err:
+        await firmware_controller.install(configuration="test_device.yaml", bootloader=True)
+
+    assert err.value.code == ErrorCode.INVALID_ARGS
+    assert not firmware_controller.state.jobs
+
+
+@pytest.mark.asyncio
+async def test_install_bootloader_refuses_offline_device_with_explicit_target(
+    firmware_controller: FirmwareController,
+    mock_device: MagicMock,
+) -> None:
+    """An explicit IP target doesn't bypass the OFFLINE bootloader rejection."""
+    mock_device.state = DeviceState.OFFLINE
+
+    with pytest.raises(CommandError) as err:
+        await firmware_controller.install(
+            configuration="test_device.yaml", port="192.168.1.5", bootloader=True
+        )
+
+    assert err.value.code == ErrorCode.INVALID_ARGS
+    assert not firmware_controller.state.jobs
 
 
 @pytest.mark.asyncio
