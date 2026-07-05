@@ -2082,6 +2082,37 @@ def test_desktop_version_reads_and_sanitizes_env(
     assert settings.desktop_version == ""
 
 
+def test_desktop_bin_and_update_capable_read_env(
+    make_settings: MakeSettingsFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``desktop_bin`` reads the CLI path; ``desktop_update_capable`` tracks it."""
+    settings = make_settings()
+    monkeypatch.delenv("ESPHOME_DESKTOP_BIN", raising=False)
+    assert settings.desktop_bin == ""
+    assert settings.desktop_update_capable is False
+
+    # Real bundle paths (with spaces) are fine.
+    monkeypatch.setenv(
+        "ESPHOME_DESKTOP_BIN",
+        "  /Applications/ESPHome Device Builder.app/Contents/MacOS/esphome-desktop  ",
+    )
+    assert (
+        settings.desktop_bin
+        == "/Applications/ESPHome Device Builder.app/Contents/MacOS/esphome-desktop"
+    )
+    assert settings.desktop_update_capable is True
+
+    # Blank, control-char (log-injection vector), and absurdly long values all
+    # degrade to "" so desktop_update_capable can't be flipped by junk.
+    monkeypatch.setenv("ESPHOME_DESKTOP_BIN", "   ")
+    assert settings.desktop_bin == ""
+    assert settings.desktop_update_capable is False
+    monkeypatch.setenv("ESPHOME_DESKTOP_BIN", "/bin/esphome\ndesktop")
+    assert settings.desktop_bin == ""
+    monkeypatch.setenv("ESPHOME_DESKTOP_BIN", "/" + "a" * 4096)
+    assert settings.desktop_bin == ""
+
+
 def test_metadata_transaction_persists_without_fcntl(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

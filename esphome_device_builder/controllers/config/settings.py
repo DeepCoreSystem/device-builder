@@ -34,6 +34,11 @@ _DASHBOARD_SENTINEL_FILE = "___DASHBOARD_SENTINEL___.yaml"
 # is treated as unset rather than rendered in the footer.
 _MAX_DESKTOP_VERSION_LEN = 64
 
+# Upper bound on the ESPHome Desktop CLI path; generous enough for real bundle
+# paths but rejects an absurd env value. A value past this (or non-printable) is
+# treated as unset so `desktop_update_capable` stays false.
+_MAX_DESKTOP_BIN_LEN = 4096
+
 
 @dataclass
 class DashboardSettings:
@@ -271,6 +276,33 @@ class DashboardSettings:
         if not raw or len(raw) > _MAX_DESKTOP_VERSION_LEN or not raw.isprintable():
             return ""
         return raw
+
+    @property
+    def desktop_bin(self) -> str:
+        """Path to the ESPHome Desktop ``esphome-desktop`` CLI, from the env.
+
+        Only ESPHome Desktop 0.14.0+ exports ``ESPHOME_DESKTOP_BIN``; older
+        apps set ``ESPHOME_DESKTOP_VERSION`` but not this, so an empty value
+        means "no update `api` available" even when ``desktop_version`` is set.
+
+        Sanitized like ``desktop_version``: a blank, non-printable (control
+        chars / newlines, which would also be a log-injection vector), or
+        absurdly long value is treated as unset.
+        """
+        raw = os.getenv("ESPHOME_DESKTOP_BIN", "").strip()
+        if not raw or len(raw) > _MAX_DESKTOP_BIN_LEN or not raw.isprintable():
+            return ""
+        return raw
+
+    @property
+    def desktop_update_capable(self) -> bool:
+        """Whether the desktop app exposes its update ``api`` (0.14.0+).
+
+        Derived from ``desktop_bin`` presence, not ``desktop_version``, so the
+        "Check for updates" UI stays hidden on older desktop apps that predate
+        the CLI.
+        """
+        return bool(self.desktop_bin)
 
     @property
     def front_door_open(self) -> bool:
