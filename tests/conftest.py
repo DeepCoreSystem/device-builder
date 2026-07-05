@@ -674,6 +674,30 @@ def make_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> MakeSettin
 
 
 # ---------------------------------------------------------------------------
+# MagicMock ``DeviceBuilder`` for /ws handshake tests
+# ---------------------------------------------------------------------------
+
+
+def make_ws_device_builder(
+    *,
+    using_password: bool = False,
+    on_ha_addon: bool = False,
+    trusted_domains: list[str] | None = None,
+    desktop_version: str = "",
+) -> MagicMock:
+    """MagicMock ``DeviceBuilder`` carrying the settings the /ws handshake reads."""
+    settings = MagicMock()
+    settings.using_password = using_password
+    settings.port = 6052
+    settings.on_ha_addon = on_ha_addon
+    settings.trusted_domains = [] if trusted_domains is None else trusted_domains
+    settings.desktop_version = desktop_version
+    device_builder = MagicMock()
+    device_builder.settings = settings
+    return device_builder
+
+
+# ---------------------------------------------------------------------------
 # Hermetic ``DeviceBuilder.start()`` — stubs network / subprocess surfaces
 # so any test that wants a fully-wired DeviceBuilder (lifecycle smoke,
 # mDNS-advertise wiring, command-registry walks) doesn't depend on a
