@@ -65,6 +65,12 @@ class JobType(StrEnum):
     RENAME = "rename"
 
 
+# Job types that compile firmware from source (INSTALL is a fused compile +
+# flash; UPLOAD only flashes an existing binary), so the config hash changes
+# and a version-mismatched remote build must provision the offloader's esphome.
+COMPILING_JOB_TYPES: frozenset[JobType] = frozenset({JobType.COMPILE, JobType.INSTALL})
+
+
 class JobSource(StrEnum):
     """
     Where a :class:`FirmwareJob`'s bytes come from.
@@ -87,6 +93,20 @@ class JobSource(StrEnum):
     LOCAL = "local"
     REMOTE = "remote"
     REMOTE_PENDING = "remote_pending"
+
+
+class JobFailureReason(StrEnum):
+    """Machine-readable failure category set alongside a FAILED terminal.
+
+    Distinct from :attr:`FirmwareJob.error`, the human-readable message.
+    ``NONE`` is an ordinary failure (compile error, bad YAML, …) the offloader
+    surfaces as-is; ``PROVISION`` means a receiver couldn't provision the target
+    esphome, which the offloader treats as retryable and rebuilds locally. New
+    retryable-vs-terminal categories get their own member here.
+    """
+
+    NONE = ""
+    PROVISION = "provision"
 
 
 @dataclass(frozen=True, slots=True)
@@ -278,6 +298,16 @@ class FirmwareJob(DashboardModel):
     # pairing hadn't yet completed a peer-link session (the
     # pairing field populates on every session-open).
     source_esphome_version: str = ""
+    # Receiver-side: the offloader's esphome version off the
+    # SUBMIT_JOB header. When set and it differs from the
+    # receiver's installed esphome, the receiver provisions a
+    # matching venv and compiles the job with it. Empty for
+    # local jobs and older offloaders (compile with installed).
+    target_esphome_version: str = ""
+    # Machine-readable failure category on a FAILED terminal (see
+    # :class:`JobFailureReason`), distinct from ``error`` (the human
+    # message). ``PROVISION`` tells the offloader to rebuild locally.
+    failure_reason: JobFailureReason = JobFailureReason.NONE
 
     @property
     def is_terminal(self) -> bool:
@@ -437,6 +467,7 @@ class FirmwareJob(DashboardModel):
         """
         self.progress = None
         self.error = None
+        self.failure_reason = JobFailureReason.NONE
         self.started_at = None
         self.completed_at = None
         self.exit_code = None

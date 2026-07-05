@@ -19,11 +19,15 @@ from collections.abc import Iterator
 from contextlib import AbstractAsyncContextManager
 from typing import TYPE_CHECKING, Any
 
+from esphome.const import __version__ as _installed_esphome_version
+
+from ...controllers.remote_build.env_provisioner import EnvProvisionError
 from ...helpers.api import CommandError, api_command
 from ...helpers.async_ import create_eager_task, drain_tasks, run_in_executor
 from ...helpers.device_yaml import configuration_filename
 from ...helpers.event_bus import Event
 from ...models import (
+    COMPILING_JOB_TYPES,
     LOCAL_JOB_BUILD_SOURCE,
     OTA_PORT,
     DeviceState,
@@ -52,6 +56,7 @@ from . import download as download_mod
 from ._state import FirmwareState, Lane
 from .helpers import (
     _find_esphome_cmd,
+    _ingest_output_line,
     _validate_upload_target,
     _verify_esphome_importable,
 )
@@ -633,7 +638,45 @@ class FirmwareController:  # noqa: PLR0904 (grandfathered; new public methods ne
         )
 
     async def _resolve_esphome_cmd(self, job: FirmwareJob) -> list[str]:
-        """Return the esphome CLI invocation to run *job* with."""
+        """
+        Return the esphome CLI invocation to run *job* with.
+
+        For a remote job whose ``target_esphome_version`` differs from ours:
+        COMPILE / INSTALL provision that version's venv (raising
+        :class:`EnvProvisionError` if unavailable); CLEAN reuses it only when
+        already provisioned. Everything else uses the installed esphome.
+        """
+        version = job.target_esphome_version
+        if not version or version == _installed_esphome_version:
+            return self.state.esphome_cmd
+        receiver = self._db.remote_build_receiver
+        provisioner = receiver.state.env_provisioner if receiver is not None else None
+        if job.job_type in COMPILING_JOB_TYPES:
+            if provisioner is None:
+                raise EnvProvisionError(
+                    f"no provisioner available to build esphome {version} "
+                    "(receiver stopping?); refusing to compile with the installed version"
+                )
+            return await provisioner.provision(version)
+        if job.job_type is JobType.CLEAN:
+            if provisioner is not None and (cached := await provisioner.cached_cmd(version)):
+                return cached
+            # No cached venv for the built version: clean with the installed
+            # esphome. An older esphome cleans less (managed_components, idedata,
+            # pio_components, PIO cache), so surface the possible under-purge
+            # instead of letting it pass silently.
+            _LOGGER.info(
+                "Clean %s: no cached esphome %s venv; cleaning with the installed "
+                "esphome, which may not fully purge the build",
+                job.configuration,
+                version,
+            )
+            _ingest_output_line(
+                job,
+                self._db.bus,
+                f"No cached esphome {version}; cleaning with the installed esphome, "
+                f"which may not fully purge artifacts built with {version}.\n",
+            )
         return self.state.esphome_cmd
 
     def _build_cache_args(self, job: FirmwareJob) -> list[str]:
@@ -689,6 +732,7 @@ class FirmwareController:  # noqa: PLR0904 (grandfathered; new public methods ne
         build_source: JobBuildSource = LOCAL_JOB_BUILD_SOURCE,
         device_name: str = "",
         device_friendly_name: str = "",
+        target_esphome_version: str = "",
         *,
         flash_bootloader: bool = False,
     ) -> FirmwareJob:
@@ -705,6 +749,7 @@ class FirmwareController:  # noqa: PLR0904 (grandfathered; new public methods ne
             build_source=build_source,
             device_name=device_name,
             device_friendly_name=device_friendly_name,
+            target_esphome_version=target_esphome_version,
         )
 
     def _resolve_install_source(self, *, force_local: bool = False) -> JobBuildSource:

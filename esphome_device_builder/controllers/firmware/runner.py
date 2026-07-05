@@ -9,10 +9,12 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
+from ...controllers.remote_build.env_provisioner import EnvProvisionError
 from ...helpers.async_ import run_in_executor
 from ...helpers.subprocess import create_subprocess_exec, iter_lines_with_progress
 from ...models import (
     FirmwareJob,
+    JobFailureReason,
     JobSource,
     JobStatus,
     JobType,
@@ -30,6 +32,13 @@ if TYPE_CHECKING:
     from .controller import FirmwareController
 
 _LOGGER = logging.getLogger(__name__)
+
+
+async def _clean_provisioned_venvs(controller: FirmwareController) -> None:
+    """Wipe the receiver's cached esphome venvs, if this dashboard is a receiver."""
+    receiver = controller._db.remote_build_receiver
+    if receiver is not None and receiver.state.env_provisioner is not None:
+        await receiver.state.env_provisioner.clean_all()
 
 
 async def run_lane(controller: FirmwareController, lane: Lane) -> None:
@@ -228,6 +237,11 @@ async def execute_job(  # noqa: PLR0915, PLR0912, C901
             if success and job.is_rename_tail:
                 await rename_flow.finalize_rename_swap(controller, job)
 
+            # A clean-build-env (``clean-all``) also wipes the receiver's
+            # cached esphome venvs — they re-provision on demand.
+            if success and job.job_type is JobType.RESET_BUILD_ENV:
+                await _clean_provisioned_venvs(controller)
+
             # ``_finalize_terminal`` runs the mark + slot-
             # release + fire sequence in the order the
             # ``queue_status`` broadcaster needs (see helper
@@ -247,6 +261,12 @@ async def execute_job(  # noqa: PLR0915, PLR0912, C901
         controller._finalize_cancelled(job)
         _LOGGER.info("Job %s cancelled (runner shutdown)", job.job_id)
         raise
+    except EnvProvisionError as exc:
+        # The receiver couldn't provision the offloader's esphome. Categorize it
+        # so the offloader rebuilds locally instead of surfacing a hard failure;
+        # still logged + finalized like any failure (``job.error`` gets the text).
+        job.failure_reason = JobFailureReason.PROVISION
+        lifecycle.finalize_unexpected_error(controller, job, exc)
     except Exception as exc:  # noqa: BLE001 — terminality guarantee; helper logs + finalizes
         # Cancel intent wins over the raise — e.g. ``_verify_chip``'s early-cancel
         # path raises ``ValueError`` to short-circuit the install, which is a

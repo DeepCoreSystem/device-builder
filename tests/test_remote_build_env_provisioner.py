@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
 from pathlib import Path
 
 import pytest
@@ -45,9 +46,11 @@ class _FakeRunner:
         self._fail_at = fail_at
         self._block = block
         self._reports_version = reports_version
+        self.entered = asyncio.Event()  # set when a call begins (for blocked-mid-call tests)
 
     async def __call__(self, *args: str, timeout: float, **_: object) -> CapturedSubprocess:
         self.calls.append(args)
+        self.entered.set()
         if self._block is not None:
             await self._block.wait()
         if "venv" in args:
@@ -88,6 +91,10 @@ def _mkdirs(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
+def _remove_dir(path: Path) -> None:
+    shutil.rmtree(path)
+
+
 async def test_provision_builds_and_caches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """First provision runs venv + pip + health probe; a repeat is a cache hit."""
     runner = _FakeRunner()
@@ -102,9 +109,8 @@ async def test_provision_builds_and_caches(tmp_path: Path, monkeypatch: pytest.M
 
     again = await provisioner.provision("2026.6.4")
     assert again == cmd
-    # No rebuild (venv / install unchanged); the health probe runs each time.
-    assert (runner.count("venv"), runner.count("install")) == (1, 1)
-    assert runner.count("version") == 2
+    # Warm hit: no rebuild AND no repeat health probe (verified this lifetime).
+    assert (runner.count("venv"), runner.count("install"), runner.count("version")) == (1, 1, 1)
 
 
 async def test_provision_rebuilds_unhealthy_existing_venv(
@@ -124,6 +130,38 @@ async def test_provision_rebuilds_unhealthy_existing_venv(
     assert (runner.count("venv"), runner.count("install")) == (1, 1)  # rebuilt
 
 
+async def test_provision_reprovisions_when_warm_venv_deleted_out_of_band(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A verified venv removed out-of-band rebuilds, never returning a dead cmd."""
+    runner = _FakeRunner()
+    _patch_runner(monkeypatch, runner)
+    provisioner = EnvProvisioner(data_dir=tmp_path)
+    await provisioner.provision("2026.6.4")  # version is now warm in _verified
+
+    # External cleanup / disk pressure removes the cached venv mid-lifetime.
+    await run_in_executor(_remove_dir, _venv_dir(provisioner, "2026.6.4"))
+
+    cmd = await provisioner.provision("2026.6.4")
+
+    assert "esphome-2026.6.4" in cmd[0]
+    assert runner.count("venv") == 2  # rebuilt rather than trusting the warm set
+
+
+async def test_cached_cmd_returns_none_when_warm_venv_deleted_out_of_band(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cached_cmd drops a warm entry whose venv vanished instead of a dead cmd."""
+    runner = _FakeRunner()
+    _patch_runner(monkeypatch, runner)
+    provisioner = EnvProvisioner(data_dir=tmp_path)
+    await provisioner.provision("2026.6.4")
+
+    await run_in_executor(_remove_dir, _venv_dir(provisioner, "2026.6.4"))
+
+    assert await provisioner.cached_cmd("2026.6.4") is None
+
+
 async def test_provision_rejects_venv_reporting_wrong_version(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -136,6 +174,33 @@ async def test_provision_rejects_venv_reporting_wrong_version(
         await provisioner.provision("2026.6.4")
 
     assert not _venv_dir(provisioner, "2026.6.4").exists()
+
+
+async def test_cached_cmd_returns_none_when_not_provisioned(tmp_path: Path) -> None:
+    """cached_cmd never builds; a version with no venv yet returns None."""
+    provisioner = EnvProvisioner(data_dir=tmp_path)
+    assert await provisioner.cached_cmd("2026.6.4") is None
+
+
+async def test_cached_cmd_refuses_non_release(tmp_path: Path) -> None:
+    """A dev / prerelease version is never cached-servable."""
+    provisioner = EnvProvisioner(data_dir=tmp_path)
+    assert await provisioner.cached_cmd("2026.7.0-dev") is None
+
+
+async def test_cached_cmd_returns_cmd_after_provision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once a version is provisioned, cached_cmd hands back its cmd without rebuilding."""
+    runner = _FakeRunner()
+    _patch_runner(monkeypatch, runner)
+    provisioner = EnvProvisioner(data_dir=tmp_path)
+    built = await provisioner.provision("2026.6.4")
+
+    cached = await provisioner.cached_cmd("2026.6.4")
+
+    assert cached == built
+    assert runner.count("venv") == 1  # no extra build
 
 
 async def test_provision_refuses_non_release(
@@ -198,7 +263,7 @@ async def test_provision_concurrent_same_version_builds_once(
 
     first = asyncio.create_task(provisioner.provision("2026.6.4"))
     second = asyncio.create_task(provisioner.provision("2026.6.4"))
-    await asyncio.sleep(0)  # let both reach the lock
+    await runner.entered.wait()  # the lock holder is inside the (blocked) build
     gate.set()
     cmd_a, cmd_b = await asyncio.gather(first, second)
 

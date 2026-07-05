@@ -45,7 +45,14 @@ class EnvProvisionError(Exception):
 
 
 class EnvProvisioner:
-    """Create + cache one esphome venv per release version, keyed by version."""
+    """
+    Create + cache one esphome venv per release version, keyed by version.
+
+    Callers serialize on the compile lane (``provision`` in COMPILE,
+    ``clean_all`` in RESET_BUILD_ENV, ``sweep_stale`` at start), so a wipe
+    never races a provision; the per-version lock guards same-version double
+    builds only.
+    """
 
     def __init__(self, data_dir: Path | None = None, *, base_python: str | None = None) -> None:
         # ``data_dir`` / ``base_python`` are injectable for tests; production
@@ -53,6 +60,10 @@ class EnvProvisioner:
         self._data_dir = data_dir
         self._base_python = base_python or sys.executable
         self._locks: dict[str, asyncio.Lock] = {}
+        # Versions this process built or health-checked; a warm hit skips the
+        # probe subprocess (can't drift under our own management). A fresh
+        # process starts empty, so it re-probes and catches cross-restart drift.
+        self._verified: set[str] = set()
 
     @property
     def venvs_dir(self) -> Path:
@@ -65,26 +76,49 @@ class EnvProvisioner:
 
         Raises :class:`EnvProvisionError` for a non-release version, or a venv
         that won't build or fails its health check; a bad venv is removed so a
-        retry starts clean.
+        retry starts clean. A warm-cached venv deleted out-of-band re-provisions
+        rather than handing back a cmd for a missing interpreter.
         """
         if not is_release_version(version):
             raise EnvProvisionError(f"cannot provision non-release esphome version {version!r}")
         venv = self.venvs_dir / f"{_VENV_PREFIX}{version}"
         async with self._lock_for(version):
-            if not await self._is_healthy(venv, version):
-                await self._build(version, venv)
+            if not await self._warm(venv, version):
                 if not await self._is_healthy(venv, version):
-                    await run_in_executor(_rmtree, venv)
-                    raise EnvProvisionError(
-                        f"provisioned esphome venv for {version} failed its health check"
-                    )
+                    await self._build(version, venv)
+                    if not await self._is_healthy(venv, version):
+                        await run_in_executor(_rmtree, venv)
+                        raise EnvProvisionError(
+                            f"provisioned esphome venv for {version} failed its health check"
+                        )
+                self._verified.add(version)
         return _venv_esphome_cmd(venv)
+
+    async def cached_cmd(self, version: str) -> list[str] | None:
+        """Return *version*'s venv cmd if already provisioned + healthy, else ``None``.
+
+        Never builds. For a fanned-out CLEAN, which wants to run under the same
+        (possibly newer) esphome that built the artifacts — a newer ``esphome
+        clean`` removes more (IDF ``managed_components``, ``idedata``,
+        ``pio_components``, PIO cache) — but only when the venv is already
+        cached from the build; a clean is never worth a ``pip install``.
+        """
+        if not is_release_version(version):
+            return None
+        venv = self.venvs_dir / f"{_VENV_PREFIX}{version}"
+        async with self._lock_for(version):
+            if await self._warm(venv, version) or await self._is_healthy(venv, version):
+                self._verified.add(version)
+                return _venv_esphome_cmd(venv)
+            self._verified.discard(version)
+        return None
 
     async def sweep_stale(self, installed_version: str) -> None:
         """Remove cached venvs older than *installed_version* (a startup sweep).
 
         No-op when *installed_version* isn't a plain release (a dev receiver),
-        since older / newer can't be ordered against it.
+        since older / newer can't be ordered against it. Runs at receiver start
+        before any build, so it never races a provision.
         """
         if not is_release_version(installed_version):
             return
@@ -97,10 +131,16 @@ class EnvProvisioner:
                     installed_version,
                 )
                 await run_in_executor(_rmtree, venv)
+                self._verified.discard(version)
 
     async def clean_all(self) -> None:
-        """Remove every cached venv (the receiver's clean-build-env path)."""
+        """Remove every cached venv (the receiver's clean-build-env path).
+
+        Runs inside a RESET_BUILD_ENV job on the compile lane, so it's serialized
+        with provisions (compile jobs) rather than racing one mid-install.
+        """
         await run_in_executor(_rmtree, self.venvs_dir)
+        self._verified.clear()
 
     # ------------------------------------------------------------------
     # Internals
@@ -125,6 +165,21 @@ class EnvProvisioner:
             if is_release_version(version):
                 found.append((child, version))
         return found
+
+    async def _warm(self, venv: Path, version: str) -> bool:
+        """Whether *version* is verified this lifetime AND its venv is still on disk.
+
+        The verified set skips the subprocess health probe, not the existence
+        check: a venv deleted out-of-band (external cleanup, disk pressure)
+        drops the stale entry so the caller re-provisions instead of returning
+        a cmd for a missing interpreter.
+        """
+        if version not in self._verified:
+            return False
+        if await run_in_executor(_venv_python(venv).is_file):
+            return True
+        self._verified.discard(version)
+        return False
 
     async def _is_healthy(self, venv: Path, version: str) -> bool:
         """Whether *venv* runs the *version* of esphome it's cached for.

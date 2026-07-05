@@ -71,7 +71,9 @@ from ...helpers.peer_link_bundle import (
 )
 from ...helpers.peer_link_frames import frame_schema, is_valid_frame
 from ...helpers.remote_build_layout import REMOTE_BUILDS_SUBDIR, RemoteBuildPath
+from ...helpers.version_compat import coerce_pep440_version
 from ...models import (
+    PAIRING_VERSION_MAX_LEN,
     JobType,
     SubmitJobAckFrameData,
     SubmitJobChunkFrameData,
@@ -235,6 +237,16 @@ def _coerce_display_field(value: Any) -> str:
     return value
 
 
+def _coerce_version_field(value: Any) -> str:
+    """Coerce the peer-supplied ``target_esphome_version`` to a PEP 440 string or ``""``.
+
+    ``NotRequired`` on the wire, so a non-str / malformed / oversized / injected
+    value would otherwise reach the provisioner's ``pip install`` argument; soft
+    coerce to ``""`` (no provisioning, compile with the installed esphome).
+    """
+    return coerce_pep440_version(value, max_len=PAIRING_VERSION_MAX_LEN)
+
+
 def _validate_configuration_filename(filename: str) -> str | None:
     r"""Return the device-name segment if *filename* is a safe leaf YAML, else ``None``.
 
@@ -310,6 +322,10 @@ class _PendingSubmit:
     # plumbing.
     device_name: str = ""
     device_friendly_name: str = ""
+    # Offloader's esphome version off the SUBMIT_JOB header; empty for
+    # older offloaders. The receiver provisions a matching esphome venv
+    # to compile with when it differs from its own installed version.
+    target_esphome_version: str = ""
 
 
 class SubmitJobReceiver:
@@ -431,6 +447,7 @@ class SubmitJobReceiver:
             # for the build.
             device_name=_coerce_display_field(frame.get("device_name")),
             device_friendly_name=_coerce_display_field(frame.get("device_friendly_name")),
+            target_esphome_version=_coerce_version_field(frame.get("target_esphome_version")),
         )
 
     async def handle_submit_job_chunk(
@@ -650,6 +667,7 @@ class SubmitJobReceiver:
                 # then falls back to the configuration path.
                 device_name=pending.device_name,
                 device_friendly_name=pending.device_friendly_name,
+                target_esphome_version=pending.target_esphome_version,
             )
             await self._firmware._enqueue(job)
         except Exception as exc:
