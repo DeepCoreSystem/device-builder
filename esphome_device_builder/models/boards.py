@@ -144,6 +144,10 @@ class BoardEsphomeConfig(DashboardModel):
     # Pre-rev3 ESP32-P4 silicon (esphome's "engineering sample"); stamped by
     # sync_boards from esphome's BOARDS table, never hand-set in manifests.
     engineering_sample: bool = False
+    # Explicit logger ``hardware_uart`` for generated configs; may restate the
+    # chip default (imports carry the upstream page's value verbatim). None
+    # emits a bare ``logger:`` and ESPHome's default applies.
+    logger_hardware_uart: str | None = None
 
     class Config(_CatalogConfig):
         """Skip empty defaults on serialise; see :class:`_CatalogConfig`."""

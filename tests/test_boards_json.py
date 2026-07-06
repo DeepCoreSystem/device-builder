@@ -667,6 +667,33 @@ def test_esp32_engineering_sample_matches_esphome_boards_table() -> None:
     assert "esp32-p4_r3-evboard" not in flagged
 
 
+def test_logger_hardware_uart_pins_known_console_wirings() -> None:
+    """UART-bridge consoles pin UART0; native-JTAG boards keep the default.
+
+    Every Waveshare P4 routes its console Type-C through a CH343P on UART0.
+    Native-JTAG boards get the default either implicitly (olimex, no field)
+    or restated explicitly when the upstream page pins it (guition).
+    """
+    uarts = {b.id: b.esphome.logger_hardware_uart for b in load_board_index()}
+    for board_id in (
+        "waveshare_esp32_p4_wifi6",
+        "waveshare_esp32_p4_nano",
+        "waveshare_esp32_p4_pico",
+        "waveshare_esp32_p4_eth",
+        "waveshare_esp32_p4_module_dev_kit",
+        "waveshare_esp32_p4_wifi6_dev_kit",
+        "waveshare_esp32_p4_wifi6_poe_eth",
+    ):
+        assert uarts[board_id] == "UART0", board_id
+    # Native USB-Serial-JTAG consoles: the upstream page pins the default
+    # explicitly (guition) or the board needs nothing (olimex).
+    assert uarts["guition_esp32_p4_m3_dev"] == "USB_SERIAL_JTAG"
+    assert uarts["esp32-p4-pc"] is None
+    # Non-P4 lifts ride the same import path.
+    assert uarts["shelly_em_gen3"] == "UART0"
+    assert uarts["mirabella_door_window_sensor"] == "UART1"
+
+
 def test_p4_generated_boards_take_the_revision_matching_generic_pinout() -> None:
     """GPIO54 is a GPIO on pre-rev3 P4 silicon but the VDD_HP_1 rail on rev3.
 

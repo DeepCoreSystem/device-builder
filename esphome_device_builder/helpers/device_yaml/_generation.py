@@ -196,6 +196,10 @@ def generate_device_yaml(
 
     # Logging
     lines.append("logger:")
+    if esphome_cfg.logger_hardware_uart:
+        # Board-explicit console target; may restate the chip default. On
+        # UART-bridge boards the default console shows no app logs at all.
+        lines.append(f"  hardware_uart: {esphome_cfg.logger_hardware_uart}")
     lines.append("")
 
     # Wi-Fi decision — used both for the ``wifi:`` block below and to
