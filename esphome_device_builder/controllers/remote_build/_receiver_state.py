@@ -29,6 +29,20 @@ class ReceiverState:
     pairing_window_clients: dict[Hashable, float] = field(default_factory=dict)
     pairing_window_handle: asyncio.TimerHandle | None = None
 
+    # Armed by ``--remote-build-only`` first-pair bootstrap: while
+    # True (and zero peers are APPROVED), the next ``pair_request``
+    # inside the open window is approved without the inbox dance.
+    # One-shot — ``record_pair_request`` disarms it on use.
+    # Trust-on-first-use by default: an attacker racing the window can
+    # win the pairing (documented accepted risk — see
+    # docs/THREAT_MODEL.md "Out of scope"). An operator who knows the
+    # builder's address closes that vector with
+    # ``--allow-pairing-source`` (``settings.allow_pairing_sources``),
+    # which ``pair_flow`` enforces before this flag is honoured. The
+    # one-shot disarm and the zero-APPROVED-rows guard are the
+    # load-bearing limits either way.
+    auto_approve_first_pair: bool = False
+
     # PENDING StoredPeer rows keyed on ``dashboard_id``; never
     # persisted, cleared on window auto-close.
     pending_peers: dict[str, StoredPeer] = field(default_factory=dict)
