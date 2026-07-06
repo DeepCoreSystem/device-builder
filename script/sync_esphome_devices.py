@@ -53,6 +53,7 @@ from esphome_device_builder.constants import (  # noqa: E402
 from esphome_device_builder.helpers.pin_gpio import parse_board_gpio  # noqa: E402
 from esphome_device_builder.models.boards import Esp32Variant  # noqa: E402
 from script._component_catalog import load_component_catalog  # noqa: E402
+from script._repo_cache import ensure_shallow_git_repo  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -417,40 +418,20 @@ def _ensure_devices_repo(*, pull: bool = True) -> Path | None:
     which is what the smoke test does so it inspects the same revision
     the sync just produced.
     """
-    target = _DEVICES_CLONE_DIR
-    if (target / ".git").exists():
-        if not pull:
-            return target
-        result = subprocess.run(
-            ["git", "-C", str(target), "pull", "-q", "--ff-only"],
-            check=False,
-            timeout=120,
-        )
-        if result.returncode != 0:
-            _LOGGER.warning("git pull failed in %s — using existing snapshot", target)
-        return target
-
-    target.parent.mkdir(parents=True, exist_ok=True)
-    _LOGGER.info("Cloning devices.esphome.io (shallow) to %s", target)
-    try:
-        subprocess.run(
-            [
-                "git",
-                "clone",
-                "-q",
-                "--depth=1",
-                "--single-branch",
-                f"--branch={_DEVICES_REPO_BRANCH}",
-                _DEVICES_REPO_URL,
-                str(target),
-            ],
-            check=True,
-            timeout=300,
-        )
-    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-        _LOGGER.error("Could not clone devices.esphome.io: %s", exc)
-        return None
-    return target
+    return ensure_shallow_git_repo(
+        _DEVICES_REPO_URL,
+        _DEVICES_CLONE_DIR,
+        _DEVICES_REPO_BRANCH,
+        label="devices.esphome.io",
+        pull=pull,
+        pull_timeout=120,
+        clone_timeout=300,
+        # Primary data source: a clone miss (empty catalog) or a stale-pull
+        # (regenerating from outdated upstream) both need operator attention,
+        # so keep both loud (clone was ERROR; pull elevated to match).
+        clone_fail_level=logging.ERROR,
+        pull_fail_level=logging.ERROR,
+    )
 
 
 def _get_repo_revision(repo: Path) -> str:
