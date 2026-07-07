@@ -9,7 +9,11 @@ from typing import TYPE_CHECKING
 
 from aiohttp.web import GracefulExit
 
-from .controllers.remote_build.pairing_window import PAIRING_WINDOW_DURATION_SECONDS
+from .controllers.remote_build.pairing_window import (
+    BOOTSTRAP_PAIRING_WINDOW_DURATION_SECONDS,
+    set_pairing_window,
+)
+from .helpers.pairing_key import generate_pairing_key
 from .helpers.pin_emoji import pin_emoji, pin_emoji_names
 from .models import EventType
 
@@ -102,10 +106,15 @@ async def _bootstrap_first_pair(db: DeviceBuilder, receiver: ReceiverController)
 
     Returns ``True`` once the first pair request lands (the window is
     closed behind it — exactly one pairing); ``False`` when the
-    window lapses unpaired. The 5-minute lifetime is the pairing
+    window lapses unpaired. The 15-minute lifetime
+    (:data:`BOOTSTRAP_PAIRING_WINDOW_DURATION_SECONDS`) is the pairing
     window's own idle deadline — the bootstrap client never extends it.
+
+    Pairing requires the banner-printed key; ``bootstrap_pairing_key`` arms
+    and clears together with ``auto_approve_first_pair``.
     """
     receiver.state.auto_approve_first_pair = True
+    receiver.state.bootstrap_pairing_key = generate_pairing_key()
     paired = asyncio.Event()
     window_closed = asyncio.Event()
 
@@ -117,38 +126,52 @@ async def _bootstrap_first_pair(db: DeviceBuilder, receiver: ReceiverController)
         if not event.data["open"]:
             window_closed.set()
 
-    with (
-        db.bus.listening([EventType.REMOTE_BUILD_PAIR_STATUS_CHANGED], _on_pair_status),
-        db.bus.listening([EventType.REMOTE_BUILD_PAIRING_WINDOW_CHANGED], _on_window_changed),
-    ):
-        await receiver.set_pairing_window(open=True, client=_BOOTSTRAP_WINDOW_CLIENT)
-        identity = await db.peer_link_identity_store.async_load()
-        _log_pairing_banner(identity, db.settings.allow_pairing_sources)
-        await _wait_first(paired, window_closed)
-    receiver.state.auto_approve_first_pair = False
+    try:
+        with (
+            db.bus.listening([EventType.REMOTE_BUILD_PAIR_STATUS_CHANGED], _on_pair_status),
+            db.bus.listening([EventType.REMOTE_BUILD_PAIRING_WINDOW_CHANGED], _on_window_changed),
+        ):
+            await set_pairing_window(
+                receiver,
+                open=True,
+                client=_BOOTSTRAP_WINDOW_CLIENT,
+                duration_seconds=BOOTSTRAP_PAIRING_WINDOW_DURATION_SECONDS,
+            )
+            identity = await db.peer_link_identity_store.async_load()
+            _log_pairing_banner(
+                identity, db.settings.allow_pairing_sources, receiver.state.bootstrap_pairing_key
+            )
+            await _wait_first(paired, window_closed)
+    finally:
+        # Arm and disarm together so a cancellation / exception mid-wait can
+        # never leave the receiver armed with a live key.
+        receiver.state.auto_approve_first_pair = False
+        receiver.state.bootstrap_pairing_key = None
     if not paired.is_set():
         _LOGGER.error(
             "No pairing request arrived within %d minutes; exiting. Re-run to "
             "open a fresh pairing window.",
-            int(PAIRING_WINDOW_DURATION_SECONDS // 60),
+            int(BOOTSTRAP_PAIRING_WINDOW_DURATION_SECONDS // 60),
         )
         return False
-    await receiver.set_pairing_window(open=False, client=_BOOTSTRAP_WINDOW_CLIENT)
+    await set_pairing_window(receiver, open=False, client=_BOOTSTRAP_WINDOW_CLIENT)
     peer = next(iter(receiver.state.approved_peers.values()))
     _LOGGER.info("Paired with %r — remote-build server is now in service", peer.label)
     return True
 
 
-def _log_pairing_banner(identity: PeerLinkIdentity, allow_pairing_sources: list[str]) -> None:
-    """Print the fingerprint the operator verifies on the main builder's pair dialog."""
+def _log_pairing_banner(
+    identity: PeerLinkIdentity, allow_pairing_sources: list[str], pairing_key: str | None
+) -> None:
+    """Print the fingerprint + one-shot pairing key the operator uses in the pair dialog."""
     banner = "=" * 70
     if allow_pairing_sources:
         source_line = f" Only auto-approving a request from: {', '.join(allow_pairing_sources)}\n"
     else:
         source_line = (
-            " Accepting the first pairing request from ANY source\n"
-            " (--allow-any-pairing-source). Anyone on this LAN who pairs\n"
-            " before your builder does wins — watch this console.\n"
+            " Any source may attempt to pair; the pairing key above is\n"
+            " required to succeed (add --allow-pairing-source <IP> to also\n"
+            " restrict the source address).\n"
         )
     _LOGGER.info(
         "\n%s\n"
@@ -160,15 +183,21 @@ def _log_pairing_banner(identity: PeerLinkIdentity, allow_pairing_sources: list[
         "   (%s)\n"
         "   %s\n"
         "\n"
+        " Enter this one-time pairing key in the pair dialog\n"
+        " (it asks for the key once it detects this server):\n"
+        "\n"
+        "   %s\n"
+        "\n"
         "%s"
         " The window closes on the first pairing (exactly one pairing).\n"
         " This process exits if nothing pairs before the window lapses.\n"
         "%s",
         banner,
-        int(PAIRING_WINDOW_DURATION_SECONDS // 60),
+        int(BOOTSTRAP_PAIRING_WINDOW_DURATION_SECONDS // 60),
         pin_emoji(identity.pin_sha256),
         pin_emoji_names(identity.pin_sha256),
         identity.pin_sha256_formatted,
+        pairing_key,
         source_line,
         banner,
     )
