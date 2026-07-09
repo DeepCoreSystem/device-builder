@@ -6,7 +6,10 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 import esphome_device_builder
+from esphome_device_builder.models.boards import Platform
 
 _SCRIPT_DIR = Path(__file__).parent.parent / "script"
 if str(_SCRIPT_DIR) not in sys.path:
@@ -15,6 +18,16 @@ if str(_SCRIPT_DIR) not in sys.path:
 import sync_components  # noqa: E402
 
 _DEFINITIONS = Path(esphome_device_builder.__file__).parent / "definitions"
+
+
+def test_platform_enum_accepts_both_rp2_spellings() -> None:
+    assert Platform("rp2") is Platform.RP2040
+    assert Platform("rp2040") is Platform.RP2040
+
+
+def test_platform_enum_still_rejects_unknown_values() -> None:
+    with pytest.raises(ValueError, match="rp3"):
+        Platform("rp3")
 
 
 def _entry(component_id: str, **overrides: object) -> dict:
