@@ -2264,6 +2264,7 @@ def build_component_entry(
     # rule to the user as readable prose — issue #924. Drops out
     # naturally once the FE renders the structured fields inline.
     _annotate_constraint_descriptions(component)
+    _apply_ethernet_platform_split(component)
     return component
 
 
@@ -5803,6 +5804,51 @@ def _apply_logger_uart_options(component_id: str, entries: list[dict]) -> None:
             entry["platform_options"] = _LOGGER_UART_PLATFORM_OPTIONS
             entry["allow_custom_value"] = True
             break
+
+
+def _ethernet_type_platform_options() -> dict[str, list[dict[str, str]]]:
+    """
+    Ethernet's per-platform ``type`` choices from the live module constants.
+
+    The schema bundle ships a flat union; empty when esphome's ethernet
+    isn't importable or predates the split.
+    """
+    try:
+        from esphome.components import ethernet as _ethernet
+    except ImportError:
+        _LOGGER.warning("esphome ethernet not importable — type platform split skipped")
+        return {}
+    if not hasattr(_ethernet, "RP2_ETHERNET_TYPES"):
+        # Catalog syncs always run on 2026.7+; this only keeps test runs
+        # under an older interpreter (CI stable leg) from crashing.
+        _LOGGER.debug("installed esphome predates RP2_ETHERNET_TYPES — ethernet split skipped")
+        return {}
+    rp2 = set(_ethernet.RP2_ETHERNET_TYPES)
+    # Everything except the RP2-only chips.
+    esp32 = set(_ethernet.ETHERNET_TYPES) - (rp2 - set(_ethernet.SPI_ETHERNET_TYPES))
+    return {
+        "esp32": [{"label": t, "value": t} for t in sorted(esp32)],
+        "rp2040": [{"label": t, "value": t} for t in sorted(rp2)],
+    }
+
+
+def _apply_ethernet_platform_split(component: dict) -> None:
+    """
+    Stamp ethernet's ``type`` ``platform_options`` from the live split.
+
+    The component's ``supported_platforms`` becomes the option-map keys;
+    ``type`` is required, so no valid type means no platform support.
+    """
+    if component["id"] != "ethernet":
+        return
+    options = _ethernet_type_platform_options()
+    if not options:
+        return
+    for entry in component["config_entries"]:
+        if entry["key"] == "type":
+            entry["platform_options"] = options
+            break
+    component["supported_platforms"] = sorted(options)
 
 
 @contextlib.contextmanager
