@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from operator import attrgetter
 from typing import TYPE_CHECKING, Any
 
@@ -44,7 +44,10 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
-_MDNS_RESOLVE_TIMEOUT_MS = 2000
+# Matches upstream esphome's ``zeroconf.DEFAULT_TIMEOUT`` — slow ESP32/ESP8266
+# nodes routinely need most of it, and ``async_request`` keeps re-querying the
+# wire inside the window, so a short one-shot silently drops their announce.
+_MDNS_RESOLVE_TIMEOUT_MS = 10_000
 
 # Bound on the zeroconf close. ``async_close`` broadcasts mDNS goodbyes and can
 # hang on a wedged socket; shutdown must not block on it.
@@ -62,6 +65,11 @@ class MdnsSource:
         # bookkeeping versus two parallel browsers.
         self._mdns_browser: AsyncServiceBrowser | None = None
         self._interface_monitor_task: asyncio.Task[None] | None = None
+        # Full service names with a wire resolve in flight. Browser event
+        # churn on a still-unresolved service (Added then Updated) would
+        # otherwise stack concurrent resolvers, each holding a global
+        # zeroconf listener for the whole resolve window.
+        self._inflight_resolves: set[str] = set()
 
     @property
     def zeroconf(self) -> AsyncEsphomeZeroconf | None:
@@ -278,6 +286,34 @@ class MdnsSource:
         addresses = info.parsed_scoped_addresses(IPVersion.All)
         return addresses or None
 
+    def reconcile_from_cache(self, device_name: str) -> None:
+        """
+        Re-apply the cached TXT payload without claiming state or IP.
+
+        Level-triggered repair for the edge-triggered apply path: a
+        drop window (cold-start probe no-op, timed-out resolve) leaves
+        the record blank while the cache holds the TXT, and zeroconf's
+        same-content TTL refreshes never re-fire the browser handler.
+        No ONLINE claim — a cache hit can be stale, and a claim here
+        has no browser ``Removed`` counterpart (#1776).
+        """
+        if (zc := self._zeroconf) is None:
+            return
+        # Read the TXT record directly rather than via
+        # ``AsyncServiceInfo.load_from_cache``, whose success requires an
+        # unexpired *address* record — the A (120s TTL) routinely expires
+        # while the TXT (4500s) is still cached, exactly the state this
+        # pass repairs.
+        service_name = f"{device_name}.{_ESPHOME_SERVICE_TYPE}"
+        now_ms = current_time_millis()
+        records = [
+            record
+            for record in zc.zeroconf.cache.get_all_by_details(service_name, _TYPE_TXT, _CLASS_IN)
+            if not record.is_expired(now_ms)
+        ]
+        if props := _decode_mdns_txt_records(records):
+            self._apply_txt_properties(device_name, props)
+
     def _on_esphomelib_service_state_change(
         self, zeroconf: Any, service_type: str, name: str, state_change: ServiceStateChange
     ) -> None:
@@ -335,13 +371,19 @@ class MdnsSource:
         HTTP browser paths: spawn a task on cache miss,
         ``async_request`` the record, swallow exceptions to a
         debug log, dispatch to the per-type applier on success.
+        At most one resolve per service name is in flight.
         """
+        if info.name in self._inflight_resolves:
+            return
+        self._inflight_resolves.add(info.name)
         try:
             if not await info.async_request(zeroconf, timeout=_MDNS_RESOLVE_TIMEOUT_MS):
                 return
         except Exception:
             _LOGGER.debug("mDNS resolve failed for %s", device_name, exc_info=True)
             return
+        finally:
+            self._inflight_resolves.discard(info.name)
         apply(device_name, info)
 
     def _apply_service_info(self, device_name: str, info: AsyncServiceInfo) -> None:
@@ -362,7 +404,11 @@ class MdnsSource:
         # devices surface every IP.
         if addresses := info.parsed_scoped_addresses(IPVersion.All):
             monitor.apply_ip_addresses(device_name, addresses)
-        props = info.decoded_properties
+        self._apply_txt_properties(device_name, info.decoded_properties)
+
+    def _apply_txt_properties(self, device_name: str, props: Mapping[str, str | None]) -> None:
+        """Apply version / config_hash / mac / api_encryption from decoded TXT properties."""
+        monitor = self._monitor
         if version := props.get("version"):
             monitor.apply_version(device_name, version)
         if config_hash := props.get("config_hash"):
