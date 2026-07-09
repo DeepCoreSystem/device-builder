@@ -948,7 +948,11 @@ def main() -> int:
     # flattens to bare ``<domain>`` so the action surfaces whenever
     # a matching base domain is configured.
     component_ids = {c["id"] for c in catalog}
-    automations = build_automations(schema_dir=schema_dir, component_ids=component_ids)
+    automations = build_automations(
+        schema_dir=schema_dir,
+        component_ids=component_ids,
+        registry_groups=_collect_automation_registry_groups(),
+    )
     _LOGGER.info(
         "Built automations catalog: %d triggers, %d actions, %d conditions, %d effects",
         len(automations["triggers"]),
@@ -6225,6 +6229,30 @@ def _required_group_from_validator(node: Any) -> dict[str, Any] | None:
     return {"kind": kind, "keys": str_keys}
 
 
+def _groups_in_all_chain(node: Any) -> list[dict[str, Any]]:
+    """
+    Surface every ``cv.has_*_one_key`` validator in a ``vol.All`` chain.
+
+    The iteration cap bounds a misbehaving cyclic chain.
+    """
+    out: list[dict[str, Any]] = []
+    for _ in range(8):
+        if not isinstance(node, vol.All):
+            return out
+        for child in node.validators:
+            group = _required_group_from_validator(child)
+            if group is not None:
+                out.append(group)
+        inner = next(
+            (v for v in node.validators if isinstance(v, vol.All)),
+            None,
+        )
+        if inner is None:
+            return out
+        node = inner
+    return out
+
+
 def _collect_inclusive_groups(
     manifest: Any,
 ) -> dict[tuple[str, ...], str]:
@@ -6262,7 +6290,7 @@ def _collect_inclusive_groups(
     return out
 
 
-def _collect_required_groups(  # noqa: C901
+def _collect_required_groups(
     manifest: Any,
 ) -> dict[tuple[str, ...], list[dict[str, Any]]]:
     """
@@ -6291,30 +6319,11 @@ def _collect_required_groups(  # noqa: C901
     out: dict[tuple[str, ...], list[dict[str, Any]]] = {}
     visited: set[int] = set()
 
-    def collect_at(node: Any, path: tuple[str, ...]) -> None:
-        # Walk through ``vol.All`` wrappers at the current level
-        # surfacing every ``cv.has_*_one_key`` validator. The cap
-        # mirrors the ``unwrap`` budget below — a misbehaving
-        # cyclic ``vol.All`` chain can't lock the walker.
-        for _ in range(8):
-            if not isinstance(node, vol.All):
-                return
-            for child in node.validators:
-                group = _required_group_from_validator(child)
-                if group is not None:
-                    out.setdefault(path, []).append(group)
-            inner = next(
-                (v for v in node.validators if isinstance(v, vol.All)),
-                None,
-            )
-            if inner is None:
-                return
-            node = inner
-
     def walk(node: Any, path: tuple[str, ...], depth: int) -> None:
         if depth > 6:
             return
-        collect_at(node, path)
+        if groups := _groups_in_all_chain(node):
+            out.setdefault(path, []).extend(groups)
         target = _unwrap_schema_to_dict(node)
         if target is None:
             return
@@ -6329,6 +6338,31 @@ def _collect_required_groups(  # noqa: C901
         walk(schema, (), 0)
     except Exception:
         _LOGGER.debug("required-groups walk aborted on %r", schema, exc_info=True)
+    return out
+
+
+def _collect_automation_registry_groups() -> dict[str, dict[str, list[dict[str, Any]]]]:
+    """
+    Collect ``{registry_id: [{kind, keys}, ...]}`` per registry type from live esphome.
+
+    The ``action`` / ``condition`` registries fill during :func:`build_catalog`'s
+    import sweep, so call this after it; ``--limit-component`` runs yield partial
+    data. Empty when esphome isn't importable.
+    """
+    try:
+        automation = importlib.import_module("esphome.automation")
+        registries = {
+            "action": automation.ACTION_REGISTRY,
+            "condition": automation.CONDITION_REGISTRY,
+        }
+    except Exception:
+        _LOGGER.debug("automation registries unavailable", exc_info=True)
+        return {}
+    out: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    for registry_type, registry in registries.items():
+        for registry_id, entry in registry.items():
+            if groups := _groups_in_all_chain(getattr(entry, "raw_schema", None)):
+                out.setdefault(registry_type, {})[registry_id] = groups
     return out
 
 
@@ -6951,6 +6985,7 @@ def build_automations(  # noqa: C901
     *,
     schema_dir: Path,
     component_ids: set[str],
+    registry_groups: dict[str, dict[str, list[dict[str, Any]]]] | None = None,
 ) -> dict[str, list[dict]]:
     """
     Walk every schema file and emit the automation catalog.
@@ -6967,6 +7002,10 @@ def build_automations(  # noqa: C901
     as a component) or just an organisational namespace
     (``page.display`` ⇒ no ``display.page`` component, so actions
     surface against the bare ``display`` domain).
+
+    *registry_groups* is :func:`_collect_automation_registry_groups`
+    output; matching actions / conditions gain ``required_groups``
+    and their group members are promoted off ``advanced``.
     """
     triggers: list[dict] = []
     actions: list[dict] = []
@@ -7056,10 +7095,15 @@ def build_automations(  # noqa: C901
                 )
             )
 
+    actions = _dedupe_by_id(actions)
+    conditions = _dedupe_by_id(conditions)
+    groups_by_type = registry_groups or {}
+    _apply_automation_required_groups(actions, groups_by_type.get("action"))
+    _apply_automation_required_groups(conditions, groups_by_type.get("condition"))
     return {
         "triggers": _dedupe_by_id(triggers),
-        "actions": _dedupe_by_id(actions),
-        "conditions": _dedupe_by_id(conditions),
+        "actions": actions,
+        "conditions": conditions,
         "light_effects": _dedupe_by_id(effects),
         "filters": _dedupe_filters(filters),
     }
@@ -7107,6 +7151,52 @@ def _automation_id_prefix(top_key: str, *, platform_domains: set[str]) -> str:
         return top_key
     stem, base = top_key.split(".", 1)
     return f"{base}.{stem}" if base in platform_domains else top_key
+
+
+def _automation_required_groups(
+    group_index: dict[str, list[dict[str, Any]]] | None,
+    qualified: str,
+    config_entries: list[dict],
+) -> list[dict[str, Any]]:
+    """
+    Live-registry ``required_groups`` for the *qualified* automation id.
+
+    Groups with keys outside *config_entries* are dropped — ``if``'s
+    ``then`` / ``condition`` groups live on the control-flow editor,
+    not the params form.
+    """
+    groups = (group_index or {}).get(qualified)
+    if not groups:
+        return []
+    keys = {e["key"] for e in config_entries}
+    return [dict(g) for g in groups if all(k in keys for k in g["keys"])]
+
+
+def _apply_automation_required_groups(
+    entries: list[dict],
+    group_index: dict[str, list[dict[str, Any]]] | None,
+) -> None:
+    """
+    Stamp live-registry ``required_groups`` onto built actions / conditions.
+
+    Mirrors the component path's ``_apply_required_groups``: members are
+    promoted off ``advanced`` and their descriptions gain the constraint hint.
+    Members also drop per-field ``required`` — the group is the requirement,
+    but the bundle stamps ``Required`` on a preferred alias (``action`` on
+    ``homeassistant.service``), which would flag a legitimately blank sibling.
+    """
+    for entry in entries:
+        groups = _automation_required_groups(group_index, entry["id"], entry["config_entries"])
+        if not groups:
+            continue
+        members = {key for g in groups for key in g["keys"]}
+        promoted = _promote_constraint_members(entry["config_entries"], groups)
+        for e in promoted:
+            if e["key"] in members:
+                e["required"] = False
+        entry["config_entries"] = [_strip_entry_defaults(e) for e in promoted]
+        entry["required_groups"] = groups
+        _annotate_constraint_descriptions(entry)
 
 
 def _convert_automation_action(
