@@ -658,6 +658,14 @@ _FIELD_OVERRIDES: dict[tuple[str, str], dict[str, Any]] = {
     ("esphome", "comment"): {
         "advanced": True,
     },
+    # ``ota.esphome.allow_partition_access``: surface on the main form, esp32-only.
+    # Its esp32 rule lives in FINAL_VALIDATE, not a field-level ``cv.only_on``, so
+    # ``_collect_platform_constraints`` can't gate it — stamp the platform here or
+    # it renders on every OTA platform.
+    ("ota.esphome", "allow_partition_access"): {
+        "advanced": False,
+        "supported_platforms": ["esp32"],
+    },
     # ``logger.hardware_uart`` is commonly set (USB_SERIAL_JTAG vs UART0 on
     # newer ESP32 variants); keep it on the main form, not behind Advanced.
     ("logger", "hardware_uart"): {
@@ -865,6 +873,11 @@ _TEMPLATE_ID_SUFFIX = ".template"
 _OPTIMISTIC_KEY = "optimistic"
 _LAMBDA_KEY = "lambda"
 _ACTION_KEY_SUFFIX = "_action"
+
+# esp32 ``framework.advanced`` fields surfaced under the "Advanced" disclosure,
+# overriding upstream's group-level ``yaml_only``. ``_surface_esp32_advanced_fields``
+# un-hides only these; the group's other expert knobs stay hidden.
+_ESP32_ADVANCED_VISIBLE: frozenset[str] = frozenset({"sram1_as_iram"})
 
 # ---------------------------------------------------------------------------
 # CLI / main
@@ -6051,14 +6064,15 @@ def _apply_psram_options(component_id: str, entries: list[dict]) -> None:
 
 
 def _apply_esp32_options(component_id: str, entries: list[dict]) -> None:
-    """Default esp32's framework ``type`` from upstream's validate-time setter."""
+    """Default esp32's framework ``type`` and surface curated advanced fields."""
     if component_id != "esp32":
-        return
-    default = _esp32_default_framework()
-    if default is None:
         return
     framework = next((e for e in entries if e.get("key") == "framework"), None)
     if not framework:
+        return
+    _surface_esp32_advanced_fields(framework)
+    default = _esp32_default_framework()
+    if default is None:
         return
     type_entry = next(
         (e for e in framework.get("config_entries", []) if e.get("key") == "type"), None
@@ -6067,6 +6081,37 @@ def _apply_esp32_options(component_id: str, entries: list[dict]) -> None:
         return  # fill in a missing default; never clobber one the bundle carries
     if default in {o["value"] for o in type_entry.get("options", [])}:
         type_entry["default_value"] = default
+
+
+def _surface_esp32_advanced_fields(framework: dict) -> None:
+    """
+    Surface ``_ESP32_ADVANCED_VISIBLE`` fields under ``framework.advanced``.
+
+    Upstream marks the whole ``advanced`` group ``yaml_only``, so the cascade
+    hides every child. Runs post-cascade: show the curated fields and their
+    ``advanced`` group on the framework form (the group *is* the disclosure —
+    don't bury it behind the form's generic "Show advanced settings" too);
+    siblings keep ``hidden=True``.
+    """
+    advanced = next(
+        (e for e in framework.get("config_entries", []) if e.get("key") == "advanced"), None
+    )
+    if not advanced:
+        return
+    # Direct children of the group only — every curated key is a leaf of
+    # ``advanced``; a deeper nesting would no-op here (the catalog test catches it).
+    promoted = [
+        child
+        for child in advanced.get("config_entries", [])
+        if child.get("key") in _ESP32_ADVANCED_VISIBLE
+    ]
+    if not promoted:
+        return
+    advanced["hidden"] = False
+    advanced["advanced"] = False  # render the "Advanced" group card on the framework form
+    for child in promoted:
+        child["hidden"] = False
+        child["advanced"] = False  # render inside the group, not behind its own disclosure
 
 
 @cache
