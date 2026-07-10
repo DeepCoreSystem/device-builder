@@ -877,6 +877,9 @@ _ACTION_KEY_SUFFIX = "_action"
 # esp32 ``framework.advanced`` fields surfaced under the "Advanced" disclosure,
 # overriding upstream's group-level ``yaml_only``. ``_surface_esp32_advanced_fields``
 # un-hides only these; the group's other expert knobs stay hidden.
+# esp32 ``framework.advanced`` fields to surface on the framework form. Each one's
+# variant restriction (if any) is derived from esphome by ``_esp32_variant_gate``,
+# not hand-listed here.
 _ESP32_ADVANCED_VISIBLE: frozenset[str] = frozenset({"sram1_as_iram"})
 
 # ---------------------------------------------------------------------------
@@ -6112,16 +6115,20 @@ def _surface_esp32_advanced_fields(framework: dict) -> None:
     for child in promoted:
         child["hidden"] = False
         child["advanced"] = False  # render inside the group, not behind its own disclosure
+        gate = _esp32_variant_gate(child["key"])
+        if gate:
+            # Gate on the sibling ``variant`` at the esp32-component root; the
+            # frontend resolves a nested ``depends_on`` against the component root.
+            child["depends_on"] = "variant"
+            child["depends_on_value_any"] = list(gate)
 
 
 @cache
 def _esp32_default_framework() -> str | None:
     """Validate a minimal config so esp32's schema fills in the framework type."""
-    try:
-        from esphome.components import esp32
-        from esphome.const import CONF_FRAMEWORK, CONF_TYPE, CONF_VARIANT
-    except ImportError:
-        return None
+    from esphome.components import esp32
+    from esphome.const import CONF_FRAMEWORK, CONF_TYPE, CONF_VARIANT
+
     # A non-Arduino variant keeps the validate-time migration notice quiet.
     variant = next((v for v in esp32.VARIANTS if v not in esp32.ARDUINO_ALLOWED_VARIANTS), None)
     if variant is None:
@@ -6129,6 +6136,70 @@ def _esp32_default_framework() -> str | None:
     with _esp32_variant_context(variant):
         config = esp32.CONFIG_SCHEMA({CONF_VARIANT: variant})
     return config[CONF_FRAMEWORK][CONF_TYPE]
+
+
+@cache
+def _esp32_variant_gate(field_key: str) -> tuple[str, ...] | None:
+    """
+    Variants a ``framework.advanced`` boolean is valid on — ``None`` for all.
+
+    esphome gates some advanced knobs to specific chips in its FINAL_VALIDATE
+    (``sram1_as_iram`` → classic ESP32 only). Derive that by enabling the field
+    per variant and keeping the ones esphome doesn't reject, so an upstream
+    change flows through without a hand-maintained list. Returns esphome's
+    canonical value plus the lowercase form boards write; ``None`` only when
+    every testable variant accepts it (no gate needed).
+    """
+    import esphome.config_validation as cv
+    import esphome.final_validate as fv
+    from esphome.components import esp32
+    from esphome.const import (
+        CONF_ADVANCED,
+        CONF_ESPHOME,
+        CONF_FRAMEWORK,
+        CONF_TYPE,
+        CONF_VARIANT,
+    )
+
+    accepted: list[str] = []
+    tested = 0
+    for variant in esp32.VARIANTS:
+        raw = {
+            CONF_VARIANT: variant,
+            CONF_FRAMEWORK: {CONF_TYPE: "esp-idf", CONF_ADVANCED: {field_key: True}},
+        }
+        with _esp32_variant_context(variant):
+            try:
+                config = esp32.CONFIG_SCHEMA(raw)
+            except cv.Invalid:
+                continue  # variant needs more than a bare config; not testable here
+            tested += 1
+            token = fv.full_config.set({CONF_ESPHOME: {}})
+            try:
+                esp32.final_validate(config)
+                accepted.append(variant)
+            except cv.Invalid as err:
+                # Rejected specifically for this field (its key in the error's
+                # path or message) → gated off this variant; any other error
+                # means the field itself is fine here. Checking both path and
+                # message keeps this robust if esphome moves where it reports.
+                errors = getattr(err, "errors", [err])
+                if not any(field_key in (e.path or []) or field_key in str(e) for e in errors):
+                    accepted.append(variant)
+            finally:
+                fv.full_config.reset(token)
+    # Fail loud on the degenerate cases rather than silently ungating: a curated
+    # advanced field must be valid on at least one variant, and if no variant's
+    # base config validated the derivation itself is broken (upstream schema shift).
+    if tested == 0:
+        raise RuntimeError(
+            f"esp32 variant gate for {field_key!r}: no variant validated a base config"
+        )
+    if not accepted:
+        raise RuntimeError(f"esp32 variant gate: {field_key!r} is rejected on every variant")
+    if len(accepted) == tested:
+        return None  # valid on every variant → no gate
+    return tuple(dict.fromkeys(v for var in accepted for v in (var.lower(), var)))
 
 
 def _promote_multi_value_keys(entries: list[dict]) -> None:

@@ -10,9 +10,11 @@ from __future__ import annotations
 from typing import Any
 
 import orjson
+import pytest
 
 from script.sync_components import (  # type: ignore[import-not-found]
     _OUTPUT_BODIES_DIR,
+    _esp32_variant_gate,
     _surface_esp32_advanced_fields,
 )
 
@@ -57,6 +59,9 @@ def test_surface_unhides_sram1_and_group_keeps_siblings_hidden() -> None:
     assert advanced["hidden"] is False and advanced["advanced"] is False
     sram1 = _find(advanced["config_entries"], "sram1_as_iram")
     assert sram1 is not None and sram1["hidden"] is False and sram1["advanced"] is False
+    # Gated on the classic ESP32 variant (invalid elsewhere).
+    assert sram1["depends_on"] == "variant"
+    assert sram1["depends_on_value_any"] == ["esp32", "ESP32"]
     adc = _find(advanced["config_entries"], "adc_oneshot_in_iram")
     assert adc is not None and adc["hidden"] is True  # untouched
 
@@ -79,6 +84,9 @@ def test_esp32_catalog_surfaces_sram1_under_advanced() -> None:
     sram1 = _find(advanced["config_entries"], "sram1_as_iram")
     assert sram1 is not None
     assert not sram1.get("hidden") and not sram1.get("advanced")
+    # Variant-gated: only shown on the classic ESP32 (esphome rejects it elsewhere).
+    assert sram1.get("depends_on") == "variant"
+    assert sram1.get("depends_on_value_any") == ["esp32", "ESP32"]
     # Scope guard: a sibling expert knob stays hidden (yaml_only).
     adc = _find(advanced["config_entries"], "adc_oneshot_in_iram")
     assert adc is not None and adc.get("hidden") is True
@@ -90,3 +98,17 @@ def test_esp32_ota_catalog_promotes_allow_partition_access() -> None:
     assert allow is not None
     assert not allow.get("advanced")  # core, not behind "Show advanced"
     assert allow.get("supported_platforms") == ["esp32"]  # only offered where it works
+
+
+def test_variant_gate_derived_from_esphome() -> None:
+    """``sram1_as_iram`` derives to classic-ESP32-only; an ungated field derives to None."""
+    # esphome's FINAL_VALIDATE rejects sram1_as_iram off the classic ESP32.
+    assert _esp32_variant_gate("sram1_as_iram") == ("esp32", "ESP32")
+    # A field with no variant restriction is valid everywhere → no gate stamped.
+    assert _esp32_variant_gate("disable_fatfs") is None
+
+
+def test_variant_gate_fails_loud_when_underivable() -> None:
+    """A key no variant's base config accepts raises, rather than silently ungating."""
+    with pytest.raises(RuntimeError):
+        _esp32_variant_gate("not_a_real_advanced_field")
