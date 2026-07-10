@@ -51,6 +51,9 @@ from esphome_device_builder.models import (
     ComponentCategory,
     Connectivity,
     DefaultComponent,
+    Device,
+    DeviceRuntimeState,
+    DeviceState,
     Esp32Variant,
     Platform,
     ReachabilitySource,
@@ -2600,39 +2603,6 @@ def test_load_device_default_labels_is_empty_list(tmp_path: Path) -> None:
 
 
 @pytest.mark.usefixtures("_redirect_ext_storage")
-def test_load_device_carries_api_encryption_active_from_previous(tmp_path: Path) -> None:
-    """Reload preserves the mDNS-observed ``api_encryption_active``.
-
-    The mDNS browser fires on Added/Updated, populates
-    ``api_encryption_active="Noise_..."`` on the live ``Device``,
-    and then sleeps until the next service-record TTL refresh — a
-    couple of minutes in the typical fleet. Anything that triggers
-    ``scanner.reload`` between announces (a successful flash, an
-    ``--only-generate`` run, an unrelated YAML edit on the sibling
-    device, an atomic-save remove/re-add cycle) used to wipe the
-    field back to ``None`` because the new ``Device`` was built
-    from defaults — the user saw a freshly-flashed encrypted
-    device flip into the "Pending install" warning despite the
-    firmware on the wire still broadcasting encryption.
-
-    Mirrors the existing carry-forward shape for ``state``,
-    ``deployed_config_hash``, and ``ip_addresses``: pass
-    ``previous`` and ``api_encryption_active`` round-trips
-    through.
-    """
-    yaml_path = tmp_path / "kitchen.yaml"
-    yaml_path.write_text("esphome:\n  name: kitchen\n", encoding="utf-8")
-    write_storage_json(tmp_path, "kitchen.yaml")
-
-    previous = load_device_from_storage(yaml_path)
-    previous.api_encryption_active = "Noise_NNpsk0_25519_ChaChaPoly_SHA256"
-
-    reloaded = load_device_from_storage(yaml_path, previous=previous)
-
-    assert reloaded.api_encryption_active == "Noise_NNpsk0_25519_ChaChaPoly_SHA256"
-
-
-@pytest.mark.usefixtures("_redirect_ext_storage")
 def test_load_device_carries_plaintext_confirmation_from_previous(tmp_path: Path) -> None:
     """The empty-string ``api_encryption_active`` ("confirmed plaintext") also carries.
 
@@ -2651,11 +2621,11 @@ def test_load_device_carries_plaintext_confirmation_from_previous(tmp_path: Path
     write_storage_json(tmp_path, "kitchen.yaml")
 
     previous = load_device_from_storage(yaml_path)
-    previous.api_encryption_active = ""
+    previous.runtime_state.api_encryption_active = ""
 
     reloaded = load_device_from_storage(yaml_path, previous=previous)
 
-    assert reloaded.api_encryption_active == ""
+    assert reloaded.runtime_state.api_encryption_active == ""
 
 
 @pytest.mark.usefixtures("_redirect_ext_storage")
@@ -2674,30 +2644,7 @@ def test_load_device_without_previous_defaults_api_encryption_active_to_none(
 
     device = load_device_from_storage(yaml_path)
 
-    assert device.api_encryption_active is None
-
-
-@pytest.mark.usefixtures("_redirect_ext_storage")
-def test_load_device_carries_active_source_from_previous(tmp_path: Path) -> None:
-    """Reload preserves the monitor-observed ``active_source``.
-
-    The frontend gates the update-available and modified dots on
-    ``active_source == "mdns"``, and the monitor re-fires
-    ``on_source_change`` only on a real transition. A rebuild that
-    resets the field to UNKNOWN (the post-compile ``scanner.reload``
-    in a bulk update was the reported shape, issue #1939) therefore
-    hides the dots until the device's next TTL re-announce.
-    """
-    yaml_path = tmp_path / "kitchen.yaml"
-    yaml_path.write_text("esphome:\n  name: kitchen\n", encoding="utf-8")
-    write_storage_json(tmp_path, "kitchen.yaml")
-
-    previous = load_device_from_storage(yaml_path)
-    previous.active_source = ReachabilitySource.MDNS
-
-    reloaded = load_device_from_storage(yaml_path, previous=previous)
-
-    assert reloaded.active_source is ReachabilitySource.MDNS
+    assert device.runtime_state.api_encryption_active is None
 
 
 @pytest.mark.usefixtures("_redirect_ext_storage")
@@ -2711,7 +2658,33 @@ def test_load_device_without_previous_defaults_active_source_to_unknown(
 
     device = load_device_from_storage(yaml_path)
 
-    assert device.active_source is ReachabilitySource.UNKNOWN
+    assert device.runtime_state.active_source is ReachabilitySource.UNKNOWN
+
+
+@pytest.mark.usefixtures("_redirect_ext_storage")
+def test_load_device_carries_runtime_state_from_previous(tmp_path: Path) -> None:
+    """The whole monitor-observed ``runtime_state`` survives a rebuild."""
+    yaml_path = tmp_path / "kitchen.yaml"
+    yaml_path.write_text("esphome:\n  name: kitchen\n", encoding="utf-8")
+    write_storage_json(tmp_path, "kitchen.yaml")
+
+    previous = load_device_from_storage(yaml_path)
+    previous.runtime_state = DeviceRuntimeState(
+        state=DeviceState.ONLINE,
+        active_source=ReachabilitySource.MDNS,
+        ip_addresses=["192.168.1.42"],
+        deployed_version="2025.1.0",
+        deployed_config_hash="deadbeef",
+        queued_update=True,
+        api_encryption_active="Noise_NNpsk0_25519_ChaChaPoly_SHA256",
+    )
+
+    reloaded = load_device_from_storage(yaml_path, previous=previous)
+
+    assert reloaded.runtime_state == previous.runtime_state
+    # Fresh copies, so mutating the new device can't reach back into the old.
+    assert reloaded.runtime_state is not previous.runtime_state
+    assert reloaded.runtime_state.ip_addresses is not previous.runtime_state.ip_addresses
 
 
 @pytest.mark.usefixtures("_redirect_ext_storage")
@@ -2730,7 +2703,7 @@ def test_load_device_api_encrypted_falls_back_to_wire_signal(tmp_path: Path) -> 
 
     Drives the scan path (not the mDNS-callback path covered by
     ``test_on_api_encryption_change_promotes_api_encrypted_when_yaml_missed_it``)
-    by setting ``previous.api_encryption_active`` to a cipher
+    by setting ``previous.runtime_state.api_encryption_active`` to a cipher
     string and reloading; the YAML itself has no ``encryption:``
     block so the YAML signal still says false.
     """
@@ -2741,12 +2714,12 @@ def test_load_device_api_encrypted_falls_back_to_wire_signal(tmp_path: Path) -> 
 
     previous = load_device_from_storage(yaml_path)
     assert previous.api_encrypted is False  # YAML signal alone says no
-    previous.api_encryption_active = "Noise_NNpsk0_25519_ChaChaPoly_SHA256"
+    previous.runtime_state.api_encryption_active = "Noise_NNpsk0_25519_ChaChaPoly_SHA256"
 
     reloaded = load_device_from_storage(yaml_path, previous=previous)
 
     assert reloaded.api_encrypted is True
-    assert reloaded.api_encryption_active == "Noise_NNpsk0_25519_ChaChaPoly_SHA256"
+    assert reloaded.runtime_state.api_encryption_active == "Noise_NNpsk0_25519_ChaChaPoly_SHA256"
 
 
 @pytest.mark.usefixtures("_redirect_ext_storage")
@@ -2767,12 +2740,12 @@ def test_load_device_api_encrypted_stays_false_for_plaintext_wire(tmp_path: Path
     write_storage_json(tmp_path, "kitchen.yaml")
 
     previous = load_device_from_storage(yaml_path)
-    previous.api_encryption_active = ""  # mDNS confirmed plaintext
+    previous.runtime_state.api_encryption_active = ""  # mDNS confirmed plaintext
 
     reloaded = load_device_from_storage(yaml_path, previous=previous)
 
     assert reloaded.api_encrypted is False
-    assert reloaded.api_encryption_active == ""
+    assert reloaded.runtime_state.api_encryption_active == ""
 
 
 def test_every_board_body_generates_creatable_platform_block() -> None:
@@ -3142,3 +3115,42 @@ def test_board_requires_wifi_false_when_board_has_onboard_ethernet() -> None:
 def test_board_requires_wifi_false_for_non_wifi_board() -> None:
     """No native Wi-Fi ⇒ not required (handled by the no-network / Thread path)."""
     assert board_requires_wifi(_board(connectivity=["ethernet"], featured=["ethernet"])) is False
+
+
+def test_device_to_dict_nests_runtime_state() -> None:
+    """The wire payload carries the monitor-observed fields under runtime_state."""
+    device = Device(
+        name="kitchen",
+        friendly_name="Kitchen",
+        configuration="kitchen.yaml",
+        runtime_state=DeviceRuntimeState(
+            state=DeviceState.ONLINE,
+            active_source=ReachabilitySource.MDNS,
+            deployed_version="2025.1.0",
+        ),
+    )
+
+    payload = device.to_dict()
+
+    assert payload["runtime_state"]["state"] == "online"
+    assert payload["runtime_state"]["active_source"] == "mdns"
+    assert payload["runtime_state"]["deployed_version"] == "2025.1.0"
+    for flat_key in ("state", "active_source", "deployed_version"):
+        assert flat_key not in payload
+
+
+def test_device_to_dict_emits_runtime_state_when_all_default() -> None:
+    """An all-default runtime_state still serializes every key; the frontend requires it."""
+    payload = Device(
+        name="kitchen", friendly_name="Kitchen", configuration="kitchen.yaml"
+    ).to_dict()
+
+    assert payload["runtime_state"] == {
+        "state": "unknown",
+        "active_source": "unknown",
+        "ip_addresses": [],
+        "deployed_version": "",
+        "deployed_config_hash": "",
+        "queued_update": False,
+        "api_encryption_active": None,
+    }

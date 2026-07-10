@@ -148,7 +148,7 @@ async def test_handler_does_not_substitute_hyphens(monkeypatch: pytest.MonkeyPat
     """
     devices = [_device("my-device")]
     # The recorder's per-device state-flip mirrors production —
-    # without it, ``device.state`` stays UNKNOWN forever and the
+    # without it, ``runtime_state.state`` stays UNKNOWN forever and the
     # eager ``apply(ONLINE)`` in the browser callback plus the
     # redundant claim in ``_apply_service_info`` would each re-fire
     # against the still-stale state, yielding a misleading double-call.
@@ -197,7 +197,7 @@ async def test_mdns_takes_ownership_after_ping_set_online(
     override the still-true mDNS view.
     """
     devices = [_device("kitchen")]
-    devices[0].state = DeviceState.ONLINE  # ping already saw it
+    devices[0].runtime_state.state = DeviceState.ONLINE  # ping already saw it
     monitor, _callbacks = make_state_monitor_with_callbacks(devices)
     monitor.state.state_source["kitchen"] = "ping"
 

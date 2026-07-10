@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -11,7 +12,7 @@ from esphome.const import CONF_PACKAGES
 from esphome.core import EsphomeError
 from esphome.storage_json import StorageJSON
 
-from ...models import Device, DeviceState, ReachabilitySource
+from ...models import Device, DeviceRuntimeState
 from ...models.boards import normalize_platform
 from ..mac_addresses import derive_interface_macs
 from ..storage_path import resolve_compiled_config_path, resolve_storage_path
@@ -125,9 +126,7 @@ def load_device_from_storage(
     board-id edits.
 
     *previous* is the prior in-memory Device for this path, when one
-    exists. Runtime-only fields populated by monitors (``state``,
-    ``deployed_config_hash``, ``ip_addresses``,
-    ``api_encryption_active``) carry forward from it so a reload
+    exists. Its ``runtime_state`` carries forward whole so a reload
     doesn't wipe what mDNS / ping has already discovered.
     """
     filename = path.name
@@ -195,32 +194,31 @@ def load_device_from_storage(
     if storage and storage.firmware_bin_path and storage.firmware_bin_path.exists():
         bin_mtime = storage.firmware_bin_path.stat().st_mtime
 
-    # Carry-forward: in-memory *previous* wins over the store kwarg
-    # (an apply since the last scan is fresher than disk).
-    if previous is not None:
-        deployed_config_hash = previous.deployed_config_hash
-        deployed_version = previous.deployed_version
-        api_encryption_active = previous.api_encryption_active
-        queued_update = previous.queued_update
-    # ``active_source`` is runtime-only (never persisted); losing it on a
-    # rebuild hides the mDNS-gated dashboard dots until the next announce,
-    # since the monitor re-fires ``on_source_change`` only on a transition.
-    state, active_source = (
-        (previous.state, previous.active_source)
+    # In-memory *previous* wins over the store kwargs (an apply since the
+    # last scan is fresher than disk). Shallow-copy so RELOADED change
+    # handlers can still diff the new device against *previous*.
+    runtime = (
+        replace(previous.runtime_state, ip_addresses=list(previous.runtime_state.ip_addresses))
         if previous
-        else (DeviceState.UNKNOWN, ReachabilitySource.UNKNOWN)
+        else DeviceRuntimeState(
+            deployed_config_hash=deployed_config_hash,
+            deployed_version=deployed_version,
+            api_encryption_active=api_encryption_active,
+            queued_update=queued_update,
+        )
     )
-    ip_addresses = list(previous.ip_addresses) if previous else []
 
     has_pending = compute_has_pending_changes(
         yaml_mtime=yaml_mtime,
         bin_mtime=bin_mtime,
         expected_config_hash=expected_config_hash,
-        deployed_config_hash=deployed_config_hash,
+        deployed_config_hash=runtime.deployed_config_hash,
     )
-    pending_via_hash = pending_changes_via_hash(expected_config_hash, deployed_config_hash)
+    pending_via_hash = pending_changes_via_hash(expected_config_hash, runtime.deployed_config_hash)
 
-    update_available = bool(deployed_version and deployed_version != const.__version__)
+    update_available = bool(
+        runtime.deployed_version and runtime.deployed_version != const.__version__
+    )
 
     # ``Device.target_platform`` is the lowercase platform *key*
     # (``esp32``, ``esp8266``, ``rp2040``, …) — the value the
@@ -316,9 +314,10 @@ def load_device_from_storage(
     api_encrypted = (
         get_api_encryption_block(resolved_config) is not None
         or yaml_has_api_encryption(yaml_content)
-        or bool(api_encryption_active)
+        or bool(runtime.api_encryption_active)
     )
     return Device(
+        runtime_state=runtime,
         name=name,
         friendly_name=friendly_name,
         configuration=filename,
@@ -340,20 +339,14 @@ def load_device_from_storage(
         # ``esphome.address``.
         address=(storage.address if storage and storage.address else f"{fallback_name}.local"),
         ip=ip,
-        ip_addresses=ip_addresses,
         web_port=storage.web_port if storage else None,
         current_version=const.__version__,
-        deployed_version=deployed_version,
         expected_config_hash=expected_config_hash,
-        deployed_config_hash=deployed_config_hash,
         loaded_integrations=loaded_integrations,
         directly_referenced_integrations=directly_referenced_integrations,
-        state=state,
-        active_source=active_source,
         has_pending_changes=has_pending,
         pending_changes_via_hash=pending_via_hash,
         update_available=update_available,
-        queued_update=queued_update,
         # ``uses_mqtt`` keeps its prior shape — the resolved config
         # wins, raw-text fills in mid-edit, and we don't have a
         # ``loaded_integrations`` entry that maps cleanly to "uses
@@ -365,7 +358,6 @@ def load_device_from_storage(
         ),
         api_enabled=api_enabled,
         api_encrypted=api_encrypted,
-        api_encryption_active=api_encryption_active,
         mac_address=mac_address,
         ethernet_mac=ethernet_mac,
         bluetooth_mac=bluetooth_mac,
