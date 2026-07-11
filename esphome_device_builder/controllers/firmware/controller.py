@@ -98,11 +98,15 @@ class FirmwareController:  # noqa: PLR0904 (grandfathered; new public methods ne
         self._unsub_job_completed = self.bus.add_listener(
             EventType.JOB_COMPLETED, self._handle_job_completed
         )
+        self._unsub_job_failed = self.bus.add_listener(
+            EventType.JOB_FAILED, self._handle_job_failed
+        )
 
     def stop(self) -> None:
         """Tear down bus subscriptions registered in __init__."""
         self._unsub_device_wake()
         self._unsub_job_completed()
+        self._unsub_job_failed()
 
     @property
     def bus(self) -> EventBus:
@@ -518,38 +522,42 @@ class FirmwareController:  # noqa: PLR0904 (grandfathered; new public methods ne
 
     def _handle_job_completed(self, event: Event) -> None:
         job = event.data["job"]
+        # Arm before the dispatch tail — a failed immediate OTA must find
+        # the flag set so the device stays armed for its next wake.
+        self._arm_queued_update_if_flagged(job)
         self._handle_deferred_compile_completion(job)
         self._handle_ota_upload_completion(job)
 
-    def _handle_deferred_compile_completion(self, job: FirmwareJob) -> None:
-        """After a deferred-install COMPILE finishes, upload now or arm for later.
+    def _handle_job_failed(self, event: Event) -> None:
+        """Arm the queued update for an OTA app upload that failed against an offline device."""
+        self._arm_queued_update_if_flagged(event.data["job"])
 
-        Only a successfully-completed COMPILE queued via the offline-install
-        path (``is_deferred_install``) does anything here — a plain compile,
-        or one that failed, has nothing to act on.
+    def _arm_queued_update_if_flagged(self, job: FirmwareJob) -> None:
+        """Arm the device when a terminal *job* left a queued update behind."""
+        devices = self._db.devices
+        if devices is None or not job.is_queued_update_armed:
+            return
+        devices.set_queued_update(job.configuration)
+
+    def _handle_deferred_compile_completion(self, job: FirmwareJob) -> None:
+        """Flash a finished deferred-install COMPILE now when its device is already ONLINE.
+
+        Anything short of confirmed ONLINE (OFFLINE, or the narrow UNKNOWN
+        window from a scanner rebuild with previous=None) just waits for
+        the wake dispatch; the arm already happened.
         """
         if not job.is_deferred_compile_success:
             return
 
-        devices = self._db.devices
-        if not devices:
-            return
-
         device = self._device_for_configuration(job.configuration)
-        if not device:
+        if not device or device.runtime_state.state != DeviceState.ONLINE:
             return
 
-        # Arm first on every path — a failed immediate OTA must find the flag
-        # set so the device stays armed for its next wake. Anything short of
-        # confirmed ONLINE (OFFLINE, or the narrow UNKNOWN window from a
-        # scanner rebuild with previous=None) just waits for that wake.
-        devices.set_queued_update(job.configuration)
-        if device.runtime_state.state == DeviceState.ONLINE:
-            _LOGGER.info(
-                "Device %s is online after deferred compile. Triggering upload now.",
-                job.configuration,
-            )
-            self._dispatch_queued_upload(job.configuration)
+        _LOGGER.info(
+            "Device %s is online after deferred compile. Triggering upload now.",
+            job.configuration,
+        )
+        self._dispatch_queued_upload(job.configuration)
 
     def _handle_ota_upload_completion(self, job: FirmwareJob) -> None:
         """Disarm a queued update once its OTA delivery lands.

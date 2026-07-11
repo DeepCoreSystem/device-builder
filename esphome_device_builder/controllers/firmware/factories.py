@@ -13,7 +13,6 @@ from ...models import (
     LOCAL_JOB_BUILD_SOURCE,
     OTA_PORT,
     REMOTE_PENDING_JOB_BUILD_SOURCE,
-    DeviceState,
     ErrorCode,
     EventType,
     FirmwareJob,
@@ -21,7 +20,7 @@ from ...models import (
     JobType,
 )
 from ...models.firmware import _now_iso
-from .helpers import _fire_job_lifecycle, _names_touched_by_job
+from .helpers import _fire_job_lifecycle, _names_touched_by_job, _target_is_offline
 
 if TYPE_CHECKING:
     from .controller import FirmwareController
@@ -174,9 +173,8 @@ async def enqueue_install_or_defer(
     app, not the bootloader — so an OFFLINE device raises ``INVALID_ARGS``,
     ahead of build-source resolution so it wins over ``NO_COMPATIBLE_PEER``.
     """
-    device = controller._device_for_configuration(configuration)
     # Deferral gated ONLY on OFFLINE, avoiding UNKNOWN startup states.
-    offline = device is not None and device.runtime_state.state == DeviceState.OFFLINE
+    offline = _target_is_offline(controller, configuration)
     # An explicit IP/hostname target doesn't make a known-OFFLINE
     # device reachable, so the bootloader refusal skips the port gate.
     if offline and flash_bootloader:
@@ -190,6 +188,11 @@ async def enqueue_install_or_defer(
         job = create_job(controller, configuration, JobType.COMPILE, build_source=build_source)
         job.is_deferred_install = True
         return await controller._enqueue(job)
+    if port == OTA_PORT and not flash_bootloader and controller._db.devices is not None:
+        # A device still in the UNKNOWN startup window gets an immediate
+        # reachability probe, so the state has settled by the time the
+        # compile finishes and the release-time re-check runs.
+        controller._db.devices.probe_reachability_if_unknown(configuration)
     return await enqueue_install_chain(
         controller,
         configuration=configuration,

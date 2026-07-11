@@ -42,6 +42,7 @@ from esphome_device_builder.helpers.event_bus import Event, EventBus
 from esphome_device_builder.helpers.version_compat import VersionMatchPolicy
 from esphome_device_builder.models import (
     TERMINAL_JOB_STATUSES,
+    DeviceState,
     EventType,
     FirmwareJob,
     JobType,
@@ -435,10 +436,22 @@ class StubDevices:
     def get_by_configuration(self, configuration: str) -> Any | None:
         return self._by_configuration.get(configuration)
 
+    def probe_reachability_if_unknown(self, configuration: str) -> None:
+        """No-op; the UNKNOWN-window probe is pinned devices-side."""
+
 
 def wire_devices(controller: FirmwareController) -> None:
     """Attach a no-op ``DevicesController`` stub for ``_build_cache_args``."""
     controller._db.devices = StubDevices()  # type: ignore[attr-defined]
+
+
+def attach_device(controller: FirmwareController, configuration: str, state: DeviceState) -> None:
+    """Wire one mock device so ``_device_for_configuration`` resolves it; arming is assertable."""
+    device = MagicMock()
+    device.runtime_state.state = state
+    devices = MagicMock()
+    devices.get_by_configuration.side_effect = lambda c: device if c == configuration else None
+    controller._db.devices = devices
 
 
 async def run_until_terminal(

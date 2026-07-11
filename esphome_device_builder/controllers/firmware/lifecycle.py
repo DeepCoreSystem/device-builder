@@ -6,10 +6,10 @@ import logging
 from typing import TYPE_CHECKING
 
 from ...helpers.process import terminate_subtree_with_grace
-from ...models import EventType, FirmwareJob, JobStatus
+from ...models import EventType, FirmwareJob, JobStatus, JobType
 from . import rename_flow
-from .constants import _PREREQUISITE_FAILED_ERROR
-from .helpers import _fire_job_lifecycle, _trim_job_output
+from .constants import _PREREQUISITE_FAILED_ERROR, _TARGET_OFFLINE_DEFERRED_ERROR
+from .helpers import _fire_job_lifecycle, _target_is_offline, _trim_job_output
 
 if TYPE_CHECKING:
     from ._state import Lane
@@ -42,6 +42,9 @@ def finalize_terminal(
     subsequent install.
     """
     job.mark_terminal(status, error=error)
+    # Flag before the fire — the terminal-event hooks and the follow
+    # stream read the armed state when the event lands.
+    _defer_install_if_target_offline(controller, job)
     _release_lane_slot(controller, job)
     _fire_job_lifecycle(job, controller._db.bus, _STATUS_TO_TERMINAL_EVENT[status])
     release_dependents(controller, job)
@@ -105,6 +108,8 @@ def release_dependents(controller: FirmwareController, job: FirmwareJob) -> bool
 
     A chained UPLOAD sits QUEUED but off its lane queue until its prerequisite
     COMPILE finishes (see ``factories.enqueue``); this is where it lands.
+    A compile converted to a deferred install cancels its held upload
+    instead — the wake dispatch flashes when the device reconnects.
     Returns whether any dependent was acted on, so a caller that persisted
     before calling can re-persist when the cascade actually changed state.
     """
@@ -113,12 +118,16 @@ def release_dependents(controller: FirmwareController, job: FirmwareJob) -> bool
         if dep.depends_on != job.job_id or dep.status is not JobStatus.QUEUED:
             continue
         acted = True
-        if job.status is JobStatus.COMPLETED:
-            controller.state.place_on_lane(dep)
-        else:
+        if job.status is not JobStatus.COMPLETED:
             controller._finalize_terminal(
                 dep, JobStatus.CANCELLED, error=_PREREQUISITE_FAILED_ERROR
             )
+        elif job.is_deferred_install:
+            controller._finalize_terminal(
+                dep, JobStatus.CANCELLED, error=_TARGET_OFFLINE_DEFERRED_ERROR
+            )
+        else:
+            controller.state.place_on_lane(dep)
     return acted
 
 
@@ -178,3 +187,33 @@ async def terminate_current_process(controller: FirmwareController, lane: Lane) 
         proc,
         job_label=f"job {lane.current_job.job_id}" if lane.current_job else "job ?",
     )
+
+
+def _defer_install_if_target_offline(controller: FirmwareController, job: FirmwareJob) -> None:
+    """
+    Flag *job* ``is_deferred_install`` when its OTA target is OFFLINE at terminality.
+
+    Two shapes: a COMPLETED chain-head COMPILE whose held OTA upload would
+    flash a dead address (``release_dependents`` cancels it), and a FAILED
+    OTA app UPLOAD. The controller's terminal-event hooks arm the device
+    off ``is_queued_update_armed``.
+    """
+    if job.is_deferred_install:
+        return
+    if job.status is JobStatus.COMPLETED and job.job_type is JobType.COMPILE:
+        message = "Device %s went offline during the build; queuing the update instead"
+    elif job.status is JobStatus.FAILED and job.is_ota_app_upload:
+        message = "OTA upload to %s failed while the device is offline; queuing the update"
+    else:
+        return
+    if not _target_is_offline(controller, job.configuration):
+        return
+    # A compile converts only when it still has a held OTA app upload
+    # to spare from the dead address.
+    if job.job_type is JobType.COMPILE and not any(
+        dep.depends_on == job.job_id and dep.status is JobStatus.QUEUED and dep.is_ota_app_upload
+        for dep in controller.state.jobs.values()
+    ):
+        return
+    _LOGGER.info(message, job.configuration)
+    job.is_deferred_install = True

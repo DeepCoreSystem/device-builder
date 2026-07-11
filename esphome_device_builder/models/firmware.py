@@ -373,6 +373,26 @@ class FirmwareJob(DashboardModel):
             and self.is_deferred_install
         )
 
+    @property
+    def is_ota_app_upload(self) -> bool:
+        """Whether this is an app (not bootloader) flash over OTA — the deferrable shape."""
+        return (
+            self.job_type == JobType.UPLOAD and self.port == OTA_PORT and not self.flash_bootloader
+        )
+
+    @property
+    def is_queued_update_armed(self) -> bool:
+        """
+        Whether this terminal job left the device armed for a queued update.
+
+        True for a completed deferred-install COMPILE and for a failed OTA
+        app UPLOAD the offline conversion flagged; a *failed* deferred
+        COMPILE armed nothing, so it stays False.
+        """
+        return self.is_deferred_compile_success or (
+            self.is_ota_app_upload and self.status == JobStatus.FAILED and self.is_deferred_install
+        )
+
     def reset(self) -> None:
         """
         Reset per-run state so the job is ready to be re-executed.
