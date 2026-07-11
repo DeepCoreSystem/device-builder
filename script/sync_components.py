@@ -1492,7 +1492,7 @@ def _repair_field_bullet_descriptions(entries: list[dict]) -> None:
         )
 
 
-def _backfill_descriptions_from_mdx(entries: list[dict]) -> None:
+def _backfill_descriptions_from_mdx(entries: list[dict]) -> None:  # noqa: C901
     """Fill empty names, descriptions and field docs from the docs MDX.
 
     The prebuilt schema's index sometimes only lists ``dependencies``
@@ -1510,8 +1510,9 @@ def _backfill_descriptions_from_mdx(entries: list[dict]) -> None:
     """
     descriptions = _load_mdx_descriptions()
     field_descriptions = _load_mdx_field_descriptions()
+    field_sections = _load_mdx_field_sections()
     titles = _load_mdx_titles()
-    if not descriptions and not field_descriptions and not titles:
+    if not descriptions and not field_descriptions and not field_sections and not titles:
         return
     # Titles stay un-aliased so the chip families keep distinct names.
     aliases = _shared_docs_page_aliases(descriptions.keys())
@@ -1519,6 +1520,7 @@ def _backfill_descriptions_from_mdx(entries: list[dict]) -> None:
     backfilled_components = 0
     backfilled_names = 0
     backfilled_fields = 0
+    backfilled_nested = 0
     for entry in entries:
         cid = entry["id"]
         stem = cid.split(".", 1)[-1]
@@ -1565,12 +1567,26 @@ def _backfill_descriptions_from_mdx(entries: list[dict]) -> None:
                 docs_url=entry.get("docs_url") or "",
             )
 
-    if backfilled_components or backfilled_fields or backfilled_names:
+        # Nested fields: match each nested node to the docs section documenting it.
+        sections = (
+            field_sections.get(cid)
+            or field_sections.get(stem)
+            or (field_sections.get(alias) if alias else None)
+        )
+        if sections:
+            backfilled_nested += _apply_nested_field_sections(
+                entry.get("config_entries") or [],
+                sections,
+                docs_url=entry.get("docs_url") or "",
+            )
+
+    if backfilled_components or backfilled_fields or backfilled_names or backfilled_nested:
         _LOGGER.info(
-            "Backfilled from docs MDX: %d names, %d descriptions, %d fields",
+            "Backfilled from docs MDX: %d names, %d descriptions, %d fields, %d nested fields",
             backfilled_names,
             backfilled_components,
             backfilled_fields,
+            backfilled_nested,
         )
 
 
@@ -1735,6 +1751,35 @@ def _apply_field_descriptions(
     return backfilled
 
 
+def _strip_mdx_frontmatter(text: str) -> str:
+    """Drop a leading ``---`` YAML frontmatter block from an MDX page body."""
+    return re.sub(r"^---\s*\n.*?\n---\s*\n", "", text, count=1, flags=re.DOTALL)
+
+
+def _iter_component_mdx() -> Iterator[tuple[str, str, Path]]:
+    """
+    Yield ``(component_id, stem, mdx_path)`` for each per-component docs page.
+
+    ``component_id`` follows the catalog convention — bare stem for a top-level
+    page, ``<domain>.<stem>`` for a platform page; ``index`` pages and deeper
+    nesting are skipped. Empty when the docs repo can't be resolved.
+    """
+    docs_dir = _ensure_docs_repo()
+    if docs_dir is None:
+        return
+    components_root = docs_dir / "src" / "content" / "docs" / "components"
+    if not components_root.exists():
+        return
+    for mdx_path in components_root.rglob("*.mdx"):
+        parts = mdx_path.relative_to(components_root).with_suffix("").parts
+        if not parts or parts[-1] == "index":
+            continue
+        if len(parts) == 1:
+            yield parts[0], parts[0], mdx_path
+        elif len(parts) == 2:
+            yield f"{parts[0]}.{parts[1]}", parts[1], mdx_path
+
+
 def _load_mdx_descriptions() -> dict[str, str]:
     """Walk the cached docs repo, return ``{component_id: description}``.
 
@@ -1749,34 +1794,14 @@ def _load_mdx_descriptions() -> dict[str, str]:
     Caches the cloned docs repo in ``.cache/esphome.io/`` so re-runs
     don't refetch.
     """
-    docs_dir = _ensure_docs_repo()
-    if docs_dir is None:
-        return {}
-
     out: dict[str, str] = {}
-    components_root = docs_dir / "src" / "content" / "docs" / "components"
-    if not components_root.exists():
-        return {}
-
-    for mdx_path in components_root.rglob("*.mdx"):
-        rel = mdx_path.relative_to(components_root)
-        parts = rel.with_suffix("").parts
-        if not parts or parts[-1] == "index":
-            continue
-        if len(parts) == 1:
-            component_id = parts[0]
-        elif len(parts) == 2:
-            component_id = f"{parts[0]}.{parts[1]}"
-        else:
-            continue  # Deeper nesting isn't a per-component page.
-
+    for component_id, stem, mdx_path in _iter_component_mdx():
         text = _extract_mdx_description(mdx_path.read_text(encoding="utf-8"))
         if text:
             out[component_id] = text
             # Also index under the bare stem if it's not already taken,
             # so e.g. ``ota.esphome`` falls back to ``esphome.mdx`` if
             # ever needed (rare, but cheap to support).
-            stem = parts[-1]
             out.setdefault(stem, text)
     return out
 
@@ -1804,31 +1829,11 @@ def _load_mdx_titles() -> dict[str, str]:
     "ESPHome OTA Updates"). Indexed by both the catalog id
     (``ota.esphome``) and the bare stem (``esphome``).
     """
-    docs_dir = _ensure_docs_repo()
-    if docs_dir is None:
-        return {}
-
     out: dict[str, str] = {}
-    components_root = docs_dir / "src" / "content" / "docs" / "components"
-    if not components_root.exists():
-        return {}
-
-    for mdx_path in components_root.rglob("*.mdx"):
-        rel = mdx_path.relative_to(components_root)
-        parts = rel.with_suffix("").parts
-        if not parts or parts[-1] == "index":
-            continue
-        if len(parts) == 1:
-            component_id = parts[0]
-        elif len(parts) == 2:
-            component_id = f"{parts[0]}.{parts[1]}"
-        else:
-            continue
-
+    for component_id, stem, mdx_path in _iter_component_mdx():
         title = _extract_mdx_title(mdx_path.read_text(encoding="utf-8"))
         if title:
             out[component_id] = title
-            stem = parts[-1]
             out.setdefault(stem, title)
     return out
 
@@ -1860,31 +1865,11 @@ def _load_mdx_field_descriptions() -> dict[str, dict[str, str]]:
     Used to fill in per-field descriptions for components whose schema
     entries lack a ``docs`` field — most visibly the OTA platforms.
     """
-    docs_dir = _ensure_docs_repo()
-    if docs_dir is None:
-        return {}
-
     out: dict[str, dict[str, str]] = {}
-    components_root = docs_dir / "src" / "content" / "docs" / "components"
-    if not components_root.exists():
-        return {}
-
-    for mdx_path in components_root.rglob("*.mdx"):
-        rel = mdx_path.relative_to(components_root)
-        parts = rel.with_suffix("").parts
-        if not parts or parts[-1] == "index":
-            continue
-        if len(parts) == 1:
-            component_id = parts[0]
-        elif len(parts) == 2:
-            component_id = f"{parts[0]}.{parts[1]}"
-        else:
-            continue
-
+    for component_id, stem, mdx_path in _iter_component_mdx():
         fields = _extract_mdx_field_descriptions(mdx_path.read_text(encoding="utf-8"))
         if fields:
             out[component_id] = fields
-            stem = parts[-1]
             out.setdefault(stem, fields)
     return out
 
@@ -1896,25 +1881,16 @@ _CONFIG_VAR_LINE = re.compile(
 )
 
 
-def _extract_mdx_field_descriptions(text: str) -> dict[str, str]:  # noqa: C901
-    """Parse the ``## Configuration variables`` section into a field map.
+def _parse_config_var_bullets(  # noqa: C901
+    body: str, *, first_paragraph_only: bool = False
+) -> dict[str, str]:
+    """Parse a flat ``- **name** (...): ...`` bullet list into a field map.
 
-    Captures one description per top-level bullet — including
-    continuation lines from indented prose, but excluding nested
-    sub-bullets and stopping at sub-headings (``###`` action /
-    trigger sections).
+    One description per top-level bullet, joining indented continuation
+    prose, excluding nested sub-bullets, and stopping at block-quotes /
+    sub-headings. With *first_paragraph_only*, a blank line after the
+    first prose ends the field (drops trailing ``**Important:**`` notes).
     """
-    body = re.sub(r"^---\s*\n.*?\n---\s*\n", "", text, count=1, flags=re.DOTALL)
-
-    section_re = re.compile(
-        r"^(?:##\s+Configuration variables\s*|Configuration variables:\s*)\n"
-        r"(.*?)(?=^##\s|\Z)",
-        re.MULTILINE | re.DOTALL,
-    )
-    match = section_re.search(body)
-    if not match:
-        return {}
-
     descriptions: dict[str, str] = {}
     current_key: str | None = None
     current_parts: list[str] = []
@@ -1930,7 +1906,7 @@ def _extract_mdx_field_descriptions(text: str) -> dict[str, str]:  # noqa: C901
         if cleaned:
             descriptions[current_key] = cleaned
 
-    for raw_line in match.group(1).splitlines():
+    for raw_line in body.splitlines():
         line = raw_line.rstrip()
         m = _CONFIG_VAR_LINE.match(line)
         if m:
@@ -1941,6 +1917,13 @@ def _extract_mdx_field_descriptions(text: str) -> dict[str, str]:  # noqa: C901
         if current_key is None:
             continue
         stripped = line.strip()
+        # A blank line ends the first paragraph when the caller wants only that.
+        if not stripped:
+            if first_paragraph_only and current_parts:
+                commit()
+                current_key = None
+                current_parts = []
+            continue
         # Block-quotes / GitHub alerts and sub-headings end the field.
         if stripped.startswith((">", "#")):
             commit()
@@ -1950,11 +1933,182 @@ def _extract_mdx_field_descriptions(text: str) -> dict[str, str]:  # noqa: C901
         # Sub-bullets describe sub-fields — skip.
         if stripped.startswith(("- ", "* ", "+ ")):
             continue
-        if stripped:
-            current_parts.append(stripped)
+        current_parts.append(stripped)
 
     commit()
     return descriptions
+
+
+def _extract_mdx_field_descriptions(text: str) -> dict[str, str]:
+    """Parse the ``## Configuration variables`` section into a field map.
+
+    Captures one description per top-level bullet — including
+    continuation lines from indented prose, but excluding nested
+    sub-bullets and stopping at sub-headings (``###`` action /
+    trigger sections).
+    """
+    body = _strip_mdx_frontmatter(text)
+    section_re = re.compile(
+        r"^(?:##\s+Configuration variables\s*|Configuration variables:\s*)\n"
+        r"(.*?)(?=^##\s|\Z)",
+        re.MULTILINE | re.DOTALL,
+    )
+    match = section_re.search(body)
+    if not match:
+        return {}
+    return _parse_config_var_bullets(match.group(1))
+
+
+_MDX_HEADING = re.compile(r"^(?P<hashes>#{2,4})\s+(?P<title>.*?)\s*$", re.MULTILINE)
+_AUTOMATION_HEADING = re.compile(r"(?i)\b(?:trigger|action|condition)s?\b")
+# Field names too generic to carry a section's identity: they recur under nearly
+# every nested mapping, so a node whose only overlap with a section is these must
+# NOT be matched (this is what keeps ``esphome.areas[].name`` off the top-level map).
+_GENERIC_FIELD_NAMES = frozenset({"id", "name", "lambda", "action", "trigger_id", "platform"})
+# Entry types that aren't leaf config fields — excluded from a node's field set
+# for section matching (nested/map are containers matched on their own recursion).
+_NONFIELD_ENTRY_TYPES = frozenset({"nested", "map", "divider", "label", "alert"})
+# Match thresholds (see ``_match_section_to_node``): a section must share at least
+# this many non-generic names and cover at least this fraction of both sides.
+_MIN_SHARED_NONGENERIC = 2
+_MIN_SECTION_COVERAGE = 0.5
+
+
+def _slugify_heading(heading: str) -> str:
+    """GitHub-slugger-style anchor for a docs heading (backticks stripped)."""
+    slug = heading.replace("`", "").lower()
+    slug = re.sub(r"[^a-z0-9]+", "-", slug)
+    return slug.strip("-")
+
+
+def _enumerate_mdx_field_sections(text: str) -> list[dict]:
+    """
+    Every H2–H4 section of a docs page that carries a config-var bullet list.
+
+    Each entry: ``{heading, slug, fields, is_automation}``. ``slug`` is
+    de-duplicated in document order (``-1``, ``-2`` …) to mirror the docs site.
+    ``is_automation`` marks sections under a Trigger/Action/Condition heading —
+    their field sets can coincide with a config schema's, so they're excluded
+    from matching rather than relying on field-set overlap to filter them.
+    """
+    body = _strip_mdx_frontmatter(text)
+    heads = list(_MDX_HEADING.finditer(body))
+    sections: list[dict] = []
+    slug_seen: dict[str, int] = {}
+    auto_stack: list[tuple[int, bool]] = []  # (level, is_automation) for ancestor headings
+    for i, m in enumerate(heads):
+        level = len(m.group("hashes"))
+        title = m.group("title").strip()
+        while auto_stack and auto_stack[-1][0] >= level:
+            auto_stack.pop()
+        is_auto = bool(auto_stack and auto_stack[-1][1]) or bool(_AUTOMATION_HEADING.search(title))
+        auto_stack.append((level, is_auto))
+        start = m.end()
+        end = heads[i + 1].start() if i + 1 < len(heads) else len(body)
+        fields = _parse_config_var_bullets(body[start:end], first_paragraph_only=True)
+        # Advance the dedup counter for every heading, bullet-bearing or not — the
+        # docs site's slugger sees each rendered heading, so a bulletless duplicate
+        # still shifts a later section's ``-N`` anchor.
+        base = _slugify_heading(title)
+        n = slug_seen.get(base, 0)
+        slug_seen[base] = n + 1
+        if not fields:
+            continue
+        slug = base if n == 0 else f"{base}-{n}"
+        sections.append(
+            {"heading": title, "slug": slug, "fields": fields, "is_automation": is_auto}
+        )
+    return sections
+
+
+def _load_mdx_field_sections() -> dict[str, list[dict]]:
+    """Walk the cached docs repo, return ``{component_id: [section, ...]}``.
+
+    Same id / stem keying as :func:`_load_mdx_field_descriptions`; feeds the
+    nested field-description matcher.
+    """
+    out: dict[str, list[dict]] = {}
+    for component_id, stem, mdx_path in _iter_component_mdx():
+        sections = _enumerate_mdx_field_sections(mdx_path.read_text(encoding="utf-8"))
+        if sections:
+            out[component_id] = sections
+            out.setdefault(stem, sections)
+    return out
+
+
+def _match_section_to_node(
+    children: set[str], missing: set[str], sections: list[dict]
+) -> tuple[dict | None, dict[str, str]]:
+    """
+    Pick the docs section that documents a nested node and the descriptions to apply.
+
+    A section is a candidate when its field set overlaps the node's children by
+    at least two *non-generic* names and covers at least half of both the node's
+    children and the section's own fields. The best candidate wins unless a
+    lower-ranked one disagrees on a shared key's prose (ambiguous → skip). Returns
+    ``(section, {key: description})`` limited to the node's still-missing children.
+    """
+    if not children:
+        return None, {}
+    candidates: list[tuple[int, float, dict]] = []
+    for sec in sections:
+        if sec["is_automation"]:
+            continue
+        shared = children & sec["fields"].keys()
+        nongeneric = len(shared - _GENERIC_FIELD_NAMES)
+        if nongeneric < _MIN_SHARED_NONGENERIC:
+            continue
+        node_cov = len(shared) / len(children)
+        sec_cov = len(shared) / len(sec["fields"])
+        if node_cov < _MIN_SECTION_COVERAGE or sec_cov < _MIN_SECTION_COVERAGE:
+            continue
+        candidates.append((nongeneric, node_cov + sec_cov, sec))
+    if not candidates:
+        return None, {}
+    candidates.sort(key=lambda c: (c[0], c[1]), reverse=True)
+    winner = candidates[0][2]
+    # Ambiguity guard: a runner-up that disagrees on a shared key's prose means we
+    # can't trust the pick — decline rather than risk mis-attribution.
+    for _, _, other in candidates[1:]:
+        for key in children & winner["fields"].keys() & other["fields"].keys():
+            if winner["fields"][key] != other["fields"][key]:
+                return None, {}
+    apply = {k: winner["fields"][k] for k in missing & winner["fields"].keys()}
+    return winner, apply
+
+
+def _apply_nested_field_sections(
+    config_entries: list[dict], sections: list[dict], *, docs_url: str
+) -> int:
+    """
+    Backfill a nested node's field descriptions from the docs section documenting it.
+
+    Each node (an entry with ``config_entries``) is matched to a section by
+    field-set overlap and its still-empty leaf children are filled path-scoped.
+    Top-level leaves stay owned by the flat ``_apply_field_descriptions``.
+    """
+    backfilled = 0
+    for entry in config_entries:
+        inner = entry.get("config_entries")
+        if not inner:
+            continue
+        leaves = [c for c in inner if c.get("type") not in _NONFIELD_ENTRY_TYPES]
+        names = {c["key"] for c in leaves}
+        missing = {c["key"] for c in leaves if not (c.get("description") or "").strip()}
+        if missing:
+            section, apply = _match_section_to_node(names, missing, sections)
+            if section:
+                anchor = f"{docs_url}#{section['slug']}" if docs_url else ""
+                for child in leaves:
+                    text = apply.get(child["key"])
+                    if not text:
+                        continue
+                    child["description"] = text
+                    backfilled += 1
+                    if anchor and not child.get("help_link"):
+                        child["help_link"] = anchor
+        backfilled += _apply_nested_field_sections(inner, sections, docs_url=docs_url)
+    return backfilled
 
 
 def _ensure_docs_repo() -> Path | None:
