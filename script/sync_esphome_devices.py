@@ -29,7 +29,9 @@ Usage
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
+import importlib.util
 import logging
 import re
 import shutil
@@ -49,6 +51,7 @@ from esphome_device_builder.constants import (  # noqa: E402
     BOARD_PIN_KEYS,
     BUS_CATEGORIES,
     DEVICE_IMPORT_SOURCE_TYPE,
+    FEATURED_EXCLUDED_CATEGORIES,
 )
 from esphome_device_builder.helpers.pin_gpio import parse_board_gpio  # noqa: E402
 from esphome_device_builder.models.boards import Esp32Variant  # noqa: E402
@@ -904,7 +907,8 @@ def _build_candidate(  # noqa: PLR0911 — distinct skip reasons each get their 
         return None
     local_occupancy: dict[int, str] = {}
     fields = _extract_fields(item, component, local_occupancy, component_id)
-    # ``None`` means an unfillable placeholder ("(FILL IN ...)").
+    # ``None`` means an unfillable placeholder ("(FILL IN ...)") or a
+    # required field whose value we couldn't represent.
     if fields is None:
         return None
     # ``{}`` is fine when the inline item carries a ``type: "id"`` ref
@@ -1184,9 +1188,11 @@ def _extract_fields(
     rename friction or duplicate-id collisions.
 
     Returns ``None`` when the upstream item carries an unfillable
-    placeholder (e.g. ``address: (FILL IN ONE-WIRE BUS ADDRESS)``).
-    The caller drops the whole featured-component entry in that case
-    rather than emit a preset that would compile but not run.
+    placeholder (e.g. ``address: (FILL IN ONE-WIRE BUS ADDRESS)``) or
+    sets a catalog-required field to a value we can't represent. The
+    caller drops the whole featured-component entry in either case
+    rather than emit a preset that would compile but not run — or, for
+    a lost required field, not even compile.
     """
     valid_keys: dict[str, dict[str, Any]] = {}
     for ce in component.get("config_entries") or []:
@@ -1204,6 +1210,16 @@ def _extract_fields(
         if _is_placeholder_value(fval):
             return None
         preset = _coerce_field_preset(ce, fval, fkey, inline_item, gpio_occupancy, component_id)
+        if preset is None and ce.get("required") and ce.get("type") != "id":
+            # id-typed refs are intentionally deferred to pass 2; every
+            # other required field the page set but we couldn't carry
+            # would ship an entry that fails ESPHome validation.
+            _LOGGER.info(
+                "Dropping %s: required field %r has an unrepresentable value",
+                component_id,
+                fkey,
+            )
+            return None
         if preset is not None:
             out[fkey] = preset
     return out
@@ -1222,8 +1238,10 @@ def _coerce_field_preset(  # noqa: PLR0911 — distinct field shapes each get th
 
     Pin entries record GPIO occupancy and emit a ``locked`` preset.
     Cross-component id references are dropped (the user picks at add
-    time). Other simple scalars come through as either locked presets
-    (when the field name looks hardware-fixed) or bare suggestions.
+    time). Data-only nested values (``dimensions``, ``data_pins``,
+    ``init_sequence``) lock verbatim. Other simple scalars come through
+    as either locked presets (when the field name looks hardware-fixed)
+    or bare suggestions.
     """
     ce_type = config_entry.get("type")
     if ce_type == "pin":
@@ -1248,6 +1266,10 @@ def _coerce_field_preset(  # noqa: PLR0911 — distinct field shapes each get th
         # local id assigned — emitting them here would lock in the
         # raw upstream value before remapping.
         return None
+    if isinstance(raw_value, dict | list):
+        return _coerce_data_tree(
+            config_entry, raw_value, field_name, inline_item, gpio_occupancy, component_id
+        )
     if not _is_simple_scalar(raw_value):
         return None
     if _looks_lockable(field_name):
@@ -1277,6 +1299,87 @@ def _coerce_pin_list(
         if gpio is not None:
             gpio_occupancy.setdefault(gpio, label)
     return {"value": normalized, "locked": True}
+
+
+# Field names whose nested value is a group of board pins (``data_pins``);
+# porches / dimensions / init sequences don't match.
+_PIN_TREE_FIELD_RE = re.compile(r"(?:^|_)pins?$")
+
+
+def _coerce_data_tree(
+    config_entry: dict[str, Any],
+    raw_value: dict[str, Any] | list[Any],
+    field_name: str,
+    inline_item: dict[str, Any],
+    gpio_occupancy: dict[int, str],
+    component_id: str,
+) -> dict[str, Any] | None:
+    """
+    Lock a data-only nested value (``dimensions``, ``data_pins``, ``init_sequence``).
+
+    ``None`` when the shape doesn't match the catalog entry, a leaf is
+    templated / placeholder, or the entry could carry an id reference we
+    can't remap. Pin-group fields record every GPIO leaf as occupied.
+    """
+    ce_type = config_entry.get("type")
+    if ce_type != "nested" and not (
+        isinstance(raw_value, list) and config_entry.get("multi_value")
+    ):
+        return None
+    if not _is_data_only_tree(raw_value):
+        return None
+    if _ce_has_id_descendant(config_entry) or _tree_has_id_keys(raw_value):
+        return None
+    if _PIN_TREE_FIELD_RE.search(field_name):
+        label = _occupancy_label(inline_item, component_id)
+        _record_pin_tree_occupancy(raw_value, label, gpio_occupancy)
+    return {"value": raw_value, "locked": True}
+
+
+def _is_data_only_tree(value: Any) -> bool:
+    """Return True for a non-empty dict/list tree of round-trippable scalar leaves."""
+    if isinstance(value, dict):
+        return bool(value) and all(
+            isinstance(key, str) and _is_data_only_tree(item) for key, item in value.items()
+        )
+    if isinstance(value, list):
+        return bool(value) and all(_is_data_only_tree(item) for item in value)
+    return _is_simple_scalar(value) and not _is_placeholder_value(value)
+
+
+def _tree_has_id_keys(value: Any) -> bool:
+    """Return True when any dict key in the tree is ``id`` or ``*_id``."""
+    if isinstance(value, dict):
+        return any(
+            (isinstance(key, str) and (key == "id" or key.endswith("_id")))
+            or _tree_has_id_keys(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, list):
+        return any(_tree_has_id_keys(item) for item in value)
+    return False
+
+
+def _ce_has_id_descendant(config_entry: dict[str, Any]) -> bool:
+    """Return True when any nested config entry of *config_entry* is id-typed."""
+    for sub in config_entry.get("config_entries") or []:
+        if sub.get("type") == "id" or _ce_has_id_descendant(sub):
+            return True
+    return False
+
+
+def _record_pin_tree_occupancy(value: Any, label: str, gpio_occupancy: dict[int, str]) -> None:
+    """Record every GPIO leaf of a pin-group tree (``data_pins``) as occupied."""
+    if isinstance(value, dict):
+        for item in value.values():
+            _record_pin_tree_occupancy(item, label, gpio_occupancy)
+    elif isinstance(value, list):
+        for item in value:
+            _record_pin_tree_occupancy(item, label, gpio_occupancy)
+    else:
+        gpio = _gpio_number(_normalize_pin_value(value))
+        if gpio is not None:
+            gpio_occupancy.setdefault(gpio, label)
 
 
 def _occupancy_label(inline_item: dict[str, Any], component_id: str) -> str:
@@ -1436,6 +1539,107 @@ def _extract_ethernet(config: dict[str, Any]) -> tuple[dict[str, Any] | None, di
         "fields": fields,
     }
     return entry, occupancy
+
+
+def _extract_psram(
+    config: dict[str, Any], components_index: dict[str, dict[str, Any]]
+) -> dict[str, Any] | None:
+    """
+    Mine a top-level ``psram:`` block into a featured component.
+
+    A display's framebuffer needs it at runtime even though the config
+    validates without it, so a page configuring PSRAM keeps it.
+    """
+    if "psram" not in config:
+        return None
+    component = components_index.get("psram")
+    if component is None:
+        return None
+    block = config.get("psram")
+    fields: dict[str, Any] = {}
+    if isinstance(block, dict):
+        extracted = _extract_fields(block, component, {}, "psram")
+        if extracted is None:
+            return None
+        fields = extracted
+    return {"id": "onboard_psram", "component_id": "psram", "name": "PSRAM", "fields": fields}
+
+
+# PSRAM-capable allocation markers in esphome component sources; a component
+# dir using one puts large runtime buffers (framebuffers, audio pipelines)
+# in PSRAM when the device provides it.
+_PSRAM_ALLOC_RE = re.compile(r"ExternalRAMAllocator|RAMAllocator|MALLOC_CAP_SPIRAM")
+_SOURCE_SUFFIXES = frozenset({".h", ".hpp", ".c", ".cpp", ".py"})
+
+
+@functools.cache
+def _psram_allocating_components() -> frozenset[str]:
+    """
+    Names of installed esphome components whose sources allocate from PSRAM.
+
+    The schema carries no PSRAM signal (a display like st7701s validates
+    without it, so it never declares the dep), so the C++/py sources are
+    the only derivable truth. Base domains (``display``) cover every
+    platform of the domain; platform components (``i2s_audio``) cover
+    their own leaves. Empty when esphome isn't installed.
+    """
+    spec = importlib.util.find_spec("esphome")
+    if spec is None or not spec.submodule_search_locations:
+        return frozenset()
+    components = Path(spec.submodule_search_locations[0]) / "components"
+    if not components.is_dir():
+        return frozenset()
+    allocating: set[str] = set()
+    for child in sorted(components.iterdir()):
+        if not child.is_dir():
+            continue
+        for source in child.rglob("*"):
+            if source.suffix not in _SOURCE_SUFFIXES:
+                continue
+            try:
+                text = source.read_text(encoding="utf-8", errors="ignore")
+            except OSError as exc:
+                # An unreadable source silently shrinks the allocating set —
+                # and the cached result makes the omission sticky for the run.
+                _LOGGER.warning("Skipping unreadable esphome source %s: %s", source, exc)
+                continue
+            if _PSRAM_ALLOC_RE.search(text):
+                allocating.add(child.name)
+                break
+    return frozenset(allocating)
+
+
+def _needs_psram(component_id: str, components_index: dict[str, dict[str, Any]]) -> bool:
+    """Whether a featured leaf's component puts large runtime buffers in PSRAM."""
+    component = components_index.get(component_id) or {}
+    if "psram" in (component.get("dependencies") or []):
+        return True
+    allocating = _psram_allocating_components()
+    domain, _, stem = component_id.partition(".")
+    return domain in allocating or (bool(stem) and stem in allocating)
+
+
+def _lift_psram(
+    config: dict[str, Any],
+    featured: list[dict[str, Any]],
+    components_index: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Prepend the page's ``psram:`` lift and stamp it on PSRAM-allocating leaves.
+
+    Gated on *featured* being non-empty so a psram-only page stays unimportable.
+    """
+    psram_entry = _extract_psram(config, components_index) if featured else None
+    if psram_entry is None:
+        if featured and "psram" in config:
+            # The page configured PSRAM but the lift failed (placeholder
+            # value or missing catalog entry) — the device ships unstamped.
+            _LOGGER.warning("Dropping psram lift: the page's psram: block can't be represented")
+        return featured
+    for entry in featured:
+        if _needs_psram(entry["component_id"], components_index):
+            entry["requires"] = [*(entry.get("requires") or []), psram_entry["id"]]
+    return [psram_entry, *featured]
 
 
 def _as_block_list(raw: Any) -> list[Any]:
@@ -1781,17 +1985,17 @@ def _required_pin_keys(component: dict[str, Any]) -> set[str]:
 
 def _is_driver_hub(component: dict[str, Any]) -> bool:
     """
-    Return True for a hub a consumer binds by catalog dependency that owns board pins.
+    Return True for a hub a consumer binds by catalog dependency.
 
-    LED-driver hubs (``bp5758d``, ``sm2135``, ...) sit as a top-level block with
-    their own ``clock_pin`` / ``data_pin`` and are pulled in by an
-    ``output.<driver>`` platform's ``dependencies`` rather than by a pin
-    reference. Buses (``i2c`` / ``spi`` / ``uart``) are excluded — a hub's own
-    bus is materialized through ``_ensure_buses`` instead.
+    Pin-owning LED-driver hubs (``bp5758d``), bus-attached ones (``tuya``,
+    ``ads1115``, ``modbus_controller``), and pin-less providers (``i2s_audio``)
+    all qualify: without the top-level block the consumer fails ESPHome's
+    dependency validation. Buses are excluded — a hub's own bus is
+    materialized through ``_ensure_buses`` — and featured-excluded categories
+    (core / ota / time / update) belong to the base config, not the manifest.
     """
-    if component.get("category") == "bus":
-        return False
-    return any(ce.get("type") == "pin" for ce in component.get("config_entries") or [])
+    category = component.get("category")
+    return category not in BUS_CATEGORIES and category not in FEATURED_EXCLUDED_CATEGORIES
 
 
 def _sole_hub_block(raw: Any) -> dict[str, Any] | None:
@@ -2046,6 +2250,7 @@ def _make_record(  # noqa: C901, PLR0911, PLR0912 — distinct skip reasons each
     if eth_entry is not None:
         featured = [eth_entry, *featured]
         gpio_occupancy = {**eth_occupancy, **gpio_occupancy}
+    featured = _lift_psram(src.config_yaml, featured, components_index)
     # Lift the prerequisites a featured leaf needs but the platform-list
     # extraction drops, each stamping ``requires`` so the dashboard adds them
     # first with pins pre-filled: I/O-expander hubs referenced by a featured
