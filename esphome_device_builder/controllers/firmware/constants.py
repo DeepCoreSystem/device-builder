@@ -121,6 +121,44 @@ _NINJA_PROGRESS_PATTERN: re.Pattern[str] = re.compile(
     r"^(?:\x1b\[[0-9;]*[A-Za-z])*\s*\[\s*(\d+)\s*/\s*(\d+)\s*\] "
 )
 
+# This compile-phase grammar is the authoritative copy: it stamps
+# ``compile_started_at`` / ``compile_ended_at`` on the persisted job. The
+# frontend mirrors these markers in ``src/util/compile-phase.ts`` only to drive
+# the live per-second timer before the stamped fields land over the stream —
+# keep the two in sync (word markers, bracket-percent, ninja counter, end
+# banner).
+#
+# Lines are ANSI-stripped before compile-phase matching: PlatformIO colourises
+# and repaints, so escapes land not only as a leading reset but *inside* tokens
+# — the summary banner is ``[<green><bold>SUCCESS<reset>] Took`` — which an
+# anchored/literal match would miss.
+_ANSI_ESCAPE: re.Pattern[str] = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+# Compile-phase word markers for stamping ``compile_started_at``. ``Compiling
+# <path>`` is emitted by PlatformIO for every framework (esp32-arduino, esp8266,
+# libretiny, esp-idf-via-pio); ``Reading CMake configuration`` opens an esp-idf
+# build (the real start, after the download); the rest cover a cached build that
+# jumps straight to linking. None appear in the download phase, whose lines
+# start with ``Tool Manager:`` / ``Library Manager:`` / ``Unpacking`` /
+# ``Installing``.
+_COMPILE_PHASE_WORD_PATTERN: re.Pattern[str] = re.compile(
+    r"^\s*(?:Compiling |Archiving |Linking |Indexing |Generating |Building in "
+    r"|Reading CMake configuration)"
+)
+
+# The arduino per-file gauge ``[ 17%] Compiling …`` — percent *inside* the
+# brackets. Kept distinct from the download ``Unpacking [----] 0%`` bar (percent
+# *outside* the brackets) and from esptool ``(45 %)`` / OTA ``Uploading … 45%``,
+# none of which mean "compiling". So a stray percentage during the download
+# never starts the clock — only these three compile-specific shapes do (the
+# ninja ``[N/M]`` counter below is the third).
+_COMPILE_BRACKET_PERCENT: re.Pattern[str] = re.compile(r"^\s*\[\s*\d{1,3}\s*%\s*\]")
+
+# PlatformIO closes each environment with ``===== [SUCCESS] Took N seconds =====``
+# (or ``[FAILED]``); marks ``compile_ended_at`` so an install's flash phase,
+# which streams after, isn't counted.
+_COMPILE_END_PATTERN: re.Pattern[str] = re.compile(r"\[(?:SUCCESS|FAILED)\] Took ")
+
 # History retention.
 #   - "Primary" = COMPILE / UPLOAD / INSTALL: dedup'd to the most
 #     recent terminal job per device, then capped globally. The dedup

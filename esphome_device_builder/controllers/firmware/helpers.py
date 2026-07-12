@@ -31,7 +31,12 @@ from ...models import (
     JobProgressData,
     JobType,
 )
+from ...models.firmware import _now_iso
 from .constants import (
+    _ANSI_ESCAPE,
+    _COMPILE_BRACKET_PERCENT,
+    _COMPILE_END_PATTERN,
+    _COMPILE_PHASE_WORD_PATTERN,
     _INFLIGHT_TRIM_KEEP,
     _MAX_OUTPUT_LINES_INFLIGHT,
     _MAX_OUTPUT_LINES_RETAINED,
@@ -361,10 +366,51 @@ def _ingest_output_line(job: FirmwareJob, bus: EventBus, line: str) -> None:
         _trim_job_output(job, keep=_INFLIGHT_TRIM_KEEP)
     out_payload: JobOutputData = {"job_id": job.job_id, "line": line}
     bus.fire(EventType.JOB_OUTPUT, out_payload)
+    _stamp_compile_phase(job, line)
     progress = _parse_progress(line)
     if progress is None or progress <= (job.progress or 0):
         return
     _fire_job_progress(job, bus, progress)
+
+
+def _is_compile_start_line(line: str) -> bool:
+    """
+    Whether *line* proves compilation has begun.
+
+    True for a PlatformIO ``Compiling`` / ``Linking`` / … word marker, an
+    arduino ``[ NN%]`` per-file gauge, or a ninja ``[N/M]`` counter (any total —
+    download always precedes ninja, so the first counter is the build start).
+    Deliberately *not* the esptool ``(45 %)`` / OTA / download percentages, so a
+    stray percent during the download can't start the clock.
+    """
+    return bool(
+        _COMPILE_PHASE_WORD_PATTERN.match(line)
+        or _COMPILE_BRACKET_PERCENT.match(line)
+        or _NINJA_PROGRESS_PATTERN.match(line)
+    )
+
+
+def _stamp_compile_phase(job: FirmwareJob, line: str) -> None:
+    """
+    Stamp the compile-phase wall-clocks off *line*.
+
+    Start on the first build line and end on the summary banner, so the span
+    excludes the download and, for an install, the flash. ANSI is stripped
+    first — the ``[SUCCESS] Took`` banner colours *inside* the brackets. Runs
+    per streamed line, so it short-circuits once both stamps are latched (an
+    install flashes long after the compile ends) and pre-filters the end scan
+    on a plain-text substring before paying for the ANSI strip + regex.
+    """
+    if job.compile_ended_at is not None:
+        return
+    if job.compile_started_at is None:
+        if _is_compile_start_line(_ANSI_ESCAPE.sub("", line)):
+            job.compile_started_at = _now_iso()
+        return
+    # ``Took `` is plain text in the banner (only the [SUCCESS]/[FAILED] token
+    # carries inline ANSI), so this skips the strip + regex on every other line.
+    if "Took " in line and _COMPILE_END_PATTERN.search(_ANSI_ESCAPE.sub("", line)):
+        job.compile_ended_at = _now_iso()
 
 
 def _target_is_offline(controller: FirmwareController, configuration: str) -> bool:
