@@ -37,6 +37,7 @@ import re
 import shutil
 import subprocess
 import sys
+from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -224,11 +225,18 @@ _PLACEHOLDER_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\byour[\s_-]+(key|address|token|id)\b", re.IGNORECASE),
 ]
 
-# Template substitutions like ``${friendly_name}`` that upstream pages
-# resolve at runtime via ``substitutions:``. We don't carry the
-# substitutions block forward, so anything still containing one is
-# unsafe to surface as a preset value or as an ``occupied_by`` label.
+# Template substitutions like ``${friendly_name}``. The page's own
+# ``substitutions:`` block is resolved in ``_resolve_page_substitutions``,
+# so anything still containing one is an undefined reference (or the pass
+# was skipped) — unsafe to surface as a preset value or ``occupied_by`` label.
 _TEMPLATE_VAR_RE = re.compile(r"\$\{[^}]*\}")
+
+# A leading token with no letter or digit (unicode-aware, so "Спот"
+# survives) is placeholder noise — a ``friendly_name: "***"`` fill-in
+# resolving into "*** Button". Only leading tokens are stripped: interior
+# separators ("gosund_sp111 - Status") and trailing symbols that
+# disambiguate ("Energy Meter kWh +" vs "Energy Meter kWh") are real.
+_ALNUM_RE = re.compile(r"[^\W_]")
 
 # Deprecated flat ``clk_mode: GPIO<n>_(IN|OUT)`` encodes the RMII clock
 # pin and direction in the mode string; folded into nested ``clk``
@@ -512,6 +520,8 @@ def _first_config_yaml(body: str, device_dir: Path) -> tuple[dict[str, Any], str
     """
     First parseable ``yaml`` config fence as ``(parsed, raw_text)``, following ``file=``.
 
+    *parsed* has the page's ``substitutions:`` block resolved over the tree.
+
     A device page often splits optional snippets across separate fences. The
     onboard ``ethernet:`` block (real hardware we lift) is sometimes a standalone
     fence after the base config, so fold just that one into the primary fence when
@@ -544,7 +554,7 @@ def _first_config_yaml(body: str, device_dir: Path) -> tuple[dict[str, Any], str
         # edits to it. An inline fence is already in *body* — leave it be.
         if ethernet_text is not None and ethernet_text not in body:
             text = f"{text}\n{ethernet_text}"
-    return parsed, text
+    return _resolve_page_substitutions(parsed, device_dir.name), text
 
 
 def _extract_local_images(body: str, device_dir: Path) -> list[str]:
@@ -578,6 +588,38 @@ def _extract_local_images(body: str, device_dir: Path) -> list[str]:
 def _hash_content(text: str) -> str:
     """Return the SHA-256 hex digest of *text*."""
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _resolve_page_substitutions(parsed: dict[str, Any], folder: str) -> dict[str, Any]:
+    """
+    Resolve the page's own ``substitutions:`` block over the config tree.
+
+    Unresolved references stay literal; any failure returns *parsed* unchanged.
+    """
+    subs = parsed.get("substitutions")
+    if not isinstance(subs, dict) or not subs:
+        return parsed
+    try:
+        from esphome.components.substitutions import do_substitution_pass
+    except ImportError:
+        _LOGGER.debug("esphome unavailable; skipping substitution pass (%s)", folder)
+        return parsed
+    try:
+        resolved = do_substitution_pass(OrderedDict(parsed))
+    except Exception as err:
+        _LOGGER.warning("substitution pass failed for %s: %s", folder, err)
+        return parsed
+    resolved.pop("substitutions", None)
+    return _plain_tree(resolved)
+
+
+def _plain_tree(value: Any) -> Any:
+    """Rebuild dict/list subclasses (``substitute`` emits OrderedDict) as plain builtins."""
+    if isinstance(value, dict):
+        return {k: _plain_tree(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_plain_tree(v) for v in value]
+    return value
 
 
 def _iter_devices(repo: Path) -> Iterator[_DeviceSource]:
@@ -1434,17 +1476,20 @@ def _clean_entity_name(inline_item: dict[str, Any]) -> str:
     """
     Pick a readable entity name from an inline-yaml item.
 
-    Returns the upstream ``name:`` / ``id:`` value with any
-    ``${...}`` template substitutions removed and surrounding
-    whitespace / separators trimmed. Returns an empty string when no
-    readable label remains — callers fall back to a derived default.
+    Returns the upstream ``name:`` / ``id:`` value with ``${...}``
+    template substitutions and leading symbol-only placeholder tokens
+    removed and surrounding whitespace / separators trimmed. Returns an
+    empty string when no readable label remains — callers fall back to a
+    derived default.
     """
     for key in ("name", "id"):
         candidate = inline_item.get(key)
         if not isinstance(candidate, str):
             continue
-        cleaned = _TEMPLATE_VAR_RE.sub("", candidate).strip(" -_")
-        cleaned = re.sub(r"\s+", " ", cleaned)
+        tokens = _TEMPLATE_VAR_RE.sub("", candidate).split()
+        while tokens and not _ALNUM_RE.search(tokens[0]):
+            tokens.pop(0)
+        cleaned = " ".join(tokens).strip(" -_")
         if cleaned:
             return cleaned
     return ""
