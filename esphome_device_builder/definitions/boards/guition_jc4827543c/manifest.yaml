@@ -17,18 +17,12 @@ pins:
 - gpio: 1
   available: false
   occupied_by: gpio_backlight_pwm
-- gpio: 3
-  available: false
-  occupied_by: my_touchscreen
 - gpio: 4
   available: false
   occupied_by: bus_a
 - gpio: 8
   available: false
   occupied_by: bus_a
-- gpio: 38
-  available: false
-  occupied_by: my_touchscreen
 docs_url: https://devices.esphome.io/devices/Guition-JC4827543C/
 featured_components:
 - id: bus_a
@@ -44,6 +38,12 @@ featured_components:
     id:
       value: bus_a
       locked: true
+- id: onboard_psram
+  component_id: psram
+  name: PSRAM
+  fields:
+    mode: octal
+    speed: 80MHz
 - id: display_backlight
   component_id: light.monochromatic
   fields:
@@ -61,20 +61,6 @@ featured_components:
       locked: true
     frequency: 1000Hz
     id: gpio_backlight_pwm
-- id: my_touchscreen
-  component_id: touchscreen.gt911
-  fields:
-    interrupt_pin:
-      value:
-        number: 3
-        ignore_strapping_warning: true
-      locked: true
-    reset_pin:
-      value: 38
-      locked: true
-    id: my_touchscreen
-  requires:
-  - bus_a
 featured_bundles:
 - id: display_backlight_setup
   name: Display Backlight (full setup)
