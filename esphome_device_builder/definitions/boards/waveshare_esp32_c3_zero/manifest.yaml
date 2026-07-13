@@ -21,7 +21,7 @@ esphome:
 
 hardware:
   flash_size: 4MB
-  ram_size: 393216  # 400kB - 16kB cache
+  ram_size: 327680
   cpu_frequency: 160MHz
   connectivity:
     - wifi
